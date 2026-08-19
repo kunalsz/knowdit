@@ -25,7 +25,7 @@
 //! chunk; the orchestrator unions those id lists across chunks. If every
 //! chunk says "no merge", the new raw is admitted as a fresh canonical.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use llmy::agent::tool::ToolBox;
@@ -33,7 +33,8 @@ use llmy::agent::{LLMYError, tool};
 use llmy::client::client::LLM;
 use llmy::client::model::OpenAIModel;
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 
 use knowdit_kg_model::category::DeFiCategory;
@@ -346,6 +347,271 @@ impl FindingChunkExtractor {
 }
 
 // ---------------------------------------------------------------------------
+// Combined narrative extraction
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct NarrativeSemanticRecord {
+    pub id: String,
+    #[serde(flatten)]
+    pub semantic: ExtractedSemantic,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct NarrativeFindingRecord {
+    pub id: String,
+    #[serde(flatten)]
+    pub finding: ExtractedFinding,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct NarrativeLinkRecord {
+    pub finding_id: String,
+    pub semantic_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum NarrativeCombinedItem {
+    Semantic(NarrativeSemanticRecord),
+    Finding(NarrativeFindingRecord),
+    Link(NarrativeLinkRecord),
+}
+
+#[derive(Debug, Default)]
+struct NarrativeCombinedState {
+    semantic_ids: BTreeSet<String>,
+    finding_ids: BTreeSet<String>,
+    links: BTreeSet<(String, String)>,
+}
+
+impl NarrativeCombinedState {
+    fn validate_semantic(&self, record: &NarrativeSemanticRecord) -> Option<String> {
+        if !record.id.starts_with("sem-") || record.id.trim().len() <= 4 {
+            return Some("error: semantic id must use the `sem-<ordinal>` format".to_string());
+        }
+        if record.semantic.name.trim().is_empty() {
+            return Some("error: semantic `name` must not be empty".to_string());
+        }
+        if record.semantic.functions.is_empty() {
+            return Some("error: semantic `functions` must contain at least one entry".to_string());
+        }
+        if self.semantic_ids.contains(&record.id) {
+            return Some(format!("error: duplicate semantic id `{}`", record.id));
+        }
+        None
+    }
+
+    fn validate_finding(&self, record: &NarrativeFindingRecord) -> Option<String> {
+        if !record.id.starts_with("finding-") || record.id.trim().len() <= 8 {
+            return Some("error: finding id must use the `finding-<ordinal>` format".to_string());
+        }
+        if record.finding.title.trim().is_empty() {
+            return Some("error: finding `title` must not be empty".to_string());
+        }
+        if let Some(hint) =
+            validate_taxonomy_pair(record.finding.category, &record.finding.subcategory)
+        {
+            return Some(format!("error: {hint}"));
+        }
+        if self.finding_ids.contains(&record.id) {
+            return Some(format!("error: duplicate finding id `{}`", record.id));
+        }
+        None
+    }
+
+    fn validate_link(&self, record: &NarrativeLinkRecord) -> Option<String> {
+        if !self.finding_ids.contains(&record.finding_id) {
+            return Some(format!(
+                "error: link references unknown finding id `{}`",
+                record.finding_id
+            ));
+        }
+        if record.semantic_ids.is_empty() {
+            return Some(format!(
+                "error: finding `{}` must link to at least one semantic",
+                record.finding_id
+            ));
+        }
+        for semantic_id in &record.semantic_ids {
+            if !self.semantic_ids.contains(semantic_id) {
+                return Some(format!(
+                    "error: link references unknown semantic id `{semantic_id}`"
+                ));
+            }
+        }
+        None
+    }
+}
+
+#[derive(Debug, Clone)]
+#[tool(
+    arguments = NarrativeSemanticRecord,
+    invoke = invoke,
+    description = "Emit one reusable exploit-pattern semantic with a unique sem-<ordinal> id. Emit all distinct semantics before linking findings.",
+    name = "emit_narrative_semantic",
+)]
+struct EmitNarrativeSemanticTool {
+    buffer: Arc<AgentChunkBuffer<NarrativeCombinedItem>>,
+    state: Arc<Mutex<NarrativeCombinedState>>,
+}
+
+impl EmitNarrativeSemanticTool {
+    async fn invoke(
+        &self,
+        args: NarrativeSemanticRecord,
+    ) -> std::result::Result<String, LLMYError> {
+        {
+            let state = self.state.lock().await;
+            if let Some(error) = state.validate_semantic(&args) {
+                return Ok(error);
+            }
+        }
+        let message = self
+            .buffer
+            .push_with_message(NarrativeCombinedItem::Semantic(args.clone()), "semantic")
+            .await;
+        if message.starts_with("error:") {
+            return Ok(message);
+        }
+        self.state.lock().await.semantic_ids.insert(args.id);
+        Ok(message)
+    }
+}
+
+#[derive(Debug, Clone)]
+#[tool(
+    arguments = NarrativeFindingRecord,
+    invoke = invoke,
+    description = "Emit one atomic vulnerability mechanism with a unique finding-<ordinal> id. Emit separate records for independent mechanisms, even when they share a report title.",
+    name = "emit_narrative_finding",
+)]
+struct EmitNarrativeFindingTool {
+    buffer: Arc<AgentChunkBuffer<NarrativeCombinedItem>>,
+    state: Arc<Mutex<NarrativeCombinedState>>,
+}
+
+impl EmitNarrativeFindingTool {
+    async fn invoke(&self, args: NarrativeFindingRecord) -> std::result::Result<String, LLMYError> {
+        {
+            let state = self.state.lock().await;
+            if let Some(error) = state.validate_finding(&args) {
+                return Ok(error);
+            }
+        }
+        let message = self
+            .buffer
+            .push_with_message(NarrativeCombinedItem::Finding(args.clone()), "finding")
+            .await;
+        if message.starts_with("error:") {
+            return Ok(message);
+        }
+        self.state.lock().await.finding_ids.insert(args.id);
+        Ok(message)
+    }
+}
+
+#[derive(Debug, Clone)]
+#[tool(
+    arguments = NarrativeLinkRecord,
+    invoke = invoke,
+    description = "Link one finding to every semantic needed to reproduce it. Call only after the referenced records have been emitted.",
+    name = "link_narrative_finding",
+)]
+struct LinkNarrativeFindingTool {
+    buffer: Arc<AgentChunkBuffer<NarrativeCombinedItem>>,
+    state: Arc<Mutex<NarrativeCombinedState>>,
+}
+
+impl LinkNarrativeFindingTool {
+    async fn invoke(&self, args: NarrativeLinkRecord) -> std::result::Result<String, LLMYError> {
+        {
+            let state = self.state.lock().await;
+            if let Some(error) = state.validate_link(&args) {
+                return Ok(error);
+            }
+        }
+        let message = self
+            .buffer
+            .push_with_message(NarrativeCombinedItem::Link(args.clone()), "finding link")
+            .await;
+        if message.starts_with("error:") {
+            return Ok(message);
+        }
+        let mut state = self.state.lock().await;
+        for semantic_id in args.semantic_ids {
+            state.links.insert((args.finding_id.clone(), semantic_id));
+        }
+        Ok(message)
+    }
+}
+
+#[derive(Debug, Clone)]
+#[tool(
+    arguments = FinalizeArgs,
+    invoke = invoke,
+    description = "Finalize only after all semantics, findings, and finding-to-semantic links in this report chunk have been emitted.",
+    name = "finalize_narrative_extraction",
+)]
+struct FinalizeNarrativeExtractionTool {
+    buffer: Arc<AgentChunkBuffer<NarrativeCombinedItem>>,
+}
+
+impl FinalizeNarrativeExtractionTool {
+    async fn invoke(&self, args: FinalizeArgs) -> std::result::Result<String, LLMYError> {
+        Ok(self
+            .buffer
+            .finalize_with_message(args.summary, "narrative extraction")
+            .await)
+    }
+}
+
+pub struct NarrativeChunkExtractor {
+    pub llm: LLM,
+    pub options: AgentRunOptions,
+    pub system_prompt: String,
+    pub user_prompt: String,
+    pub cache_key: String,
+    pub label: String,
+}
+
+impl NarrativeChunkExtractor {
+    pub async fn run(self) -> Result<Vec<NarrativeCombinedItem>> {
+        let buffer = AgentChunkBuffer::<NarrativeCombinedItem>::new();
+        let state = Arc::new(Mutex::new(NarrativeCombinedState::default()));
+
+        let mut tools = ToolBox::new();
+        tools.add_tool(EmitNarrativeSemanticTool {
+            buffer: buffer.clone(),
+            state: state.clone(),
+        });
+        tools.add_tool(EmitNarrativeFindingTool {
+            buffer: buffer.clone(),
+            state: state.clone(),
+        });
+        tools.add_tool(LinkNarrativeFindingTool {
+            buffer: buffer.clone(),
+            state: state.clone(),
+        });
+        tools.add_tool(FinalizeNarrativeExtractionTool {
+            buffer: buffer.clone(),
+        });
+
+        let runner = AgentChunkRunner {
+            llm: self.llm,
+            options: self.options,
+            buffer: buffer.clone(),
+            tools,
+            system_prompt: self.system_prompt,
+            user_prompt: self.user_prompt,
+            cache_key: self.cache_key,
+            label: self.label,
+        };
+        let _outcome = runner.run().await?;
+        Ok(buffer.drain().await)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Merge — shared types
 // ---------------------------------------------------------------------------
 
@@ -542,7 +808,7 @@ impl MergeChunkingOptions {
 /// previously merged into it. The agent sees the full provenance so any
 /// `updated_*` generalization it produces can take prior merges into
 /// account.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CanonicalWithChildren<T> {
     pub canonical: T,
     /// Raw rows where `_merge.from = self.canonical.id`. Empty when the
@@ -1391,7 +1657,7 @@ impl FindingMergeChunkRunner {
 /// Per-canonical finding bundle: the canonical row + its taxonomy entry +
 /// the raws that have been merged into it. Findings (unlike semantics)
 /// also carry a `finding_category` join for taxonomy display.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FindingCanonicalWithTaxonomy {
     pub canonical: audit_finding::Model,
     pub category: finding_category::Model,

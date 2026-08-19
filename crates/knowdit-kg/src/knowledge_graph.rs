@@ -1,8 +1,9 @@
 use crate::error::Result;
 use knowdit_kg_model::db::{
-    audit_finding, audit_finding_category, category, finding_category, finding_link_status,
-    finding_merge, project, project_category, project_finding, project_platform, project_semantic,
-    semantic_finding_link, semantic_function, semantic_merge, semantic_node,
+    audit_finding, audit_finding_category, category, feed_report_source, finding_category,
+    finding_link_status, finding_merge, project, project_category, project_finding,
+    project_platform, project_semantic, semantic_finding_link, semantic_function, semantic_merge,
+    semantic_node,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -39,6 +40,8 @@ pub struct KnowledgeGraph {
     #[serde(default)]
     pub finding_link_statuses: Vec<finding_link_status::Model>,
     pub finding_merges: Vec<finding_merge::Model>,
+    #[serde(default)]
+    pub feed_report_sources: Vec<feed_report_source::Model>,
 }
 
 impl KnowledgeGraph {

@@ -13,6 +13,40 @@ Follow the user's instructions exactly.
 Use canonical, project-agnostic DeFi terminology.
 When the user requests JSON, return strict JSON only."#;
 
+pub const NARRATIVE_ROLE_SYSTEM: &str = r#"You are an expert blockchain security researcher and smart contract exploit analyst.
+Follow the user's instructions exactly.
+Use canonical, project-agnostic security terminology.
+When the user requests JSON, return strict JSON only."#;
+
+pub const NARRATIVE_PROJECT_PREFIX_HEAD: &str = r#"You are given a blockchain security report describing one or more smart contract vulnerabilities.
+Read the report carefully.
+Use only the material provided.
+Apply the category definitions below consistently whenever you classify either the report or any extracted semantic.
+
+## Category Definitions
+
+"#;
+
+pub const NARRATIVE_PROJECT_MATERIALS_HEADER: &str = r#"## Security Report
+
+"#;
+
+pub const NARRATIVE_REPORT_PREFIX_HEAD: &str = r#"You are given a blockchain security report.
+This report may be a single-exploit attack analysis or a collection of audit findings.
+Read the material carefully.
+Use only the material provided.
+Classify each extracted vulnerability with exactly one category and one subcategory from the taxonomy below.
+
+## Severity Definitions
+
+- High: Exploitation directly causes meaningful fund loss.
+- Medium: Exploitation does not directly cause fund loss, or only causes very small loss comparable to operational or gas impact, such as denial of service.
+- Low: Gas optimizations, hardening suggestions, or minor correctness issues.
+
+## Vulnerability Taxonomy
+
+"#;
+
 pub const PROJECT_USER_PREFIX_HEAD: &str = r#"You are given a DeFi project.
 Read the project materials carefully.
 Use only the material provided.
@@ -82,6 +116,22 @@ pub fn report_user_prefix() -> String {
     )
 }
 
+pub fn narrative_project_user_prefix() -> String {
+    format!(
+        "{}{}{}",
+        NARRATIVE_PROJECT_PREFIX_HEAD, CATEGORY_DEFINITIONS, NARRATIVE_PROJECT_MATERIALS_HEADER
+    )
+}
+
+pub fn narrative_report_user_prefix() -> String {
+    format!(
+        "{}{}\n{}",
+        NARRATIVE_REPORT_PREFIX_HEAD,
+        taxonomy_prompt(),
+        REPORT_MATERIALS_HEADER
+    )
+}
+
 pub const CATEGORIZE_USER_SUFFIX: &str = r#"
 ## Instructions
 
@@ -91,6 +141,18 @@ Analyze the project materials above and determine which DeFi categories the proj
 
 Use these tools to record your decision (do NOT output JSON in plain text):
 - `set_project_categories({reasoning, project_name, categories})` — call exactly once, with `categories` populated by the chosen DeFi category enum values (e.g. `Lending`, `Yield`). Multiple entries are allowed.
+- `finalize_categorization({summary?})` — call exactly once after `set_project_categories`. After this, stop emitting tool calls.
+"#;
+
+pub const NARRATIVE_CATEGORIZE_USER_SUFFIX: &str = r#"
+## Instructions
+
+Analyze the security report above and determine which DeFi categories the exploited or audited protocol belongs to. A protocol may belong to multiple categories. Use the category definitions above.
+
+## Tool Usage
+
+Use these tools to record your decision (do NOT output JSON in plain text):
+- `set_project_categories({reasoning, project_name, categories})` — call exactly once, with `categories` populated by the chosen DeFi category enum values (e.g. `Lending`, `Dexes`). Multiple entries are allowed.
 - `finalize_categorization({summary?})` — call exactly once after `set_project_categories`. After this, stop emitting tool calls.
 "#;
 
@@ -152,6 +214,79 @@ A DeFi Semantic is defined by:
 Use these tools to stream out the extraction (do NOT emit free-form JSON):
 - `emit_semantic({{name, definition, description, category, functions: [{{name, contract, signature?}}, …]}})` — call once for each distinct DeFi Semantic you identify in this chunk. Cluster aggressively; emit one call per *distinct* semantic, with every same-meaning function listed inside `functions`.
 - `finalize_semantic_extraction({{summary?}})` — call exactly once when this chunk has been fully covered (or when it contains no meaningful DeFi semantics — call finalize directly without any `emit_semantic`). After this, stop emitting tool calls.
+"#
+    )
+}
+
+pub fn narrative_extract_semantics_user_suffix(categories: &[DeFiCategory]) -> String {
+    let known_categories = if categories.is_empty() {
+        "None".to_string()
+    } else {
+        categories
+            .iter()
+            .map(DeFiCategory::as_str)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    format!(
+        r#"
+## Instructions
+
+The security report above has already been categorized under: {known_categories}
+
+Extract Exploit Pattern Semantics from this security report.
+
+### Definition of Exploit Pattern Semantic
+
+An Exploit Pattern Semantic captures a reusable vulnerability mechanism — the abstract pattern that makes the exploit reproducible across different protocols.
+
+1. **Name:** A short, canonical exploit pattern name. No protocol/contract/asset names.
+   - Good: "Share Priced Against Subset of Total Value"
+   - Good: "Reward Accounting via Unauthenticated balanceOf"
+   - Good: "Sandwich Attack on Compounding Rebalance"
+   - Bad: "Bankroll Vault Share Bug"
+
+2. **Definition:** A one-sentence formal definition of this exploit pattern.
+
+3. **Description:** Concrete prose describing the mechanism in 4-8 sentences. Include:
+   - What invariant or assumption was violated
+   - The specific accounting, call-ordering, or state-drift failure
+   - What state variables or balances drift, how, and under what conditions
+   - Attacker setup requirements (flash loan, specific preconditions, timing)
+   - Downstream consequences of the exploit
+   If the report cites specific code (state variables, function names, formulas), preserve those concrete details in the description — they make the pattern searchable. Detail beats brevity.
+
+4. **Category:** Exactly one DeFi category, picked from the project's known categories above.
+   This is the protocol's category (e.g. Lending, Dexes), not an exploit type.
+
+5. **Functions:** Always emit at least one entry. If the report references specific contract functions,
+   include them: `{{name: "<function>", contract: "<file or path>"}}`. If no specific functions
+   are referenced, emit a sentinel: `{{name: "_narrative", contract: "<report_filename>"}}`.
+
+### Critical Rules
+
+1. **Hard rule on abstraction.** In the `name`, `definition`, and `description` fields you MUST NOT include:
+   - Specific protocol/project names (Bankroll, PancakeSwap, Uniswap, Aave)
+   - Specific contract names (VltUsdcVault, ZapHelper)
+   - Specific branded asset names (USDC, stETH, wstETH) — say "stablecoin", "wrapped staking receipt"
+   Use canonical DeFi roles: "liquidity vault", "AMM pool", "collateralized debt position", etc.
+
+2. **Cluster aggressively.** If the report describes multiple aspects of the same exploit mechanism
+   (e.g. accounting asymmetry in both deposit AND redeem paths), emit ONE semantic capturing
+   the shared root cause. The number of distinct semantics should stay small.
+
+3. **Be concrete.** Preserve technical details from the report — specific accounting formulas,
+   state variable names, call sequences. These are what make the pattern reusable.
+
+4. **Be thorough within this report** but stay project-agnostic. Cross-project merging will
+   deduplicate later.
+
+## Tool Usage
+
+Use these tools to stream out the extraction (do NOT emit free-form JSON):
+- `emit_semantic({{name, definition, description, category, functions: [{{name, contract, signature?}}, …]}})` — call once for each distinct exploit pattern you identify in this report. Cluster aggressively; emit one call per *distinct* pattern.
+- `finalize_semantic_extraction({{summary?}})` — call exactly once when this report has been fully covered (or when it contains no meaningful exploit patterns — call finalize directly without any `emit_semantic`). After this, stop emitting tool calls.
 "#
     )
 }
@@ -315,6 +450,109 @@ Use these tools to stream out the extraction (do NOT emit free-form JSON):
 - `emit_finding({{title, severity, category, subcategory, root_cause, description, patterns, exploits}})` — call once per *atomic* vulnerability mechanism. If one original report finding decomposes into multiple independent mechanisms, share the same `title` across the calls but populate `root_cause` / `patterns` / `exploits` independently for each.
 - `finalize_finding_extraction({{summary?}})` — call exactly once when every distinct finding in this chunk has been emitted (or when the chunk contains no findings — call finalize directly without `emit_finding`). Stop afterwards.
 "#
+    )
+}
+
+pub fn narrative_extract_findings_user_suffix(categories: &[DeFiCategory]) -> String {
+    let known_categories = if categories.is_empty() {
+        "None".to_string()
+    } else {
+        categories
+            .iter()
+            .map(DeFiCategory::as_str)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    format!(
+        r###"
+## Instructions
+
+The underlying protocol for this report has been categorized as: {known_categories}
+
+Extract concrete vulnerability findings from the security report above.
+
+### Handling Different Report Formats
+
+- **Audit reports** with explicit "## Severity", "## Description", "## Impact" sections →
+  extract one finding per vulnerability. Preserve original finding titles when available.
+- **Attack analyses** without explicit finding structure →
+  extract one finding covering the entire exploit.
+
+### Per-Finding Structure
+
+Capture:
+1. **title**: Keep the original report title when available. For unstructured narratives, create a concise title summarizing the vulnerability.
+2. **root_cause**: The fundamental design or implementation flaw. Cite the specific accounting step / state mutation / call ordering / assumption that was violated. E.g. "Share minting accounts only for position liquidity L, not the vault's full asset inventory (pending fees, retained balances, compound dust)" — not just "share pricing bug".
+3. **description**: The full exploit mechanism — what goes wrong, how, and why. Combine the report's Description and Impact sections. Include: what invariant was violated, the sequence of steps that trigger the bug, what state drifts, and concrete consequences.
+4. **severity**: One of `High`, `Medium`, or `Low` using the severity definitions above. If the report states severity explicitly, use it. Otherwise infer: loss of funds → High, griefing / denial of service → Medium, informational design issues → Low.
+5. **patterns**: Concrete exploit patterns used. If a PoC is provided, summarize the exploitation steps. Reference specific functions, state variables, and control-flow shapes cited in the report. E.g. "Depositor calls `deposit()` while `claimableUsdc < AUTO_COMPOUND_MIN_USDC` → `_compound()` skipped → retained fees from prior epoch are folded into new depositor's shares at next compound."
+6. **exploits**: The actual attack sequence in reproducible detail. A future reader should be able to translate the prose into an explicit transaction sequence. If the report provides a PoC, capture its key steps here.
+7. **category**: Exactly one top-level vulnerability category from the taxonomy.
+8. **subcategory**: Exactly one subcategory from the chosen top-level category.
+
+### Critical Rules
+
+0. **Hard rule on abstraction.** Outside the `title` field, fields MUST NOT include:
+   - Specific protocol/project names
+   - Specific contract names
+   - Specific branded asset names (say "stablecoin", "wrapped staking receipt")
+   Use only abstract roles.
+1. If the report describes multiple independently triggerable vulnerability mechanisms, emit one record per mechanism. They share the same `title` but each record's `root_cause`, `patterns`, and `exploits` describe one mechanism only.
+2. Do not invent findings not supported by the report.
+3. Always use a subcategory name exactly as written in the taxonomy.
+4. Deduplicate repeated mentions of the same finding.
+
+## Tool Usage
+
+Use these tools to stream out the extraction (do NOT emit free-form JSON):
+- `emit_finding({{title, severity, category, subcategory, root_cause, description, patterns, exploits}})` — call once per distinct vulnerability mechanism.
+- `finalize_finding_extraction({{summary?}})` — call exactly once when every distinct finding has been emitted. Stop afterwards.
+"###
+    )
+}
+
+pub fn narrative_combined_extract_user_suffix(categories: &[DeFiCategory]) -> String {
+    let known_categories = if categories.is_empty() {
+        "None".to_string()
+    } else {
+        categories
+            .iter()
+            .map(DeFiCategory::as_str)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    format!(
+        r###"
+## Instructions
+
+The report's protocol has been categorized as: {known_categories}
+
+Extract both reusable exploit-pattern semantics and atomic vulnerability findings from the report above in one pass. The report may contain an overview, vulnerable or reconstructed code, an attack flow, a PoC, a classification table, remediation, lessons, and on-chain verification. Treat those sections as evidence for the same report, not as separate incidents.
+
+### Semantics
+
+Emit one semantic for each distinct reusable exploit mechanism. Keep names, definitions, and descriptions project-agnostic, but preserve concrete state variables, functions, call ordering, assumptions, and prerequisites in the description. Every semantic needs at least one function reference; use `_narrative` and the report filename when no function is named.
+
+### Findings
+
+Emit one finding for each independently triggerable vulnerability mechanism. If a classification table gives IDs such as V-01, V-02, or V-03, preserve each independently supported row as a separate finding even when several findings share one attack. Do not collapse a prerequisite, missing defense, bypass condition, or separately exploitable impact mechanism into a generic report-level finding. Conversely, do not create a finding for a venue or dependency explicitly described as not vulnerable, such as an exchange pool used only to exit minted or stolen assets. Do not treat remediation, lessons, or comparison incidents as new findings.
+
+Use the original report title for related findings when no more specific title exists. Preserve explicit severity when the report states it; otherwise infer from impact. Respect the report's own distinction between verified, inferred, reconstructed, estimated, superseded, and unconfirmed evidence in the finding prose. Never invent a transaction, address, code fact, or vulnerability absent from the report.
+
+### Links
+
+After emitting all semantics and findings, link every finding to one or more semantics that describe the business logic required to reproduce it. A finding may link to several semantics. Link IDs must refer to records emitted in this chunk. Use IDs in the `sem-<ordinal>` and `finding-<ordinal>` formats; the extractor will namespace them for this chunk.
+
+### Tool Usage
+
+Use only these tools; do not emit free-form JSON:
+- `emit_narrative_semantic({{id, name, definition, description, category, functions: [{{name, contract, signature?}}, …]}})` — once per distinct exploit-pattern semantic.
+- `emit_narrative_finding({{id, title, severity, category, subcategory, root_cause, description, patterns, exploits}})` — once per atomic vulnerability mechanism, including independently supported classification-table rows.
+- `link_narrative_finding({{finding_id, semantic_ids}})` — after the referenced records exist; every finding must have at least one semantic.
+- `finalize_narrative_extraction({{summary?}})` — exactly once after all records and links are emitted.
+"###
     )
 }
 

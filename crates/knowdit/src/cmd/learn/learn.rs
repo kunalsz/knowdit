@@ -145,6 +145,7 @@ impl LearnArgs {
             all_projects,
             self.concurrency,
             self.link,
+            false,
             self.merge.to_agent_options(),
             self.merge.to_chunking_options(),
             self.finding_link.to_options(self.concurrency),
@@ -200,6 +201,7 @@ impl LearnC4Args {
             all_projects,
             self.concurrency,
             self.link,
+            false,
             self.merge.to_agent_options(),
             self.merge.to_chunking_options(),
             self.finding_link.to_options(self.concurrency),
@@ -280,6 +282,7 @@ impl LearnMovesArgs {
             all_projects,
             self.concurrency,
             self.link,
+            false,
             self.merge.to_agent_options(),
             self.merge.to_chunking_options(),
             self.finding_link.to_options(self.concurrency),
@@ -385,6 +388,7 @@ impl LearnSherlockArgs {
             all_projects,
             self.concurrency,
             self.link,
+            false,
             self.merge.to_agent_options(),
             self.merge.to_chunking_options(),
             self.finding_link.to_options(self.concurrency),
@@ -397,14 +401,49 @@ impl LearnSherlockArgs {
     }
 }
 
+async fn admit_incremental_project(
+    db: &HistoricalDatabase,
+    llm: &llmy::client::client::LLM,
+    project: &ProjectData,
+    extract: &ExtractResult,
+    agent_options: &knowdit_kg::agent_runner::AgentRunOptions,
+    merge_chunking: knowdit_kg::agents::MergeChunkingOptions,
+) -> Result<()> {
+    let txn = db.begin().await?;
+    let new_canonicals = project
+        .merge_and_write_txn(&txn, db, llm, extract, agent_options, merge_chunking)
+        .await?;
+    let enqueued = db
+        .enqueue_pending_canonical_semantics_txn(&txn, &new_canonicals)
+        .await?;
+    txn.commit().await?;
+    if let Err(error) = db
+        .clear_extraction_chunks_for_project(&project.display_id())
+        .await
+    {
+        tracing::warn!(
+            "Project {} committed, but checkpoint cleanup failed: {}",
+            project.display_id(),
+            error
+        );
+    }
+    tracing::info!(
+        "Incrementally admitted {} with {} new canonical semantic(s) enqueued for retro-link",
+        project.display_id(),
+        enqueued
+    );
+    Ok(())
+}
+
 /// Shared pipeline: categorize+extract concurrently, then merge+write each
 /// project serially as soon as extraction finishes.
-async fn run_pipeline(
+pub async fn run_pipeline(
     db: &HistoricalDatabase,
     llm: &llmy::client::client::LLM,
     all_projects: Vec<ProjectData>,
     concurrency: usize,
     link: bool,
+    incremental_links: bool,
     agent_options: knowdit_kg::agent_runner::AgentRunOptions,
     merge_chunking: knowdit_kg::agents::MergeChunkingOptions,
     link_options: FindingLinkOptions,
@@ -430,6 +469,10 @@ async fn run_pipeline(
     if pending.is_empty() {
         tracing::info!("All projects already completed.");
         if link {
+            if incremental_links {
+                knowdit_kg::link::retro_link_pending_semantics(db, llm, link_options.clone())
+                    .await?;
+            }
             link_options.link_pending_findings(db, llm).await?;
         }
         return Ok(());
@@ -455,14 +498,27 @@ async fn run_pipeline(
                 .await
             {
                 Ok(extract) => {
-                    if let Err(e) = project
-                        .merge_and_write(db, llm, &extract, &agent_options, merge_chunking)
+                    let result = if incremental_links {
+                        admit_incremental_project(
+                            db,
+                            llm,
+                            &project,
+                            &extract,
+                            &agent_options,
+                            merge_chunking,
+                        )
                         .await
-                    {
+                    } else {
+                        project
+                            .merge_and_write(db, llm, &extract, &agent_options, merge_chunking)
+                            .await
+                            .map_err(|error| color_eyre::eyre::eyre!(error.to_string()))
+                    };
+                    if let Err(error) = result {
                         tracing::error!(
                             "Failed to merge/write project {}: {}",
                             project.display_id(),
-                            e
+                            error
                         );
                     }
                 }
@@ -490,7 +546,8 @@ async fn run_pipeline(
             let force_remove_pending_chunks = force_remove_pending_chunks;
             handles.spawn(async move {
                 while let Ok(project) = rx.recv().await {
-                    let res = project
+                    let project_id = project.display_id();
+                    match project
                         .categorize_and_extract(
                             &llm,
                             &extract_opts,
@@ -498,10 +555,24 @@ async fn run_pipeline(
                             Some(&task_db),
                             force_remove_pending_chunks,
                         )
-                        .await?;
-                    out.send(Ok((project, res)))
                         .await
-                        .expect("can not send out project");
+                    {
+                        Ok(res) => {
+                            if out.send(Ok((project, res))).await.is_err() {
+                                tracing::warn!(
+                                    "pipeline receiver closed while sending {project_id}"
+                                );
+                                break;
+                            }
+                        }
+                        Err(error) => {
+                            tracing::error!(
+                                "Skipping merge for project {} (extract failed: {})",
+                                project_id,
+                                error
+                            );
+                        }
+                    }
                 }
                 Ok::<_, KgError>(())
             });
@@ -515,15 +586,41 @@ async fn run_pipeline(
 
         drop(tx);
         while let Some(handle) = out_rx.recv().await {
-            let (project, extract_res): (ProjectData, ExtractResult) = handle?;
-
-            project
-                .merge_and_write(db, llm, &extract_res, &agent_options, merge_chunking)
-                .await?;
+            let (project, extract_res): (ProjectData, ExtractResult) = match handle {
+                Ok(result) => result,
+                Err(error) => {
+                    tracing::error!("Project extraction worker failed: {error}");
+                    continue;
+                }
+            };
+            let project_id = project.display_id();
+            let result = if incremental_links {
+                admit_incremental_project(
+                    db,
+                    llm,
+                    &project,
+                    &extract_res,
+                    &agent_options,
+                    merge_chunking,
+                )
+                .await
+            } else {
+                project
+                    .merge_and_write(db, llm, &extract_res, &agent_options, merge_chunking)
+                    .await
+                    .map_err(|error| color_eyre::eyre::eyre!(error.to_string()))
+            };
+            if let Err(error) = result {
+                tracing::error!("Failed to merge/write project {}: {}", project_id, error);
+            }
         }
     }
 
     if link {
+        if incremental_links {
+            let retro_options = link_options.clone();
+            knowdit_kg::link::retro_link_pending_semantics(db, llm, retro_options).await?;
+        }
         link_options.link_pending_findings(db, llm).await?;
     }
 

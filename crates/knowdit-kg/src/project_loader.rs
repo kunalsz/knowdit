@@ -32,34 +32,61 @@ pub use knowdit_project::{
 /// merge chunking) are passed in as method parameters, not stored
 /// on this struct.
 #[derive(Debug, Clone)]
+pub struct FeedReportSource {
+    pub source_namespace: String,
+    pub relative_path: String,
+    pub stable_source_id: String,
+    pub legacy_platform_id: Option<String>,
+    pub content_hash: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct ProjectData {
     /// The project + optional audit-report payload. Owned so this
     /// wrapper can be cloned cheaply and threaded into async tasks.
     pub paired: knowdit_project::C4PairedProjectData,
+    /// When true, prompts use narrative/post-mortem templates instead of
+    /// Solidity/Move source-code templates. The markdown content is treated
+    /// as BOTH source material (for exploit-pattern semantic extraction) and
+    /// audit report material (for vulnerability finding extraction).
+    pub is_narrative: bool,
+    pub feed_source: Option<FeedReportSource>,
 }
 
 impl ProjectData {
     /// Parse `name:path` / `name:path:platform_id` and load the
     /// project as Solidity (no language auto-detection).
     pub async fn from_path_spec(spec: &str) -> Result<Self> {
-        Ok(Self::wrap(
-            knowdit_project::ProjectData::from_path_spec(spec).await?,
-        ))
+        Ok(Self {
+            paired: knowdit_project::C4PairedProjectData::bare(
+                knowdit_project::ProjectData::from_path_spec(spec).await?,
+            ),
+            is_narrative: false,
+            feed_source: None,
+        })
     }
 
     /// Parse `name:path` / `name:path:platform_id` and load the
     /// project, auto-detecting Solidity vs Move.
     pub async fn from_source_dir_spec(spec: &str) -> Result<Self> {
-        Ok(Self::wrap(
-            knowdit_project::ProjectData::from_source_dir_spec(spec).await?,
-        ))
+        Ok(Self {
+            paired: knowdit_project::C4PairedProjectData::bare(
+                knowdit_project::ProjectData::from_source_dir_spec(spec).await?,
+            ),
+            is_narrative: false,
+            feed_source: None,
+        })
     }
 
     /// Solidity-only loader over a known directory.
     pub async fn from_dir(name: &str, root_dir: &Path, platform_id: Option<&str>) -> Result<Self> {
-        Ok(Self::wrap(
-            knowdit_project::ProjectData::from_dir(name, root_dir, platform_id).await?,
-        ))
+        Ok(Self {
+            paired: knowdit_project::C4PairedProjectData::bare(
+                knowdit_project::ProjectData::from_dir(name, root_dir, platform_id).await?,
+            ),
+            is_narrative: false,
+            feed_source: None,
+        })
     }
 
     /// Load a Code4rena contest: `(audit_meta + source contracts +
@@ -69,7 +96,11 @@ impl ProjectData {
     pub async fn from_c4(dataset_dir: &Path, contest_id: u32) -> Result<Self> {
         let paired =
             knowdit_project::C4PairedProjectData::from_dataset_dir(dataset_dir, contest_id).await?;
-        Ok(Self { paired })
+        Ok(Self {
+            paired,
+            is_narrative: false,
+            feed_source: None,
+        })
     }
 
     /// Load a Sherlock contest from a `sherlock-scrape/out` directory.
@@ -79,7 +110,11 @@ impl ProjectData {
         Ok(
             knowdit_project::C4PairedProjectData::from_sherlock(out_dir, contest_id)
                 .await?
-                .map(|paired| Self { paired }),
+                .map(|paired| Self {
+                    paired,
+                    is_narrative: false,
+                    feed_source: None,
+                }),
         )
     }
 
@@ -97,7 +132,11 @@ impl ProjectData {
             Some(snippet) => knowdit_project::C4PairedProjectData::from_move_pair(project, snippet),
             None => knowdit_project::C4PairedProjectData::bare(project),
         };
-        Ok(Self { paired })
+        Ok(Self {
+            paired,
+            is_narrative: false,
+            feed_source: None,
+        })
     }
 
     /// Adapt a `knowdit_project::ProjectData` view (no audit) into
@@ -108,7 +147,48 @@ impl ProjectData {
     pub fn from_project_view(view: &knowdit_project::ProjectData) -> Self {
         Self {
             paired: knowdit_project::C4PairedProjectData::bare(view.clone()),
+            is_narrative: false,
+            feed_source: None,
         }
+    }
+
+    /// Load a markdown security report as a narrative project. The
+    /// markdown content is loaded as BOTH the source material (for
+    /// exploit-pattern semantic extraction) AND the audit report (for
+    /// vulnerability finding extraction). The functions field in
+    /// extracted semantics uses `_narrative` as a sentinel.
+    ///
+    /// `name` is the project name (typically the file stem).
+    /// `root_dir` is the parent directory containing the `.md` file.
+    /// `relative_path` is the path to the `.md` file relative to `root_dir`.
+    pub async fn from_narrative_md(
+        name: &str,
+        root_dir: &Path,
+        platform_id: Option<&str>,
+        relative_path: &Path,
+        feed_source: FeedReportSource,
+    ) -> Result<Self> {
+        let project = knowdit_project::ProjectData::from_relative_paths(
+            name,
+            root_dir,
+            knowdit_project::SourceLanguage::Solidity,
+            platform_id,
+            &[relative_path.to_path_buf()],
+        )
+        .await?;
+
+        // Clone the source content to also serve as the audit report.
+        let content = project.source_files()[0].content.clone();
+        let paired = knowdit_project::C4PairedProjectData::audit_only(
+            project,
+            knowdit_project::AuditReportMaterial::Text(content),
+        );
+
+        Ok(Self {
+            paired,
+            is_narrative: true,
+            feed_source: Some(feed_source),
+        })
     }
 
     // ----------------------------------------------------------------
@@ -146,11 +226,5 @@ impl ProjectData {
     /// shape and a number of `format!()` sites still expect it.
     pub fn display_id(&self) -> String {
         self.paired.project.display_id().to_string()
-    }
-
-    fn wrap(view: knowdit_project::ProjectData) -> Self {
-        Self {
-            paired: knowdit_project::C4PairedProjectData::bare(view),
-        }
     }
 }

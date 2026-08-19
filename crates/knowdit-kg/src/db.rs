@@ -6,10 +6,10 @@ use itertools::Itertools;
 use knowdit_kg_model::db::merge_status::MergePhase;
 use knowdit_kg_model::db::operation_history::{self, OperationType};
 use knowdit_kg_model::db::{
-    audit_finding, audit_finding_category, category, extraction_chunk, finding_category,
-    finding_link_status, finding_merge, merge_status, pending_semantic, project, project_category,
-    project_finding, project_platform, project_semantic, semantic_finding_link, semantic_function,
-    semantic_merge, semantic_node,
+    audit_finding, audit_finding_category, category, extraction_chunk, feed_report_source,
+    finding_category, finding_link_status, finding_merge, merge_status, pending_semantic, project,
+    project_category, project_finding, project_platform, project_semantic, semantic_finding_link,
+    semantic_function, semantic_merge, semantic_node,
 };
 use knowdit_kg_model::link_strength::LinkStrength;
 use sea_orm::{
@@ -18,7 +18,7 @@ use sea_orm::{
     ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection, DatabaseTransaction,
     EntityTrait, IntoActiveModel, PaginatorTrait, QueryFilter, QueryOrder, Schema, Statement,
     TransactionTrait,
-    sea_query::{ForeignKey, ForeignKeyAction, TableCreateStatement},
+    sea_query::{ForeignKey, ForeignKeyAction, Index, TableCreateStatement},
 };
 use std::collections::{HashMap, HashSet};
 
@@ -67,6 +67,48 @@ pub struct LinkedFinding {
     pub finding: audit_finding::Model,
     pub strength: LinkStrength,
     pub evidence: String,
+}
+
+/// Per-table movement counts produced by one
+/// [`HistoricalDatabase::remap_semantic_merge_txn`] call: how many rows
+/// moved off the merge source (raw) onto the canonical, and how many
+/// collided with an existing canonical-side row.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RemapSemanticOutcome {
+    /// `semantic_finding_link` rows moved raw → canonical.
+    pub links_moved: usize,
+    /// `semantic_finding_link` rows dropped because the canonical already
+    /// held an equal-or-stronger edge for the same finding.
+    pub links_collided: usize,
+    /// `semantic_function` rows moved raw → canonical.
+    pub functions_moved: usize,
+    /// `semantic_function` rows dropped because the canonical already held
+    /// the identical (function_name, contract_path).
+    pub functions_skipped_dup: usize,
+    /// `project_semantic` rows moved raw → canonical.
+    pub provenance_moved: usize,
+}
+
+/// Per-table movement counts produced by one
+/// [`HistoricalDatabase::remap_finding_merge_txn`] call.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RemapFindingOutcome {
+    /// `semantic_finding_link` rows moved raw finding → canonical finding.
+    pub links_moved: usize,
+    /// `semantic_finding_link` rows dropped because the canonical already
+    /// held an equal-or-stronger edge for the same semantic.
+    pub links_collided: usize,
+    /// `project_finding` rows moved raw finding → canonical finding.
+    pub provenance_moved: usize,
+}
+
+/// Aggregate result of [`HistoricalDatabase::remap_all_merge_links`].
+#[derive(Debug, Clone, Default)]
+pub struct RemapReport {
+    pub semantic_merges_processed: usize,
+    pub finding_merges_processed: usize,
+    pub semantic: RemapSemanticOutcome,
+    pub finding: RemapFindingOutcome,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -492,6 +534,9 @@ impl HistoricalDatabase {
             // Per-chunk extraction progress markers — INSERTed immediately
             // after each chunk's LLM call, outside the merge transaction.
             schema.create_table_from_entity(extraction_chunk::Entity),
+            // Durable source identity for Markdown report feeds. Legacy
+            // project_platform aliases remain untouched.
+            schema.create_table_from_entity(feed_report_source::Entity),
         ];
 
         for mut table in tables {
@@ -500,6 +545,16 @@ impl HistoricalDatabase {
             }
             conn.execute(&table).await?;
         }
+
+        let source_path_index = Index::create()
+            .if_not_exists()
+            .name("ux-feed-report-source-namespace-path")
+            .table(feed_report_source::Entity)
+            .col(feed_report_source::Column::SourceNamespace)
+            .col(feed_report_source::Column::RelativePath)
+            .unique()
+            .to_owned();
+        conn.execute(&source_path_index).await?;
 
         // sea-query 1.0 doesn't expose `MEDIUMTEXT` as a column type;
         // its `Text` variant maps to MySQL `TEXT` which tops out at
@@ -780,6 +835,19 @@ impl HistoricalDatabase {
             imported_rows += graph.finding_merges.len();
         }
 
+        if !graph.feed_report_sources.is_empty() {
+            feed_report_source::Entity::insert_many(
+                graph
+                    .feed_report_sources
+                    .iter()
+                    .cloned()
+                    .map(|model| model.into_active_model()),
+            )
+            .exec(&txn)
+            .await?;
+            imported_rows += graph.feed_report_sources.len();
+        }
+
         txn.commit().await?;
         Ok(imported_rows)
     }
@@ -844,6 +912,7 @@ impl HistoricalDatabase {
         copy_table!(finding_merge::Entity);
         copy_table!(project_semantic::Entity);
         copy_table!(project_finding::Entity);
+        copy_table!(feed_report_source::Entity);
         // `pending_semantic` is a writer-side retro-link queue; consumer / v3
         // source DBs legitimately drop it, and a missing table is semantically
         // an empty (drained) queue. Skip the copy instead of erroring so a
@@ -983,6 +1052,14 @@ impl HistoricalDatabase {
             let new_project_id = remap(&project_id_map, src_pp.project_id, "project")?;
             let mut am = src_pp.into_active_model();
             am.id = NotSet;
+            am.project_id = Set(new_project_id);
+            am.insert(&txn).await?;
+            copied += 1;
+        }
+
+        for src_feed in feed_report_source::Entity::find().all(&self.db).await? {
+            let new_project_id = remap(&project_id_map, src_feed.project_id, "project")?;
+            let mut am = src_feed.into_active_model();
             am.project_id = Set(new_project_id);
             am.insert(&txn).await?;
             copied += 1;
@@ -1395,6 +1472,244 @@ impl HistoricalDatabase {
             .await?
             .map(|p| p.status == "completed")
             .unwrap_or(false))
+    }
+
+    pub async fn is_feed_report_current(
+        &self,
+        source: &crate::project_loader::FeedReportSource,
+    ) -> Result<bool> {
+        let Some(mapping) = self
+            .feed_report_source_by_path(&source.source_namespace, &source.relative_path)
+            .await?
+        else {
+            return Ok(false);
+        };
+        if mapping.stable_source_id != source.stable_source_id
+            || mapping.content_hash != source.content_hash
+        {
+            return Ok(false);
+        }
+        Ok(project::Entity::find_by_id(mapping.project_id)
+            .one(&self.db)
+            .await?
+            .map(|project| project.status == "completed")
+            .unwrap_or(false))
+    }
+
+    pub async fn legacy_feed_platform_ids(&self) -> Result<Vec<(String, i32)>> {
+        let rows = project_platform::Entity::find()
+            .filter(project_platform::Column::PlatformId.like("feed-%"))
+            .all(&self.db)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .filter(|row| parse_legacy_feed_index(&row.platform_id).is_some())
+            .map(|row| (row.platform_id, row.project_id))
+            .collect())
+    }
+
+    pub async fn migrate_legacy_feed_sources(
+        &self,
+        sources: &[crate::project_loader::FeedReportSource],
+    ) -> Result<usize> {
+        let expected = sources
+            .iter()
+            .filter_map(|source| source.legacy_platform_id.as_deref())
+            .collect::<HashSet<_>>();
+        if expected.len() != sources.len() {
+            return Err(KgError::other(
+                "legacy feed migration requires a legacy platform id for every source",
+            ));
+        }
+        let platform_rows = self.legacy_feed_platform_ids().await?;
+        let mut expected_indices = sources
+            .iter()
+            .filter_map(|source| source.legacy_platform_id.as_deref())
+            .filter_map(parse_legacy_feed_index)
+            .collect::<Vec<_>>();
+        expected_indices.sort_unstable();
+        if expected_indices
+            .iter()
+            .enumerate()
+            .any(|(index, value)| *value != index as u64)
+        {
+            return Err(KgError::other(
+                "legacy feed migration requires contiguous feed ordinals starting at zero",
+            ));
+        }
+        if platform_rows.len() != expected.len()
+            || platform_rows
+                .iter()
+                .any(|(id, _)| !expected.contains(id.as_str()))
+        {
+            return Err(KgError::other(format!(
+                "legacy feed migration expected exactly {} feed platform rows, found {}",
+                expected.len(),
+                platform_rows.len()
+            )));
+        }
+        let txn = self.begin().await?;
+        let mut project_ids = HashSet::new();
+        for source in sources {
+            let legacy_id = source
+                .legacy_platform_id
+                .as_deref()
+                .ok_or_else(|| KgError::other("legacy feed source is missing its platform id"))?;
+            let Some(platform) = project_platform::Entity::find()
+                .filter(project_platform::Column::PlatformId.eq(legacy_id))
+                .one(&txn)
+                .await?
+            else {
+                return Err(KgError::other(format!(
+                    "legacy feed project `{legacy_id}` was not found"
+                )));
+            };
+            if !project_ids.insert(platform.project_id) {
+                return Err(KgError::other(format!(
+                    "legacy feed migration maps multiple reports to project {}",
+                    platform.project_id
+                )));
+            }
+            self.upsert_feed_report_source_txn(
+                &txn,
+                source,
+                platform.project_id,
+                true,
+                current_unix_timestamp(),
+            )
+            .await?;
+        }
+        txn.commit().await?;
+        Ok(sources.len())
+    }
+
+    pub async fn touch_feed_report_source(
+        &self,
+        source: &crate::project_loader::FeedReportSource,
+    ) -> Result<bool> {
+        let Some(mapping) = self
+            .feed_report_source_by_path(&source.source_namespace, &source.relative_path)
+            .await?
+        else {
+            return Ok(false);
+        };
+        let txn = self.begin().await?;
+        self.upsert_feed_report_source_txn(
+            &txn,
+            source,
+            mapping.project_id,
+            true,
+            current_unix_timestamp(),
+        )
+        .await?;
+        txn.commit().await?;
+        Ok(true)
+    }
+
+    pub async fn feed_report_source_by_path(
+        &self,
+        source_namespace: &str,
+        relative_path: &str,
+    ) -> Result<Option<feed_report_source::Model>> {
+        Ok(feed_report_source::Entity::find()
+            .filter(feed_report_source::Column::SourceNamespace.eq(source_namespace))
+            .filter(feed_report_source::Column::RelativePath.eq(relative_path))
+            .one(&self.db)
+            .await?)
+    }
+
+    pub async fn feed_report_sources_for_namespace(
+        &self,
+        source_namespace: &str,
+    ) -> Result<Vec<feed_report_source::Model>> {
+        Ok(feed_report_source::Entity::find()
+            .filter(feed_report_source::Column::SourceNamespace.eq(source_namespace))
+            .all(&self.db)
+            .await?)
+    }
+
+    pub async fn feed_report_source_by_stable_id(
+        &self,
+        stable_source_id: &str,
+    ) -> Result<Option<feed_report_source::Model>> {
+        Ok(feed_report_source::Entity::find()
+            .filter(feed_report_source::Column::StableSourceId.eq(stable_source_id))
+            .one(&self.db)
+            .await?)
+    }
+
+    pub async fn upsert_feed_report_source_txn(
+        &self,
+        conn: &DatabaseTransaction,
+        source: &crate::project_loader::FeedReportSource,
+        project_id: i32,
+        active: bool,
+        last_seen_unix: i64,
+    ) -> Result<()> {
+        let existing = feed_report_source::Entity::find_by_id(project_id)
+            .one(conn)
+            .await?;
+        if let Some(existing) = existing {
+            if existing.source_namespace != source.source_namespace
+                || existing.relative_path != source.relative_path
+                || existing.stable_source_id != source.stable_source_id
+                || existing.legacy_platform_id != source.legacy_platform_id
+            {
+                return Err(KgError::other(format!(
+                    "feed source mapping for project {} conflicts with existing path/identity",
+                    project_id
+                )));
+            }
+            let mut model = existing.into_active_model();
+            model.content_hash = Set(source.content_hash.clone());
+            model.active = Set(active);
+            model.last_seen_unix = Set(last_seen_unix);
+            model.update(conn).await?;
+        } else {
+            feed_report_source::ActiveModel {
+                project_id: Set(project_id),
+                source_namespace: Set(source.source_namespace.clone()),
+                relative_path: Set(source.relative_path.clone()),
+                stable_source_id: Set(source.stable_source_id.clone()),
+                legacy_platform_id: Set(source.legacy_platform_id.clone()),
+                content_hash: Set(source.content_hash.clone()),
+                active: Set(active),
+                last_seen_unix: Set(last_seen_unix),
+            }
+            .insert(conn)
+            .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn mark_feed_namespace_inactive(&self, source_namespace: &str) -> Result<u64> {
+        let result = feed_report_source::Entity::update_many()
+            .col_expr(
+                feed_report_source::Column::Active,
+                sea_orm::sea_query::Expr::value(false),
+            )
+            .filter(feed_report_source::Column::SourceNamespace.eq(source_namespace))
+            .exec(&self.db)
+            .await?;
+        Ok(result.rows_affected)
+    }
+
+    pub async fn mark_feed_report_seen(
+        &self,
+        source_namespace: &str,
+        relative_path: &str,
+    ) -> Result<()> {
+        let Some(existing) = self
+            .feed_report_source_by_path(source_namespace, relative_path)
+            .await?
+        else {
+            return Ok(());
+        };
+        let mut model = existing.into_active_model();
+        model.active = Set(true);
+        model.last_seen_unix = Set(current_unix_timestamp());
+        model.update(&self.db).await?;
+        Ok(())
     }
 
     // ── Extraction Chunk Checkpointing ──────────────────────────────────
@@ -2591,6 +2906,315 @@ impl HistoricalDatabase {
         Ok(())
     }
 
+    /// Upsert one `semantic_finding_link` row under the strongest-strength
+    /// rule against the supplied connection (caller owns the transaction).
+    /// Returns `true` when a NEW row was inserted and `false` when an
+    /// existing canonical-side row was kept (equal rank) or upgraded
+    /// (incoming strictly stronger) — the collision signal a remap pass
+    /// uses to count "would-have-lost" rows.
+    async fn upsert_semantic_finding_link_row<C: ConnectionTrait>(
+        conn: &C,
+        semantic_node_id: i32,
+        audit_finding_id: i32,
+        strength: LinkStrength,
+        evidence: &str,
+    ) -> Result<bool> {
+        let existing = semantic_finding_link::Entity::find()
+            .filter(semantic_finding_link::Column::SemanticNodeId.eq(semantic_node_id))
+            .filter(semantic_finding_link::Column::AuditFindingId.eq(audit_finding_id))
+            .one(conn)
+            .await?;
+        match existing {
+            None => {
+                semantic_finding_link::Entity::insert(semantic_finding_link::ActiveModel {
+                    semantic_node_id: Set(semantic_node_id),
+                    audit_finding_id: Set(audit_finding_id),
+                    strength: Set(strength),
+                    evidence: Set(evidence.to_string()),
+                })
+                .exec(conn)
+                .await?;
+                Ok(true)
+            }
+            Some(row) => {
+                let incoming_rank = strength.rank();
+                if incoming_rank > row.strength.rank() {
+                    let mut active: semantic_finding_link::ActiveModel = row.into();
+                    active.strength = Set(strength);
+                    active.evidence = Set(evidence.to_string());
+                    active.update(conn).await?;
+                }
+                Ok(false)
+            }
+        }
+    }
+
+    /// Move every row that hangs off the merged-away semantic
+    /// `from_semantic_id` onto EACH canonical in `to_semantic_ids`, inside
+    /// the caller's transaction:
+    ///
+    /// - `semantic_finding_link`: upsert `(to, finding)` strongest-wins for
+    ///   every target, then delete the source row.
+    /// - `semantic_function`: copy rows onto every target unless the exact
+    ///   `(function_name, contract_path)` pair already exists there, then
+    ///   delete the originals.
+    /// - `project_semantic`: upsert `(project, to)` for every target, then
+    ///   delete `(project, from)`.
+    ///
+    /// Idempotent and lossless: source rows are deleted only after every
+    /// canonical-side counterpart is guaranteed to exist. Multi-target
+    /// folds fan out to all targets, preserving what the old raw-chase
+    /// surfaced. `semantic_merge` itself is left untouched — it stays as
+    /// the merge-history record.
+    pub async fn remap_semantic_merge_txn<C: ConnectionTrait>(
+        &self,
+        conn: &C,
+        from_semantic_id: i32,
+        to_semantic_ids: &[i32],
+    ) -> Result<RemapSemanticOutcome> {
+        let mut out = RemapSemanticOutcome::default();
+
+        let source_links = semantic_finding_link::Entity::find()
+            .filter(semantic_finding_link::Column::SemanticNodeId.eq(from_semantic_id))
+            .all(conn)
+            .await?;
+        for link in &source_links {
+            for to_semantic_id in to_semantic_ids {
+                let inserted = Self::upsert_semantic_finding_link_row(
+                    conn,
+                    *to_semantic_id,
+                    link.audit_finding_id,
+                    link.strength,
+                    &link.evidence,
+                )
+                .await?;
+                if inserted {
+                    out.links_moved += 1;
+                } else {
+                    out.links_collided += 1;
+                }
+            }
+            semantic_finding_link::Entity::delete(semantic_finding_link::ActiveModel {
+                semantic_node_id: Set(from_semantic_id),
+                audit_finding_id: Set(link.audit_finding_id),
+                ..Default::default()
+            })
+            .exec(conn)
+            .await?;
+        }
+
+        let source_functions = semantic_function::Entity::find()
+            .filter(semantic_function::Column::SemanticNodeId.eq(from_semantic_id))
+            .all(conn)
+            .await?;
+        for func in &source_functions {
+            for to_semantic_id in to_semantic_ids {
+                let duplicate = semantic_function::Entity::find()
+                    .filter(semantic_function::Column::SemanticNodeId.eq(*to_semantic_id))
+                    .filter(semantic_function::Column::FunctionName.eq(func.function_name.clone()))
+                    .filter(semantic_function::Column::ContractPath.eq(func.contract_path.clone()))
+                    .one(conn)
+                    .await?
+                    .is_some();
+                if duplicate {
+                    out.functions_skipped_dup += 1;
+                } else {
+                    semantic_function::Entity::insert(semantic_function::ActiveModel {
+                        semantic_node_id: Set(*to_semantic_id),
+                        function_name: Set(func.function_name.clone()),
+                        contract_path: Set(func.contract_path.clone()),
+                        ..Default::default()
+                    })
+                    .exec(conn)
+                    .await?;
+                    out.functions_moved += 1;
+                }
+            }
+            semantic_function::Entity::delete_by_id(func.id)
+                .exec(conn)
+                .await?;
+        }
+
+        let source_provenance = project_semantic::Entity::find()
+            .filter(project_semantic::Column::SemanticNodeId.eq(from_semantic_id))
+            .all(conn)
+            .await?;
+        for row in &source_provenance {
+            for to_semantic_id in to_semantic_ids {
+                Self::upsert_project_semantic_row(conn, row.project_id, *to_semantic_id).await?;
+                out.provenance_moved += 1;
+            }
+            project_semantic::Entity::delete(project_semantic::ActiveModel {
+                project_id: Set(row.project_id),
+                semantic_node_id: Set(from_semantic_id),
+                ..Default::default()
+            })
+            .exec(conn)
+            .await?;
+        }
+
+        Ok(out)
+    }
+
+    /// Move every row that hangs off the merged-away finding
+    /// `from_finding_id` onto EACH canonical in `to_finding_ids`, inside the
+    /// caller's transaction:
+    ///
+    /// - `semantic_finding_link`: upsert `(semantic, to)` strongest-wins for
+    ///   every target, then delete the source row.
+    /// - `project_finding`: upsert `(project, to)` for every target, then
+    ///   delete `(project, from)`.
+    ///
+    /// Idempotent and lossless; `finding_merge` itself is left untouched.
+    pub async fn remap_finding_merge_txn<C: ConnectionTrait>(
+        &self,
+        conn: &C,
+        from_finding_id: i32,
+        to_finding_ids: &[i32],
+    ) -> Result<RemapFindingOutcome> {
+        let mut out = RemapFindingOutcome::default();
+
+        let source_links = semantic_finding_link::Entity::find()
+            .filter(semantic_finding_link::Column::AuditFindingId.eq(from_finding_id))
+            .all(conn)
+            .await?;
+        for link in &source_links {
+            for to_finding_id in to_finding_ids {
+                let inserted = Self::upsert_semantic_finding_link_row(
+                    conn,
+                    link.semantic_node_id,
+                    *to_finding_id,
+                    link.strength,
+                    &link.evidence,
+                )
+                .await?;
+                if inserted {
+                    out.links_moved += 1;
+                } else {
+                    out.links_collided += 1;
+                }
+            }
+            semantic_finding_link::Entity::delete(semantic_finding_link::ActiveModel {
+                semantic_node_id: Set(link.semantic_node_id),
+                audit_finding_id: Set(from_finding_id),
+                ..Default::default()
+            })
+            .exec(conn)
+            .await?;
+        }
+
+        let source_provenance = project_finding::Entity::find()
+            .filter(project_finding::Column::AuditFindingId.eq(from_finding_id))
+            .all(conn)
+            .await?;
+        for row in &source_provenance {
+            for to_finding_id in to_finding_ids {
+                Self::upsert_project_finding_row(conn, row.project_id, *to_finding_id).await?;
+                out.provenance_moved += 1;
+            }
+            project_finding::Entity::delete(project_finding::ActiveModel {
+                project_id: Set(row.project_id),
+                audit_finding_id: Set(from_finding_id),
+                ..Default::default()
+            })
+            .exec(conn)
+            .await?;
+        }
+
+        Ok(out)
+    }
+
+    /// One-time integrity sweep: iterate every `semantic_merge` and
+    /// `finding_merge` row and move all link / function / provenance rows
+    /// off the merge sources onto their canonicals, inside ONE transaction.
+    /// A post-loop assertion verifies zero rows still reference a merge
+    /// source; any violation aborts (the transaction rolls back and the DB
+    /// is left exactly as it was).
+    ///
+    /// Multi-target folds (one raw merged into N canonicals) fan out to
+    /// every target: merge rows are grouped by `from_*_id` first, so the
+    /// source rows are read once and copied onto all canonicals before the
+    /// source rows are deleted. This preserves the semantic of the old
+    /// raw-chase (`findings_for_semantic_ids` surfaced the raw's rows under
+    /// every canonical) while making the rows canonical-side.
+    pub async fn remap_all_merge_links(&self) -> Result<RemapReport> {
+        let txn = self.db.begin().await?;
+
+        let semantic_merges = semantic_merge::Entity::find()
+            .order_by_asc(semantic_merge::Column::FromSemanticId)
+            .all(&txn)
+            .await?;
+        let finding_merges = finding_merge::Entity::find()
+            .order_by_asc(finding_merge::Column::FromFindingId)
+            .all(&txn)
+            .await?;
+
+        let mut report = RemapReport {
+            semantic_merges_processed: semantic_merges.len(),
+            finding_merges_processed: finding_merges.len(),
+            ..Default::default()
+        };
+
+        for (from_semantic_id, target_ids) in group_merge_rows_by_source(
+            &semantic_merges,
+            |m| m.from_semantic_id,
+            |m| m.to_semantic_id,
+        ) {
+            let outcome = self
+                .remap_semantic_merge_txn(&txn, from_semantic_id, &target_ids)
+                .await?;
+            report.semantic.links_moved += outcome.links_moved;
+            report.semantic.links_collided += outcome.links_collided;
+            report.semantic.functions_moved += outcome.functions_moved;
+            report.semantic.functions_skipped_dup += outcome.functions_skipped_dup;
+            report.semantic.provenance_moved += outcome.provenance_moved;
+        }
+
+        for (from_finding_id, target_ids) in
+            group_merge_rows_by_source(&finding_merges, |m| m.from_finding_id, |m| m.to_finding_id)
+        {
+            let outcome = self
+                .remap_finding_merge_txn(&txn, from_finding_id, &target_ids)
+                .await?;
+            report.finding.links_moved += outcome.links_moved;
+            report.finding.links_collided += outcome.links_collided;
+            report.finding.provenance_moved += outcome.provenance_moved;
+        }
+
+        let semantic_sources: Vec<i32> = semantic_merges
+            .iter()
+            .map(|m| m.from_semantic_id)
+            .unique()
+            .collect();
+        let residual_semantic_links = semantic_finding_link::Entity::find()
+            .filter(semantic_finding_link::Column::SemanticNodeId.is_in(semantic_sources))
+            .count(&txn)
+            .await?;
+        if residual_semantic_links > 0 {
+            return Err(KgError::other(format!(
+                "{residual_semantic_links} semantic_finding_link row(s) still reference a merge source after remap; rolling back"
+            )));
+        }
+
+        let finding_sources: Vec<i32> = finding_merges
+            .iter()
+            .map(|m| m.from_finding_id)
+            .unique()
+            .collect();
+        let residual_finding_links = semantic_finding_link::Entity::find()
+            .filter(semantic_finding_link::Column::AuditFindingId.is_in(finding_sources))
+            .count(&txn)
+            .await?;
+        if residual_finding_links > 0 {
+            return Err(KgError::other(format!(
+                "{residual_finding_links} semantic_finding_link row(s) still reference a merge-source finding after remap; rolling back"
+            )));
+        }
+
+        txn.commit().await?;
+        Ok(report)
+    }
+
     /// Findings that have been globally linked already (i.e., have a row in
     /// `finding_link_status`). Used by the retro-link pass to feed the LLM
     /// the set of findings that should be re-checked against newly-introduced
@@ -2976,6 +3600,22 @@ impl HistoricalDatabase {
             }
         }
 
+        for row in feed_report_source::Entity::find().all(&self.db).await? {
+            if !project_ids.contains(&row.project_id) {
+                issues.push(DetectedDbIssue {
+                    issue: DbValidationIssue {
+                        table: "feed_report_source",
+                        row_key: format!(
+                            "project_id={} path={}",
+                            row.project_id, row.relative_path
+                        ),
+                        problem: format!("missing project {}", row.project_id),
+                    },
+                    repair_action: None,
+                });
+            }
+        }
+
         for row in project_category::Entity::find().all(&self.db).await? {
             let mut missing = Vec::new();
             if !project_ids.contains(&row.project_id) {
@@ -3332,10 +3972,47 @@ impl HistoricalDatabase {
         finding_merge_results: &[crate::learn::FindingMergeResult],
         in_project_links: &crate::learn::InProjectLinks,
     ) -> Result<Vec<i32>> {
+        self.write_project_completed_txn_with_source(
+            conn,
+            name,
+            platform_id,
+            categories,
+            semantic_merge_results,
+            finding_merge_results,
+            in_project_links,
+            None,
+        )
+        .await
+    }
+
+    pub async fn write_project_completed_txn_with_source(
+        &self,
+        conn: &DatabaseTransaction,
+        name: &str,
+        platform_id: Option<&str>,
+        categories: &[crate::category::DeFiCategory],
+        semantic_merge_results: &[crate::learn::MergeResult],
+        finding_merge_results: &[crate::learn::FindingMergeResult],
+        in_project_links: &crate::learn::InProjectLinks,
+        feed_source: Option<&crate::project_loader::FeedReportSource>,
+    ) -> Result<Vec<i32>> {
         use crate::learn::{FindingMergeAction, MergeAction};
 
-        // Upsert project — look up by platform_id first, then by name
-        let existing_project = if let Some(pid) = platform_id {
+        // Upsert project — source-aware narrative feeds resolve through
+        // feed_report_source first so migrated legacy projects are reused.
+        let source_project = if let Some(source) = feed_source {
+            feed_report_source::Entity::find()
+                .filter(feed_report_source::Column::SourceNamespace.eq(&source.source_namespace))
+                .filter(feed_report_source::Column::RelativePath.eq(&source.relative_path))
+                .one(conn)
+                .await?
+                .and_then(|mapping| Some(mapping.project_id))
+        } else {
+            None
+        };
+        let existing_project = if let Some(project_id) = source_project {
+            project::Entity::find_by_id(project_id).one(conn).await?
+        } else if let Some(pid) = platform_id {
             let pp = project_platform::Entity::find()
                 .filter(project_platform::Column::PlatformId.eq(pid))
                 .one(conn)
@@ -3419,6 +4096,12 @@ impl HistoricalDatabase {
         // populate `pending_semantic` so the retro-link pass during the
         // incremental learn flow can attach existing findings to them.
         let mut new_canonical_semantic_ids: Vec<i32> = Vec::new();
+        // Merge folds written by this call: (raw id, canonical targets).
+        // After the in-project link block lands (which attaches rows to raw
+        // ids), each fold's rows are moved onto its canonicals so no link /
+        // function / provenance row ever survives on a merge source.
+        let mut semantic_folds: Vec<(i32, Vec<i32>)> = Vec::new();
+        let mut finding_folds: Vec<(i32, Vec<i32>)> = Vec::new();
 
         // Process merge results
         let mut new_semantic_count = 0;
@@ -3498,6 +4181,7 @@ impl HistoricalDatabase {
                     let new_id = inserted.last_insert_id;
                     upsert_project_semantic(conn, project_id, new_id).await?;
                     raw_semantic_id_by_idx.push(new_id);
+                    semantic_folds.push((new_id, target_ids.clone()));
 
                     for func in &result.semantic.functions {
                         let f = semantic_function::ActiveModel {
@@ -3620,6 +4304,7 @@ impl HistoricalDatabase {
                     // modified by a merge; only `description`,
                     // `patterns`, `exploits` may be replaced with the
                     // agent's generalization.
+                    finding_folds.push((finding_id, target_ids.clone()));
                     for target_id in target_ids {
                         let target = audit_finding::Entity::find_by_id(*target_id)
                             .one(conn)
@@ -3749,6 +4434,37 @@ impl HistoricalDatabase {
             }
         }
 
+        // ── Move fold rows onto their canonicals ──────────────────────
+        // The in-project block above attached link rows to the *raw* ids;
+        // now that every fold is written, move each raw's link / function /
+        // provenance rows onto its canonical(s) so nothing survives on a
+        // merge source. New rows (action == New) have no folds and are
+        // untouched.
+        let mut remapped_links = 0usize;
+        for (from_semantic_id, target_ids) in &semantic_folds {
+            let outcome = self
+                .remap_semantic_merge_txn(conn, *from_semantic_id, target_ids)
+                .await?;
+            remapped_links += outcome.links_moved;
+        }
+        for (from_finding_id, target_ids) in &finding_folds {
+            let outcome = self
+                .remap_finding_merge_txn(conn, *from_finding_id, target_ids)
+                .await?;
+            remapped_links += outcome.links_moved;
+        }
+
+        if let Some(source) = feed_source {
+            self.upsert_feed_report_source_txn(
+                conn,
+                source,
+                project_id,
+                true,
+                current_unix_timestamp(),
+            )
+            .await?;
+        }
+
         // NOTE: we do NOT write finding_link_status here. In-project links
         // are intra-project only; the global-link pass still has to attach
         // these findings to canonical semantics from OTHER projects. The
@@ -3763,13 +4479,14 @@ impl HistoricalDatabase {
         // skip the enqueue because they never run retro-link.
 
         tracing::info!(
-            "Project {} saved: {} new semantics, {} merged semantics, {} new findings, {} merged findings, {} in-project links; {} new canonical id(s) returned for caller-driven pending_semantic enqueue",
+            "Project {} saved: {} new semantics, {} merged semantics, {} new findings, {} merged findings, {} in-project links ({} remapped onto canonicals); {} new canonical id(s) returned for caller-driven pending_semantic enqueue",
             platform_id.unwrap_or(name),
             new_semantic_count,
             merged_semantic_count,
             new_finding_count,
             merged_finding_count,
             in_project_link_rows,
+            remapped_links,
             new_canonical_semantic_ids.len(),
         );
         Ok(new_canonical_semantic_ids)
@@ -3844,6 +4561,7 @@ impl HistoricalDatabase {
         let semantic_finding_links = semantic_finding_link::Entity::find().all(&self.db).await?;
         let finding_link_statuses = finding_link_status::Entity::find().all(&self.db).await?;
         let finding_merges = finding_merge::Entity::find().all(&self.db).await?;
+        let feed_report_sources = feed_report_source::Entity::find().all(&self.db).await?;
 
         Ok(crate::knowledge_graph::KnowledgeGraph {
             projects,
@@ -3861,7 +4579,19 @@ impl HistoricalDatabase {
             semantic_finding_links,
             finding_link_statuses,
             finding_merges,
+            feed_report_sources,
         })
+    }
+}
+
+fn parse_legacy_feed_index(value: &str) -> Option<u64> {
+    u64::from_str_radix(value.strip_prefix("feed-")?, 16).ok()
+}
+
+fn current_unix_timestamp() -> i64 {
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(duration) => duration.as_secs() as i64,
+        Err(_) => 0,
     }
 }
 
@@ -3941,6 +4671,7 @@ fn materialize_semantic_link_candidates(
 const SNAPSHOT_TABLE_ORDER: &[&str] = &[
     "project",
     "project_platform",
+    "feed_report_source",
     "category",
     "project_category",
     "semantic_node",
@@ -4144,6 +4875,35 @@ fn split_sql_statements(sql: &str) -> Vec<String> {
 
 fn starts_line_comment(chars: &[char], index: usize) -> bool {
     matches!(chars.get(index + 2), None | Some(' ' | '\t' | '\r' | '\n'))
+}
+
+/// Group merge rows (semantic or finding) by their source id, keeping the
+/// insertion order and deduplicating targets per source. Both merge tables
+/// share the `(from, to)` shape, so one generic helper serves both the
+/// remap sweep and future multi-target consumers.
+fn group_merge_rows_by_source<M>(
+    rows: &[M],
+    from: impl Fn(&M) -> i32,
+    to: impl Fn(&M) -> i32,
+) -> Vec<(i32, Vec<i32>)> {
+    let mut grouped: Vec<(i32, Vec<i32>)> = Vec::new();
+    let mut seen: HashMap<i32, usize> = HashMap::new();
+    for row in rows {
+        let from_id = from(row);
+        let to_id = to(row);
+        match seen.get(&from_id) {
+            Some(&idx) => {
+                if !grouped[idx].1.contains(&to_id) {
+                    grouped[idx].1.push(to_id);
+                }
+            }
+            None => {
+                seen.insert(from_id, grouped.len());
+                grouped.push((from_id, vec![to_id]));
+            }
+        }
+    }
+    grouped
 }
 
 // ── merge-kg: read source canonicals / import them into a destination ───
@@ -4447,6 +5207,13 @@ impl HistoricalDatabase {
         let txn = self.db.begin().await?;
         let mut out = MergeImportOutcome::default();
 
+        // Fold tracking: (fresh leaf id, destination canonical ids). After
+        // the structural link carry (which maps src ids onto the fresh
+        // leaves), the remap pass moves every leaf-side row onto the
+        // canonicals so nothing survives on a merge source.
+        let mut semantic_folds: Vec<(i32, Vec<i32>)> = Vec::new();
+        let mut finding_folds: Vec<(i32, Vec<i32>)> = Vec::new();
+
         // ---- semantics ----
         for item in semantics {
             let inserted = semantic_node::Entity::insert(semantic_node::ActiveModel {
@@ -4477,6 +5244,7 @@ impl HistoricalDatabase {
                 out.new_semantics += 1;
             } else {
                 out.folded_semantics += 1;
+                semantic_folds.push((node_id, item.target_ids.clone()));
                 for target_id in &item.target_ids {
                     // One-level: node_id is a fresh leaf; target is a dst canonical.
                     semantic_merge::Entity::insert(semantic_merge::ActiveModel {
@@ -4555,6 +5323,7 @@ impl HistoricalDatabase {
             } else {
                 out.folded_finding_ids.push(finding_id);
                 out.folded_findings += 1;
+                finding_folds.push((finding_id, item.target_ids.clone()));
                 for target_id in &item.target_ids {
                     finding_merge::Entity::insert(finding_merge::ActiveModel {
                         from_finding_id: Set(finding_id),
@@ -4631,6 +5400,21 @@ impl HistoricalDatabase {
                 .await?;
                 out.carried_links += 1;
             }
+        }
+
+        // ── Move fold rows onto their destination canonicals ────────
+        // The carry block attached link rows to the fresh leaves. Move each
+        // leaf's link / function / provenance rows onto its canonical(s) so
+        // nothing survives on a merge source. The old raw-chase in
+        // `findings_for_semantic_ids` stays as a defensive layer but now
+        // finds nothing extra.
+        for (from_semantic_id, target_ids) in &semantic_folds {
+            self.remap_semantic_merge_txn(&txn, *from_semantic_id, target_ids)
+                .await?;
+        }
+        for (from_finding_id, target_ids) in &finding_folds {
+            self.remap_finding_merge_txn(&txn, *from_finding_id, target_ids)
+                .await?;
         }
 
         // Folded findings are not visited by the ③b link pass; mark them
@@ -4724,6 +5508,50 @@ mod tests {
             description: format!("Description for {}", name),
             category,
         }
+    }
+
+    #[test]
+    fn legacy_feed_index_accepts_hexadecimal_ordinal_ids_only() {
+        assert_eq!(parse_legacy_feed_index("feed-000000000000000a"), Some(10));
+        assert_eq!(parse_legacy_feed_index("feed-v2-deadbeef"), None);
+        assert_eq!(parse_legacy_feed_index("feed-not-an-id"), None);
+    }
+
+    #[tokio::test]
+    async fn feed_source_mapping_round_trips_existing_project_identity() {
+        let (db, path) = create_test_db().await;
+        let project = project::ActiveModel {
+            name: Set("legacy-report".to_string()),
+            status: Set("completed".to_string()),
+            ..Default::default()
+        }
+        .insert(db.conn())
+        .await
+        .expect("project should insert");
+        let source = crate::project_loader::FeedReportSource {
+            source_namespace: "attack-analyses".to_string(),
+            relative_path: "2026/report.md".to_string(),
+            stable_source_id: "feed-v2-test".to_string(),
+            legacy_platform_id: Some("feed-0000000000000000".to_string()),
+            content_hash: "hash".to_string(),
+        };
+        let txn = db.begin().await.expect("transaction should begin");
+        db.upsert_feed_report_source_txn(&txn, &source, project.id, true, 1)
+            .await
+            .expect("source should insert");
+        txn.commit().await.expect("transaction should commit");
+
+        let loaded = db
+            .feed_report_source_by_path("attack-analyses", "2026/report.md")
+            .await
+            .expect("source lookup should work")
+            .expect("source should exist");
+        assert_eq!(loaded.project_id, project.id);
+        assert_eq!(
+            loaded.legacy_platform_id.as_deref(),
+            Some("feed-0000000000000000")
+        );
+        cleanup_test_db(&path);
     }
 
     #[test]
@@ -6183,6 +7011,488 @@ INSERT INTO `demo` (`value`) VALUES ('backslash \' quote');
             .collect();
         assert_eq!(link_rows.len(), 1);
         assert_eq!(link_rows[0].args, args_a);
+
+        drop(db);
+        cleanup_test_db(&path);
+    }
+
+    /// A semantic fold must move the raw's link / function / provenance rows
+    /// onto the canonical(s) and leave nothing on the merge source, while
+    /// preserving `semantic_merge` itself as history.
+    #[tokio::test]
+    async fn remap_semantic_merge_moves_rows_onto_canonical() {
+        let (db, path) = create_test_db().await;
+
+        let project_id = project::Entity::insert(project::ActiveModel {
+            name: Set("p".to_string()),
+            status: Set("completed".to_string()),
+            ..Default::default()
+        })
+        .exec(&db.db)
+        .await
+        .unwrap()
+        .last_insert_id;
+        let canonical = semantic_node::Entity::insert(semantic_node::ActiveModel {
+            name: Set("canon".to_string()),
+            category: Set(DeFiCategory::Dexes),
+            definition: Set("d".to_string()),
+            description: Set("d".to_string()),
+            ..Default::default()
+        })
+        .exec(&db.db)
+        .await
+        .unwrap()
+        .last_insert_id;
+        let raw = semantic_node::Entity::insert(semantic_node::ActiveModel {
+            name: Set("raw".to_string()),
+            category: Set(DeFiCategory::Dexes),
+            definition: Set("d".to_string()),
+            description: Set("d".to_string()),
+            ..Default::default()
+        })
+        .exec(&db.db)
+        .await
+        .unwrap()
+        .last_insert_id;
+        let finding = audit_finding::Entity::insert(audit_finding::ActiveModel {
+            title: Set("f".to_string()),
+            severity: Set(audit_finding::FindingSeverity::High),
+            root_cause: Set("rc".to_string()),
+            description: Set("d".to_string()),
+            patterns: Set("p".to_string()),
+            exploits: Set("e".to_string()),
+            ..Default::default()
+        })
+        .exec(&db.db)
+        .await
+        .unwrap()
+        .last_insert_id;
+
+        semantic_finding_link::Entity::insert(semantic_finding_link::ActiveModel {
+            semantic_node_id: Set(raw),
+            audit_finding_id: Set(finding),
+            strength: Set(LinkStrength::Medium),
+            evidence: Set("ev".to_string()),
+        })
+        .exec(&db.db)
+        .await
+        .unwrap();
+        semantic_function::Entity::insert(semantic_function::ActiveModel {
+            semantic_node_id: Set(raw),
+            function_name: Set("swap".to_string()),
+            contract_path: Set("a.sol".to_string()),
+            ..Default::default()
+        })
+        .exec(&db.db)
+        .await
+        .unwrap();
+        project_semantic::Entity::insert(project_semantic::ActiveModel {
+            project_id: Set(project_id),
+            semantic_node_id: Set(raw),
+        })
+        .exec(&db.db)
+        .await
+        .unwrap();
+        semantic_merge::Entity::insert(semantic_merge::ActiveModel {
+            from_semantic_id: Set(raw),
+            to_semantic_id: Set(canonical),
+            appended_description: Set(String::new()),
+        })
+        .exec(&db.db)
+        .await
+        .unwrap();
+
+        let report = db.remap_all_merge_links().await.unwrap();
+        assert_eq!(report.semantic.links_moved, 1);
+        assert_eq!(report.semantic.functions_moved, 1);
+        assert_eq!(report.semantic.provenance_moved, 1);
+
+        let links = semantic_finding_link::Entity::find()
+            .all(&db.db)
+            .await
+            .unwrap();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].semantic_node_id, canonical);
+        assert_eq!(links[0].audit_finding_id, finding);
+
+        let funcs = semantic_function::Entity::find().all(&db.db).await.unwrap();
+        assert_eq!(funcs.len(), 1);
+        assert_eq!(funcs[0].semantic_node_id, canonical);
+
+        let prov = project_semantic::Entity::find().all(&db.db).await.unwrap();
+        assert_eq!(prov.len(), 1);
+        assert_eq!(prov[0].semantic_node_id, canonical);
+        assert_eq!(prov[0].project_id, project_id);
+
+        let merges = semantic_merge::Entity::find().all(&db.db).await.unwrap();
+        assert_eq!(
+            merges.len(),
+            1,
+            "semantic_merge row must survive as history"
+        );
+
+        drop(db);
+        cleanup_test_db(&path);
+    }
+
+    /// A multi-target semantic fold fans rows out to every canonical.
+    #[tokio::test]
+    async fn remap_semantic_merge_fans_out_to_all_targets() {
+        let (db, path) = create_test_db().await;
+
+        let canonical_a = semantic_node::Entity::insert(semantic_node::ActiveModel {
+            name: Set("canon-a".to_string()),
+            category: Set(DeFiCategory::Dexes),
+            definition: Set("d".to_string()),
+            description: Set("d".to_string()),
+            ..Default::default()
+        })
+        .exec(&db.db)
+        .await
+        .unwrap()
+        .last_insert_id;
+        let canonical_b = semantic_node::Entity::insert(semantic_node::ActiveModel {
+            name: Set("canon-b".to_string()),
+            category: Set(DeFiCategory::Dexes),
+            definition: Set("d".to_string()),
+            description: Set("d".to_string()),
+            ..Default::default()
+        })
+        .exec(&db.db)
+        .await
+        .unwrap()
+        .last_insert_id;
+        let raw = semantic_node::Entity::insert(semantic_node::ActiveModel {
+            name: Set("raw".to_string()),
+            category: Set(DeFiCategory::Dexes),
+            definition: Set("d".to_string()),
+            description: Set("d".to_string()),
+            ..Default::default()
+        })
+        .exec(&db.db)
+        .await
+        .unwrap()
+        .last_insert_id;
+        let finding = audit_finding::Entity::insert(audit_finding::ActiveModel {
+            title: Set("f".to_string()),
+            severity: Set(audit_finding::FindingSeverity::High),
+            root_cause: Set("rc".to_string()),
+            description: Set("d".to_string()),
+            patterns: Set("p".to_string()),
+            exploits: Set("e".to_string()),
+            ..Default::default()
+        })
+        .exec(&db.db)
+        .await
+        .unwrap()
+        .last_insert_id;
+
+        semantic_finding_link::Entity::insert(semantic_finding_link::ActiveModel {
+            semantic_node_id: Set(raw),
+            audit_finding_id: Set(finding),
+            strength: Set(LinkStrength::Low),
+            evidence: Set("ev".to_string()),
+        })
+        .exec(&db.db)
+        .await
+        .unwrap();
+        for to in [canonical_a, canonical_b] {
+            semantic_merge::Entity::insert(semantic_merge::ActiveModel {
+                from_semantic_id: Set(raw),
+                to_semantic_id: Set(to),
+                appended_description: Set(String::new()),
+            })
+            .exec(&db.db)
+            .await
+            .unwrap();
+        }
+
+        let report = db.remap_all_merge_links().await.unwrap();
+        assert_eq!(report.semantic.links_moved, 2, "one link per target");
+
+        let links = semantic_finding_link::Entity::find()
+            .all(&db.db)
+            .await
+            .unwrap();
+        let semantic_ids: Vec<i32> = links.iter().map(|l| l.semantic_node_id).sorted().collect();
+        assert_eq!(semantic_ids, vec![canonical_a, canonical_b]);
+        assert!(
+            !semantic_ids.contains(&raw),
+            "no link may survive on the merge source"
+        );
+
+        drop(db);
+        cleanup_test_db(&path);
+    }
+
+    /// Strongest-strength-wins when the canonical already holds an edge for
+    /// the same (semantic, finding) pair: a weaker incoming edge is dropped.
+    #[tokio::test]
+    async fn remap_link_collision_keeps_strongest_strength() {
+        let (db, path) = create_test_db().await;
+
+        let canonical = semantic_node::Entity::insert(semantic_node::ActiveModel {
+            name: Set("canon".to_string()),
+            category: Set(DeFiCategory::Dexes),
+            definition: Set("d".to_string()),
+            description: Set("d".to_string()),
+            ..Default::default()
+        })
+        .exec(&db.db)
+        .await
+        .unwrap()
+        .last_insert_id;
+        let raw = semantic_node::Entity::insert(semantic_node::ActiveModel {
+            name: Set("raw".to_string()),
+            category: Set(DeFiCategory::Dexes),
+            definition: Set("d".to_string()),
+            description: Set("d".to_string()),
+            ..Default::default()
+        })
+        .exec(&db.db)
+        .await
+        .unwrap()
+        .last_insert_id;
+        let finding = audit_finding::Entity::insert(audit_finding::ActiveModel {
+            title: Set("f".to_string()),
+            severity: Set(audit_finding::FindingSeverity::High),
+            root_cause: Set("rc".to_string()),
+            description: Set("d".to_string()),
+            patterns: Set("p".to_string()),
+            exploits: Set("e".to_string()),
+            ..Default::default()
+        })
+        .exec(&db.db)
+        .await
+        .unwrap()
+        .last_insert_id;
+
+        semantic_finding_link::Entity::insert(semantic_finding_link::ActiveModel {
+            semantic_node_id: Set(canonical),
+            audit_finding_id: Set(finding),
+            strength: Set(LinkStrength::High),
+            evidence: Set("canonical evidence".to_string()),
+        })
+        .exec(&db.db)
+        .await
+        .unwrap();
+        semantic_finding_link::Entity::insert(semantic_finding_link::ActiveModel {
+            semantic_node_id: Set(raw),
+            audit_finding_id: Set(finding),
+            strength: Set(LinkStrength::Low),
+            evidence: Set("raw evidence".to_string()),
+        })
+        .exec(&db.db)
+        .await
+        .unwrap();
+        semantic_merge::Entity::insert(semantic_merge::ActiveModel {
+            from_semantic_id: Set(raw),
+            to_semantic_id: Set(canonical),
+            appended_description: Set(String::new()),
+        })
+        .exec(&db.db)
+        .await
+        .unwrap();
+
+        db.remap_all_merge_links().await.unwrap();
+
+        let links = semantic_finding_link::Entity::find()
+            .all(&db.db)
+            .await
+            .unwrap();
+        assert_eq!(
+            links.len(),
+            1,
+            "weaker incoming edge must not replace canonical"
+        );
+        assert_eq!(links[0].semantic_node_id, canonical);
+        assert_eq!(links[0].strength, LinkStrength::High);
+        assert_eq!(links[0].evidence, "canonical evidence");
+
+        drop(db);
+        cleanup_test_db(&path);
+    }
+
+    /// A stronger incoming edge upgrades the canonical-side row.
+    #[tokio::test]
+    async fn remap_link_collision_upgrades_weaker_canonical() {
+        let (db, path) = create_test_db().await;
+
+        let canonical = semantic_node::Entity::insert(semantic_node::ActiveModel {
+            name: Set("canon".to_string()),
+            category: Set(DeFiCategory::Dexes),
+            definition: Set("d".to_string()),
+            description: Set("d".to_string()),
+            ..Default::default()
+        })
+        .exec(&db.db)
+        .await
+        .unwrap()
+        .last_insert_id;
+        let raw = semantic_node::Entity::insert(semantic_node::ActiveModel {
+            name: Set("raw".to_string()),
+            category: Set(DeFiCategory::Dexes),
+            definition: Set("d".to_string()),
+            description: Set("d".to_string()),
+            ..Default::default()
+        })
+        .exec(&db.db)
+        .await
+        .unwrap()
+        .last_insert_id;
+        let finding = audit_finding::Entity::insert(audit_finding::ActiveModel {
+            title: Set("f".to_string()),
+            severity: Set(audit_finding::FindingSeverity::High),
+            root_cause: Set("rc".to_string()),
+            description: Set("d".to_string()),
+            patterns: Set("p".to_string()),
+            exploits: Set("e".to_string()),
+            ..Default::default()
+        })
+        .exec(&db.db)
+        .await
+        .unwrap()
+        .last_insert_id;
+
+        semantic_finding_link::Entity::insert(semantic_finding_link::ActiveModel {
+            semantic_node_id: Set(canonical),
+            audit_finding_id: Set(finding),
+            strength: Set(LinkStrength::Low),
+            evidence: Set("canonical evidence".to_string()),
+        })
+        .exec(&db.db)
+        .await
+        .unwrap();
+        semantic_finding_link::Entity::insert(semantic_finding_link::ActiveModel {
+            semantic_node_id: Set(raw),
+            audit_finding_id: Set(finding),
+            strength: Set(LinkStrength::High),
+            evidence: Set("raw evidence".to_string()),
+        })
+        .exec(&db.db)
+        .await
+        .unwrap();
+        semantic_merge::Entity::insert(semantic_merge::ActiveModel {
+            from_semantic_id: Set(raw),
+            to_semantic_id: Set(canonical),
+            appended_description: Set(String::new()),
+        })
+        .exec(&db.db)
+        .await
+        .unwrap();
+
+        db.remap_all_merge_links().await.unwrap();
+
+        let links = semantic_finding_link::Entity::find()
+            .all(&db.db)
+            .await
+            .unwrap();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].strength, LinkStrength::High);
+        assert_eq!(links[0].evidence, "raw evidence");
+
+        drop(db);
+        cleanup_test_db(&path);
+    }
+
+    /// Finding folds remap their links and provenance the same way, and the
+    /// finding_merge row survives.
+    #[tokio::test]
+    async fn remap_finding_merge_moves_rows_onto_canonical() {
+        let (db, path) = create_test_db().await;
+
+        let project_id = project::Entity::insert(project::ActiveModel {
+            name: Set("p".to_string()),
+            status: Set("completed".to_string()),
+            ..Default::default()
+        })
+        .exec(&db.db)
+        .await
+        .unwrap()
+        .last_insert_id;
+        let semantic = semantic_node::Entity::insert(semantic_node::ActiveModel {
+            name: Set("s".to_string()),
+            category: Set(DeFiCategory::Dexes),
+            definition: Set("d".to_string()),
+            description: Set("d".to_string()),
+            ..Default::default()
+        })
+        .exec(&db.db)
+        .await
+        .unwrap()
+        .last_insert_id;
+        let canonical_finding = audit_finding::Entity::insert(audit_finding::ActiveModel {
+            title: Set("canon-f".to_string()),
+            severity: Set(audit_finding::FindingSeverity::High),
+            root_cause: Set("rc".to_string()),
+            description: Set("d".to_string()),
+            patterns: Set("p".to_string()),
+            exploits: Set("e".to_string()),
+            ..Default::default()
+        })
+        .exec(&db.db)
+        .await
+        .unwrap()
+        .last_insert_id;
+        let raw_finding = audit_finding::Entity::insert(audit_finding::ActiveModel {
+            title: Set("raw-f".to_string()),
+            severity: Set(audit_finding::FindingSeverity::High),
+            root_cause: Set("rc".to_string()),
+            description: Set("d".to_string()),
+            patterns: Set("p".to_string()),
+            exploits: Set("e".to_string()),
+            ..Default::default()
+        })
+        .exec(&db.db)
+        .await
+        .unwrap()
+        .last_insert_id;
+
+        semantic_finding_link::Entity::insert(semantic_finding_link::ActiveModel {
+            semantic_node_id: Set(semantic),
+            audit_finding_id: Set(raw_finding),
+            strength: Set(LinkStrength::Medium),
+            evidence: Set("ev".to_string()),
+        })
+        .exec(&db.db)
+        .await
+        .unwrap();
+        project_finding::Entity::insert(project_finding::ActiveModel {
+            project_id: Set(project_id),
+            audit_finding_id: Set(raw_finding),
+        })
+        .exec(&db.db)
+        .await
+        .unwrap();
+        finding_merge::Entity::insert(finding_merge::ActiveModel {
+            from_finding_id: Set(raw_finding),
+            to_finding_id: Set(canonical_finding),
+            appended_description: Set(String::new()),
+            appended_patterns: Set(String::new()),
+            appended_exploits: Set(String::new()),
+        })
+        .exec(&db.db)
+        .await
+        .unwrap();
+
+        let report = db.remap_all_merge_links().await.unwrap();
+        assert_eq!(report.finding.links_moved, 1);
+        assert_eq!(report.finding.provenance_moved, 1);
+
+        let links = semantic_finding_link::Entity::find()
+            .all(&db.db)
+            .await
+            .unwrap();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].audit_finding_id, canonical_finding);
+        assert_eq!(links[0].semantic_node_id, semantic);
+
+        let prov = project_finding::Entity::find().all(&db.db).await.unwrap();
+        assert_eq!(prov.len(), 1);
+        assert_eq!(prov[0].audit_finding_id, canonical_finding);
+
+        let merges = finding_merge::Entity::find().all(&db.db).await.unwrap();
+        assert_eq!(merges.len(), 1, "finding_merge row must survive as history");
 
         drop(db);
         cleanup_test_db(&path);

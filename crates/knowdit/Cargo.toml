@@ -24,6 +24,7 @@ sea-orm.workspace = true
 url.workspace = true
 globset.workspace = true
 humantime.workspace = true
+sha2.workspace = true
 
 knowdit-kg.workspace = true
 knowdit-kg-model.workspace = true

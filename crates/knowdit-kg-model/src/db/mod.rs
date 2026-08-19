@@ -6,6 +6,7 @@ pub mod audit_finding;
 pub mod audit_finding_category;
 pub mod category;
 pub mod extraction_chunk;
+pub mod feed_report_source;
 pub mod finding_category;
 pub mod finding_link_status;
 pub mod finding_merge;

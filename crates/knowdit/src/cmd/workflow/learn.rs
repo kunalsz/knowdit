@@ -140,8 +140,16 @@ impl WorkflowLearnArgs {
                 .enqueue_pending_canonical_semantics_txn(&txn, &new_canonicals)
                 .await?;
             txn.commit().await?;
-            kg.clear_extraction_chunks_for_project(&project.display_id())
-                .await?;
+            if let Err(error) = kg
+                .clear_extraction_chunks_for_project(&project.display_id())
+                .await
+            {
+                tracing::warn!(
+                    "Project {} committed, but checkpoint cleanup failed: {}",
+                    project.display_id(),
+                    error
+                );
+            }
             tracing::info!(
                 "Phase 1: enqueued {} new canonical semantic(s) for Phase 2 retro-link \
                  (of {} newly introduced)",

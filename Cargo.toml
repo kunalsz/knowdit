@@ -44,6 +44,7 @@ alloy-serde = "1"
 toml = "0.8"
 shellexpand = "3"
 humantime = "2"
+sha2 = "0.10"
 
 knowdit-kg-model = { version = "1.0.1", path = "./crates/knowdit-kg-model" }
 knowdit-repo-model = { version = "1.0.1", path = "./crates/knowdit-repo-model" }
@@ -54,3 +55,9 @@ knowdit-agents = { version = "1.0.1", path = "./crates/knowdit-agents" }
 knowdit-audit = { version = "1.0.1", path = "./crates/knowdit-audit" }
 knowdit-cg-static = { version = "1.0.1", path = "./crates/knowdit-cg-static" }
 knowdit-project = { version = "1.0.1", path = "./crates/knowdit-project" }
+
+# Vendor-patched llmy-tokenizer: adds `deepseek/deepseek-expert` to the model
+# registry (mirrors deepseek-chat's window/pricing). Remove this patch once
+# upstream llmy ships the entry.
+[patch.crates-io]
+llmy-tokenizer = { path = "./vendor/llmy-tokenizer" }

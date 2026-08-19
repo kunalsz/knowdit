@@ -34,6 +34,10 @@ pub enum KnowditSubCommands {
 
     /// Historical-KG database tools: snapshot in/out and direct DB-to-DB copy (no LLM)
     Db(DbCommand),
+
+    /// Ingest external security reports (post-mortems, attack analyses, audit
+    /// findings, CVE disclosures) as narrative projects into the historical KG
+    Feed(FeedCommand),
 }
 
 #[derive(Args)]
@@ -105,6 +109,33 @@ pub enum DbCommands {
     /// schema (auto-incr PKs reassigned, FKs rewritten); pass
     /// `--fresh` to instead drop and recreate dst's schema first.
     Copy(cmd::db::copy::CopyArgs),
+
+    /// Move every link / function / provenance row off merge-source
+    /// nodes/findings onto their canonicals, in one transaction with
+    /// a pre-remap SQL snapshot. One-time integrity sweep.
+    RemapLinks(cmd::db::remap_links::RemapLinksArgs),
+}
+
+// ---------------------------------------------------------------------------
+// `knowdit feed ...` — ingest external security reports into the KG
+// ---------------------------------------------------------------------------
+
+#[derive(Args)]
+pub struct FeedCommand {
+    #[command(flatten)]
+    pub database: HistoricalDatabaseArgs,
+
+    #[command(subcommand)]
+    pub command: FeedCommands,
+}
+
+#[derive(Subcommand)]
+pub enum FeedCommands {
+    /// Ingest .md security reports as narrative projects
+    Reports(cmd::feed::reports::ReportsArgs),
+
+    /// Split a multi-finding audit report into per-finding .md files
+    SplitReport(cmd::feed::split_report::SplitReportArgs),
 }
 
 // ---------------------------------------------------------------------------
@@ -296,6 +327,7 @@ impl KnowditSubCommands {
             KnowditSubCommands::Agentic(command) => command.run().await,
             KnowditSubCommands::Workflow(command) => command.run().await,
             KnowditSubCommands::Db(command) => command.run().await,
+            KnowditSubCommands::Feed(command) => command.run().await,
         }
     }
 }
@@ -324,7 +356,22 @@ impl DbCommand {
             DbCommands::Snapshot(args) => args.run().await,
             DbCommands::ImportSnapshot(args) => args.run().await,
             DbCommands::Copy(args) => args.run().await,
+            DbCommands::RemapLinks(args) => args.run().await,
         }
+    }
+}
+
+impl FeedCommand {
+    pub async fn run(self) -> color_eyre::Result<()> {
+        let Self { database, command } = self;
+        match command {
+            FeedCommands::Reports(args) => {
+                let db = database.connect_init().await?;
+                args.run(&db).await?
+            }
+            FeedCommands::SplitReport(args) => args.run().await?,
+        }
+        Ok(())
     }
 }
 

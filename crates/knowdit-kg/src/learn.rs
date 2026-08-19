@@ -1,8 +1,9 @@
 use crate::agent_runner::AgentRunOptions;
 use crate::agents::{
     AggregatedFindingMergeDecision, AggregatedSemanticMergeDecision, CategorizeRunner,
-    FindingChunkExtractor, FindingMerger, MergeChunkingOptions, SemanticChunkExtractor,
-    SemanticMerger,
+    FindingChunkExtractor, FindingMerger, MergeChunkingOptions, NarrativeChunkExtractor,
+    NarrativeCombinedItem, NarrativeFindingRecord, NarrativeLinkRecord, NarrativeSemanticRecord,
+    SemanticChunkExtractor, SemanticMerger,
 };
 use crate::category::DeFiCategory;
 use crate::db::HistoricalDatabase;
@@ -17,8 +18,9 @@ pub use knowdit_kg_model::{ExtractedFinding, ExtractedFunction, ExtractedSemanti
 use llmy::client::client::LLM;
 use llmy::client::context::TokenCursor;
 use llmy::client::model::OpenAIModel;
-use serde::Deserialize;
-use std::collections::{HashMap, HashSet};
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::Instant;
 
 // ── LLM response types ──────────────────────────────────────────────
@@ -82,7 +84,7 @@ fn render_findings_for_in_project_link(findings: &[ExtractedFinding]) -> String 
 
 // ── Public merge types (used by HistoricalDatabase) ────────────────────────
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MergeAction {
     /// Admit the new raw as a fresh canonical (no existing matches).
     New,
@@ -101,13 +103,13 @@ pub enum MergeAction {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MergeResult {
     pub semantic: ExtractedSemantic,
     pub action: MergeAction,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum FindingMergeAction {
     /// Admit the new raw finding as a fresh canonical.
     New,
@@ -130,10 +132,74 @@ pub enum FindingMergeAction {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FindingMergeResult {
     pub finding: ExtractedFinding,
     pub action: FindingMergeAction,
+}
+
+#[derive(Debug, Serialize)]
+struct SemanticMergeCheckpointManifest {
+    version: &'static str,
+    stage: &'static str,
+    model: String,
+    max_agent_steps: usize,
+    context_window_utilization: f64,
+    new_item_token_ratio: f64,
+    merge_concurrency: usize,
+    new_item_batch_size: usize,
+    extracted: Vec<ExtractedSemantic>,
+    candidates:
+        Vec<crate::agents::CanonicalWithChildren<knowdit_kg_model::db::semantic_node::Model>>,
+}
+
+#[derive(Debug, Serialize)]
+struct FindingMergeCheckpointManifest {
+    version: &'static str,
+    stage: &'static str,
+    model: String,
+    max_agent_steps: usize,
+    context_window_utilization: f64,
+    new_item_token_ratio: f64,
+    merge_concurrency: usize,
+    new_item_batch_size: usize,
+    extracted: Vec<ExtractedFinding>,
+    candidates: Vec<crate::agents::FindingCanonicalWithTaxonomy>,
+}
+
+impl ProjectData {
+    fn serialized_hash<T: Serialize>(value: &T) -> Result<String> {
+        let mut h: u64 = 0xcbf29ce484222325;
+        for &byte in serde_json::to_vec(value)?.iter() {
+            h ^= byte as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        Ok(format!("{h:016x}"))
+    }
+
+    async fn load_merge_checkpoint<T: DeserializeOwned>(
+        &self,
+        db: &HistoricalDatabase,
+        stage: &str,
+        model: &str,
+        content_hash: &str,
+    ) -> Result<Option<Vec<T>>> {
+        let rows = db.load_extraction_chunks(&self.display_id(), stage).await?;
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        if !db
+            .extraction_chunks_match(&self.display_id(), stage, model, content_hash)
+            .await?
+            || rows.len() != 1
+            || rows[0].chunk_idx != 0
+        {
+            db.clear_extraction_chunks(&self.display_id(), stage)
+                .await?;
+            return Ok(None);
+        }
+        Ok(Some(serde_json::from_str(&rows[0].chunk_json)?))
+    }
 }
 
 // ── ProjectData learning pipeline ───────────────────────────────────
@@ -143,7 +209,7 @@ pub struct FindingMergeResult {
 /// parent `ExtractResult.findings` and `ExtractResult.semantics` arrays.
 /// The atomic admission step translates these positional indices into
 /// concrete row ids for `semantic_finding_link` after all raw inserts.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct InProjectLinks {
     pub edges: Vec<(usize, usize)>,
 }
@@ -169,6 +235,207 @@ pub struct ExtractResult {
 pub struct KnownExtractedChunk<T> {
     pub chunk_idx: usize,
     pub results: Vec<T>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct NarrativeCombinedChunk {
+    items: Vec<NarrativeCombinedItem>,
+}
+
+#[derive(Debug, Default)]
+struct NarrativeRawExtraction {
+    semantics: Vec<NarrativeSemanticRecord>,
+    findings: Vec<NarrativeFindingRecord>,
+    links: Vec<NarrativeLinkRecord>,
+}
+
+impl NarrativeRawExtraction {
+    fn append_chunk(&mut self, chunk_idx: usize, chunk: NarrativeCombinedChunk) -> Result<()> {
+        let mut semantic_ids = BTreeMap::new();
+        let mut finding_ids = BTreeMap::new();
+
+        for item in &chunk.items {
+            match item {
+                NarrativeCombinedItem::Semantic(record) => {
+                    let global_id = format!("sem-{chunk_idx}-{}", record.id);
+                    if semantic_ids
+                        .insert(record.id.clone(), global_id.clone())
+                        .is_some()
+                    {
+                        return Err(KgError::other(format!(
+                            "narrative chunk {chunk_idx} emitted duplicate semantic id `{}`",
+                            record.id
+                        )));
+                    }
+                    self.semantics.push(NarrativeSemanticRecord {
+                        id: global_id,
+                        semantic: record.semantic.clone(),
+                    });
+                }
+                NarrativeCombinedItem::Finding(record) => {
+                    let global_id = format!("finding-{chunk_idx}-{}", record.id);
+                    if finding_ids
+                        .insert(record.id.clone(), global_id.clone())
+                        .is_some()
+                    {
+                        return Err(KgError::other(format!(
+                            "narrative chunk {chunk_idx} emitted duplicate finding id `{}`",
+                            record.id
+                        )));
+                    }
+                    self.findings.push(NarrativeFindingRecord {
+                        id: global_id,
+                        finding: ProjectData::canonicalize_finding(record.finding.clone())?,
+                    });
+                }
+                NarrativeCombinedItem::Link(_) => {}
+            }
+        }
+
+        for item in chunk.items {
+            let NarrativeCombinedItem::Link(link) = item else {
+                continue;
+            };
+            let Some(finding_id) = finding_ids.get(&link.finding_id) else {
+                return Err(KgError::other(format!(
+                    "narrative chunk {chunk_idx} linked unknown finding id `{}`",
+                    link.finding_id
+                )));
+            };
+            let mut semantic_global_ids = Vec::new();
+            for semantic_id in link.semantic_ids {
+                let Some(global_id) = semantic_ids.get(&semantic_id) else {
+                    return Err(KgError::other(format!(
+                        "narrative chunk {chunk_idx} linked unknown semantic id `{semantic_id}`"
+                    )));
+                };
+                semantic_global_ids.push(global_id.clone());
+            }
+            self.links.push(NarrativeLinkRecord {
+                finding_id: finding_id.clone(),
+                semantic_ids: semantic_global_ids,
+            });
+        }
+        Ok(())
+    }
+
+    fn into_extract_parts(
+        self,
+    ) -> Result<(
+        Vec<ExtractedSemantic>,
+        Vec<ExtractedFinding>,
+        InProjectLinks,
+        bool,
+    )> {
+        let mut semantics: Vec<ExtractedSemantic> = Vec::new();
+        let mut semantic_indices: BTreeMap<String, usize> = BTreeMap::new();
+        let mut semantic_ids: BTreeMap<String, usize> = BTreeMap::new();
+        for record in self.semantics {
+            let key = record
+                .semantic
+                .name
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_lowercase();
+            let index = if let Some(index) = semantic_indices.get(&key).copied() {
+                let existing = &mut semantics[index];
+                for function in record.semantic.functions {
+                    if !existing.functions.iter().any(|candidate| {
+                        candidate.name == function.name && candidate.contract == function.contract
+                    }) {
+                        existing.functions.push(function);
+                    }
+                }
+                if record.semantic.description.len() > existing.description.len() {
+                    existing.description = record.semantic.description;
+                    existing.definition = record.semantic.definition;
+                }
+                index
+            } else {
+                let index = semantics.len();
+                semantic_indices.insert(key, index);
+                semantics.push(record.semantic);
+                index
+            };
+            semantic_ids.insert(record.id, index);
+        }
+
+        let mut findings: Vec<ExtractedFinding> = Vec::new();
+        let mut finding_indices: BTreeMap<String, usize> = BTreeMap::new();
+        let mut finding_ids: BTreeMap<String, usize> = BTreeMap::new();
+        for record in self.findings {
+            let key = format!(
+                "{} {}",
+                record
+                    .finding
+                    .title
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                record
+                    .finding
+                    .root_cause
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            )
+            .to_lowercase();
+            let index = if let Some(index) = finding_indices.get(&key).copied() {
+                let existing = &mut findings[index];
+                existing.severity = existing.severity.max(record.finding.severity);
+                if record.finding.description.len() > existing.description.len() {
+                    existing.category = record.finding.category;
+                    existing.subcategory = record.finding.subcategory.clone();
+                    existing.description = record.finding.description.clone();
+                }
+                if record.finding.root_cause.len() > existing.root_cause.len() {
+                    existing.root_cause = record.finding.root_cause.clone();
+                }
+                if record.finding.patterns.len() > existing.patterns.len() {
+                    existing.patterns = record.finding.patterns.clone();
+                }
+                if record.finding.exploits.len() > existing.exploits.len() {
+                    existing.exploits = record.finding.exploits.clone();
+                }
+                index
+            } else {
+                let index = findings.len();
+                finding_indices.insert(key, index);
+                findings.push(record.finding);
+                index
+            };
+            finding_ids.insert(record.id, index);
+        }
+
+        let mut edges = BTreeSet::new();
+        for link in self.links {
+            let Some(&finding_index) = finding_ids.get(&link.finding_id) else {
+                return Err(KgError::other(format!(
+                    "narrative link references missing finding `{}`",
+                    link.finding_id
+                )));
+            };
+            for semantic_id in link.semantic_ids {
+                let Some(&semantic_index) = semantic_ids.get(&semantic_id) else {
+                    return Err(KgError::other(format!(
+                        "narrative link references missing semantic `{semantic_id}`"
+                    )));
+                };
+                edges.insert((finding_index, semantic_index));
+            }
+        }
+        let covered: BTreeSet<usize> = edges.iter().map(|(finding, _)| *finding).collect();
+        let needs_fallback = covered.len() != findings.len();
+        Ok((
+            semantics,
+            findings,
+            InProjectLinks {
+                edges: edges.into_iter().collect(),
+            },
+            needs_fallback,
+        ))
+    }
 }
 
 #[async_trait]
@@ -233,6 +500,19 @@ impl ProjectData {
         format!("{h:016x}")
     }
 
+    fn narrative_combined_content_hash(&self, suffix: &str, content: &str) -> String {
+        let mut h: u64 = 0xcbf29ce484222325;
+        for &byte in b"narrative-combined-v1"
+            .iter()
+            .chain(suffix.as_bytes())
+            .chain(content.as_bytes())
+        {
+            h ^= byte as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        format!("{h:016x}")
+    }
+
     /// Phase 1: Categorize the project and extract semantics.
     /// Safe to run concurrently across multiple projects.
     ///
@@ -247,6 +527,18 @@ impl ProjectData {
         db: Option<&HistoricalDatabase>,
         force_remove_pending_chunks: bool,
     ) -> Result<ExtractResult> {
+        if self.is_narrative {
+            return self
+                .categorize_and_extract_narrative(
+                    llm,
+                    agent_options,
+                    chunk_input_budget,
+                    db,
+                    force_remove_pending_chunks,
+                )
+                .await;
+        }
+
         let pid = self.display_id();
 
         tracing::info!(
@@ -348,6 +640,207 @@ impl ProjectData {
         })
     }
 
+    async fn categorize_and_extract_narrative(
+        &self,
+        llm: &LLM,
+        agent_options: &AgentRunOptions,
+        chunk_input_budget: Option<usize>,
+        db: Option<&HistoricalDatabase>,
+        force_remove_pending_chunks: bool,
+    ) -> Result<ExtractResult> {
+        let pid = self.display_id();
+        let categories = self
+            .categorize(llm, agent_options, db, force_remove_pending_chunks)
+            .await?;
+        let system_prompt = prompts::NARRATIVE_ROLE_SYSTEM;
+        let user_suffix = prompts::narrative_combined_extract_user_suffix(&categories);
+        let model = &llm.model;
+        let system_tokens = model.config.count_tokens_lossy(system_prompt);
+        let suffix_tokens = model.config.count_tokens_lossy(&user_suffix);
+        let total_budget = get_context_budget(model, agent_options.context_window_utilization);
+        let chunk_budget = match chunk_input_budget {
+            Some(cap) => cap.min(total_budget.saturating_sub(system_tokens + suffix_tokens)),
+            None => total_budget.saturating_sub(system_tokens + suffix_tokens),
+        };
+        if chunk_budget == 0 {
+            return Err(KgError::other(
+                "narrative extraction has no remaining input budget after prompt overhead",
+            ));
+        }
+
+        let content = self.build_project_prompt_body();
+        let content_hash = self.narrative_combined_content_hash(&user_suffix, &content);
+        let stage = "narrative_combined";
+        if let Some(db) = db {
+            let legacy_semantics = db.load_extraction_chunks(&pid, "semantics").await?;
+            let legacy_findings = db.load_extraction_chunks(&pid, "findings").await?;
+            if !legacy_semantics.is_empty() || !legacy_findings.is_empty() {
+                if !force_remove_pending_chunks {
+                    return Err(KgError::other(format!(
+                        "legacy narrative extraction checkpoints exist for {pid}; rerun with --force-remove-pending-chunks to discard them"
+                    )));
+                }
+                db.clear_extraction_chunks(&pid, "semantics").await?;
+                db.clear_extraction_chunks(&pid, "findings").await?;
+            }
+        }
+        let checkpoint_rows = if let Some(db) = db {
+            let rows = db.load_extraction_chunks(&pid, stage).await?;
+            if !rows.is_empty()
+                && !db
+                    .extraction_chunks_match(&pid, stage, model.model_id_str(), &content_hash)
+                    .await?
+            {
+                if !force_remove_pending_chunks {
+                    return Err(KgError::other(format!(
+                        "narrative extraction checkpoints for {pid} do not match this run; rerun with --force-remove-pending-chunks to discard them"
+                    )));
+                }
+                db.clear_extraction_chunks(&pid, stage).await?;
+                Vec::new()
+            } else {
+                rows
+            }
+        } else {
+            Vec::new()
+        };
+
+        let Some(mut cursor) = TokenCursor::new(content, model.clone()) else {
+            return Err(KgError::other(
+                "Failed to initialize TokenCursor for narrative extraction",
+            ));
+        };
+        let mut raw = NarrativeRawExtraction::default();
+        for (expected_idx, row) in checkpoint_rows.iter().enumerate() {
+            let row_idx = usize::try_from(row.chunk_idx)
+                .map_err(|_| KgError::other("negative narrative extraction chunk index"))?;
+            if row_idx != expected_idx {
+                return Err(KgError::other(format!(
+                    "narrative extraction checkpoints for {pid} are not contiguous"
+                )));
+            }
+            let chunk: NarrativeCombinedChunk = serde_json::from_str(&row.chunk_json)?;
+            raw.append_chunk(row_idx, chunk)?;
+            if cursor.next_chunk(chunk_budget).is_none() {
+                return Err(KgError::other(format!(
+                    "narrative extraction checkpoint {row_idx} exceeds the current report content"
+                )));
+            }
+        }
+
+        let checkpoint_sink = db.map(|db| db as &dyn ExtractionCheckpointSink);
+        let mut chunk_idx = checkpoint_rows.len();
+        while let Some(chunk) = cursor.next_chunk(chunk_budget) {
+            let user_prompt = format!("{}{}", chunk, user_suffix);
+            tracing::info!(
+                "Extracting combined narrative chunk {} (~{} tokens, done={})",
+                chunk_idx,
+                system_tokens + model.config.count_tokens_lossy(&user_prompt),
+                cursor.is_done(),
+            );
+            let extractor = NarrativeChunkExtractor {
+                llm: llm.clone(),
+                options: agent_options.scoped(&format!("narrative-combined-chunk{chunk_idx}")),
+                system_prompt: system_prompt.to_string(),
+                user_prompt,
+                cache_key: format!(
+                    "{}-narrative-combined-chunk{chunk_idx}",
+                    self.prompt_cache_key()
+                ),
+                label: format!("narrative-extract-{}-chunk{chunk_idx}", self.display_id()),
+            };
+            let items = extractor.run().await?;
+            let checkpoint = NarrativeCombinedChunk { items };
+            raw.append_chunk(chunk_idx, checkpoint.clone())?;
+            if let Some(checkpoint_sink) = checkpoint_sink {
+                checkpoint_sink
+                    .save_extraction_chunk(
+                        &pid,
+                        stage,
+                        chunk_idx,
+                        model.model_id_str(),
+                        &content_hash,
+                        serde_json::to_string(&checkpoint)?,
+                    )
+                    .await?;
+            }
+            chunk_idx += 1;
+        }
+
+        let (semantics, findings, mut in_project_links, needs_fallback) =
+            raw.into_extract_parts()?;
+        if needs_fallback && !findings.is_empty() && !semantics.is_empty() {
+            let link_manifest = (&categories, &semantics, &findings);
+            let link_hash = Self::serialized_hash(&link_manifest)?;
+            let fallback = if let Some(db) = db {
+                if let Some(mut links) = self
+                    .load_merge_checkpoint::<InProjectLinks>(
+                        db,
+                        "narrative_link",
+                        llm.model.model_id_str(),
+                        &link_hash,
+                    )
+                    .await?
+                {
+                    match links.pop() {
+                        Some(links) => links,
+                        None => {
+                            return Err(KgError::other(
+                                "narrative link checkpoint contained no link result",
+                            ));
+                        }
+                    }
+                } else {
+                    let links = self
+                        .link_findings_in_project(llm, &categories, &semantics, &findings)
+                        .await?;
+                    db.save_extraction_chunk(
+                        &pid,
+                        "narrative_link",
+                        0,
+                        llm.model.model_id_str(),
+                        &link_hash,
+                        &serde_json::to_string(&vec![links.clone()])?,
+                    )
+                    .await?;
+                    links
+                }
+            } else {
+                self.link_findings_in_project(llm, &categories, &semantics, &findings)
+                    .await?
+            };
+            let mut edges = in_project_links.edges.into_iter().collect::<BTreeSet<_>>();
+            edges.extend(fallback.edges);
+            in_project_links.edges = edges.into_iter().collect();
+        }
+        if !findings.is_empty() {
+            let linked: BTreeSet<usize> = in_project_links
+                .edges
+                .iter()
+                .map(|(finding_idx, _)| *finding_idx)
+                .collect();
+            if linked.len() != findings.len() {
+                return Err(KgError::other(format!(
+                    "narrative extraction left {} finding(s) without a semantic link",
+                    findings.len().saturating_sub(linked.len())
+                )));
+            }
+        }
+        tracing::info!(
+            "Combined narrative extraction for {} produced {} semantic(s), {} finding(s), and {} link(s)",
+            pid,
+            semantics.len(),
+            findings.len(),
+            in_project_links.edges.len(),
+        );
+        Ok(ExtractResult {
+            categories,
+            semantics,
+            findings,
+            in_project_links,
+        })
+    }
+
     /// Categorize the project and extract only project semantics.
     /// This is used by consumers that need semantic context but do not need audit findings.
     pub async fn categorize_and_extract_semantics(
@@ -441,8 +934,16 @@ impl ProjectData {
         self.merge_and_write_txn(&txn, db, llm, extract, agent_options, merge_chunking)
             .await?;
         txn.commit().await?;
-        db.clear_extraction_chunks_for_project(&self.display_id())
-            .await?;
+        if let Err(error) = db
+            .clear_extraction_chunks_for_project(&self.display_id())
+            .await
+        {
+            tracing::warn!(
+                "Project {} committed, but checkpoint cleanup failed: {}",
+                self.display_id(),
+                error
+            );
+        }
         Ok(())
     }
 
@@ -469,7 +970,7 @@ impl ProjectData {
 
         if extract.semantics.is_empty() && extract.findings.is_empty() {
             let new_canonicals = db
-                .write_project_completed_txn(
+                .write_project_completed_txn_with_source(
                     conn,
                     self.name(),
                     self.platform_id(),
@@ -477,6 +978,7 @@ impl ProjectData {
                     &[],
                     &[],
                     &InProjectLinks::default(),
+                    self.feed_source.as_ref(),
                 )
                 .await?;
             tracing::info!("Project {} written (no semantics or findings)", pid);
@@ -491,7 +993,7 @@ impl ProjectData {
             .await?;
 
         let new_canonicals = db
-            .write_project_completed_txn(
+            .write_project_completed_txn_with_source(
                 conn,
                 self.name(),
                 self.platform_id(),
@@ -499,6 +1001,7 @@ impl ProjectData {
                 &semantic_merge_results,
                 &finding_merge_results,
                 &extract.in_project_links,
+                self.feed_source.as_ref(),
             )
             .await?;
 
@@ -508,6 +1011,9 @@ impl ProjectData {
 
     /// Check if this project is already completed in the DB.
     pub async fn is_completed(&self, db: &HistoricalDatabase) -> Result<bool> {
+        if let Some(source) = &self.feed_source {
+            return db.is_feed_report_current(source).await;
+        }
         if let Some(pid) = self.platform_id() {
             db.is_project_completed(pid).await
         } else {
@@ -520,30 +1026,47 @@ impl ProjectData {
     }
 
     fn build_project_prompt_body(&self) -> String {
-        let mut content = prompts::project_user_prefix();
-        content.push_str("## Source Files\n\n");
+        if self.is_narrative {
+            let mut content = prompts::narrative_project_user_prefix();
+            for file in self.source_files() {
+                content.push_str(&format!(
+                    "### {}\n\n{}\n\n",
+                    file.relative_path.display(),
+                    file.content
+                ));
+            }
+            content
+        } else {
+            let mut content = prompts::project_user_prefix();
+            content.push_str("## Source Files\n\n");
 
-        for file in self.source_files() {
-            content.push_str(&format!(
-                "### {}\n```{}\n{}\n```\n\n",
-                file.relative_path.display(),
-                self.source_language().code_fence(),
-                file.content
-            ));
+            for file in self.source_files() {
+                content.push_str(&format!(
+                    "### {}\n```{}\n{}\n```\n\n",
+                    file.relative_path.display(),
+                    self.source_language().code_fence(),
+                    file.content
+                ));
+            }
+
+            if let Some(readme) = self.load_readme() {
+                content.push_str("## README\n\n");
+                content.push_str(&readme);
+                content.push_str("\n\n");
+            }
+
+            content
         }
-
-        if let Some(readme) = self.load_readme() {
-            content.push_str("## README\n\n");
-            content.push_str(&readme);
-            content.push_str("\n\n");
-        }
-
-        content
     }
 
     fn build_report_prompt_body(&self) -> Option<String> {
         let report = self.audit_report()?.render();
-        let mut content = prompts::report_user_prefix();
+        let prefix = if self.is_narrative {
+            prompts::narrative_report_user_prefix()
+        } else {
+            prompts::report_user_prefix()
+        };
+        let mut content = prefix;
         content.push_str(&report);
         content.push_str("\n\n");
         Some(content)
@@ -600,11 +1123,19 @@ impl ProjectData {
     ) -> Result<Vec<DeFiCategory>> {
         let started_at = Instant::now();
         let model = &llm.model;
-        let user_suffix = prompts::CATEGORIZE_USER_SUFFIX;
+        let (system_prompt, user_suffix): (&str, &str) = if self.is_narrative {
+            (
+                prompts::NARRATIVE_ROLE_SYSTEM,
+                prompts::NARRATIVE_CATEGORIZE_USER_SUFFIX,
+            )
+        } else {
+            (
+                prompts::GENERAL_ROLE_SYSTEM,
+                prompts::CATEGORIZE_USER_SUFFIX,
+            )
+        };
         let cache_key = sanitize_prompt_prefix(&self.display_id());
-        let sys_tokens = model
-            .config
-            .count_tokens_lossy(prompts::GENERAL_ROLE_SYSTEM);
+        let sys_tokens = model.config.count_tokens_lossy(system_prompt);
         let suffix_tokens = model.config.count_tokens_lossy(user_suffix);
         let budget = get_context_budget(model, agent_options.context_window_utilization)
             .saturating_sub(sys_tokens + suffix_tokens);
@@ -675,7 +1206,7 @@ impl ProjectData {
         let runner = CategorizeRunner {
             llm: llm.clone(),
             options: local_options,
-            system_prompt: prompts::GENERAL_ROLE_SYSTEM.to_string(),
+            system_prompt: system_prompt.to_string(),
             user_prompt,
             cache_key,
             label,
@@ -757,13 +1288,21 @@ impl ProjectData {
         known_chunks: &[KnownExtractedChunk<ExtractedSemantic>],
         checkpoint_sink: Option<&dyn ExtractionCheckpointSink>,
     ) -> Result<Vec<ExtractedSemantic>> {
-        let system_prompt = prompts::GENERAL_ROLE_SYSTEM;
+        let system_prompt = if self.is_narrative {
+            prompts::NARRATIVE_ROLE_SYSTEM
+        } else {
+            prompts::GENERAL_ROLE_SYSTEM
+        };
         let model = &llm.model;
         let debug_key = self.debug_key("extract");
         let cache_key_root = self.prompt_cache_key();
         let sys_tokens = model.config.count_tokens_lossy(system_prompt);
         let total_budget = get_context_budget(model, agent_options.context_window_utilization);
-        let user_suffix = prompts::extract_semantics_user_suffix(categories);
+        let user_suffix = if self.is_narrative {
+            prompts::narrative_extract_semantics_user_suffix(categories)
+        } else {
+            prompts::extract_semantics_user_suffix(categories)
+        };
         let suffix_tokens = model.config.count_tokens_lossy(&user_suffix);
 
         // Caller-overridable per-chunk input budget; default = ~80% of
@@ -973,13 +1512,21 @@ impl ProjectData {
             return Ok(Vec::new());
         };
 
-        let system_prompt = prompts::GENERAL_ROLE_SYSTEM;
+        let system_prompt = if self.is_narrative {
+            prompts::NARRATIVE_ROLE_SYSTEM
+        } else {
+            prompts::GENERAL_ROLE_SYSTEM
+        };
         let model = &llm.model;
         let debug_key = self.debug_key("finding-extract");
         let cache_key_root = self.finding_cache_key();
         let sys_tokens = model.config.count_tokens_lossy(system_prompt);
         let total_budget = get_context_budget(model, agent_options.context_window_utilization);
-        let user_suffix = prompts::extract_findings_user_suffix(categories);
+        let user_suffix = if self.is_narrative {
+            prompts::narrative_extract_findings_user_suffix(categories)
+        } else {
+            prompts::extract_findings_user_suffix(categories)
+        };
         let suffix_tokens = model.config.count_tokens_lossy(&user_suffix);
         let chunk_budget = match chunk_input_budget {
             Some(cap) => cap.min(total_budget.saturating_sub(sys_tokens + suffix_tokens)),
@@ -1133,6 +1680,176 @@ impl ProjectData {
     }
 }
 
+#[cfg(test)]
+mod narrative_tests {
+    use super::*;
+    use crate::vulnerability::{FindingSeverity, VulnerabilityCategory};
+    use knowdit_kg_model::category::DeFiCategory;
+
+    fn semantic(name: &str) -> ExtractedSemantic {
+        ExtractedSemantic {
+            name: name.to_string(),
+            category: DeFiCategory::Others,
+            definition: "A reusable exploit mechanism".to_string(),
+            description: "Concrete mechanism details".to_string(),
+            functions: vec![ExtractedFunction {
+                name: "_narrative".to_string(),
+                contract: "report.md".to_string(),
+                signature: None,
+            }],
+        }
+    }
+
+    fn finding(title: &str, root_cause: &str) -> ExtractedFinding {
+        ExtractedFinding {
+            title: title.to_string(),
+            severity: FindingSeverity::High,
+            category: VulnerabilityCategory::AccessControl,
+            subcategory: "Missing Function-Level Access Control".to_string(),
+            root_cause: root_cause.to_string(),
+            description: "Concrete finding details".to_string(),
+            patterns: "Concrete pattern".to_string(),
+            exploits: "Concrete exploit".to_string(),
+        }
+    }
+
+    #[test]
+    fn narrative_extraction_keeps_distinct_same_title_mechanisms() {
+        let raw = NarrativeRawExtraction {
+            semantics: vec![NarrativeSemanticRecord {
+                id: "sem-0".to_string(),
+                semantic: semantic("Governance Capture"),
+            }],
+            findings: vec![
+                NarrativeFindingRecord {
+                    id: "finding-0".to_string(),
+                    finding: finding("TOP Governance Takeover", "Cheap quorum capture"),
+                },
+                NarrativeFindingRecord {
+                    id: "finding-1".to_string(),
+                    finding: finding("TOP Governance Takeover", "Missing timelock"),
+                },
+            ],
+            links: vec![
+                NarrativeLinkRecord {
+                    finding_id: "finding-0".to_string(),
+                    semantic_ids: vec!["sem-0".to_string()],
+                },
+                NarrativeLinkRecord {
+                    finding_id: "finding-1".to_string(),
+                    semantic_ids: vec!["sem-0".to_string()],
+                },
+            ],
+        };
+
+        let (semantics, findings, links, needs_fallback) = match raw.into_extract_parts() {
+            Ok(parts) => parts,
+            Err(error) => panic!("unexpected narrative extraction error: {error}"),
+        };
+        assert_eq!(semantics.len(), 1);
+        assert_eq!(findings.len(), 2);
+        assert_eq!(links.edges, vec![(0, 0), (1, 0)]);
+        assert!(!needs_fallback);
+    }
+
+    #[test]
+    fn narrative_extraction_requests_fallback_for_cross_chunk_link_gap() {
+        let raw = NarrativeRawExtraction {
+            semantics: vec![NarrativeSemanticRecord {
+                id: "sem-1".to_string(),
+                semantic: semantic("Governance Capture"),
+            }],
+            findings: vec![NarrativeFindingRecord {
+                id: "finding-0".to_string(),
+                finding: finding("Governance Takeover", "Cheap quorum capture"),
+            }],
+            links: Vec::new(),
+        };
+
+        let (_, findings, links, needs_fallback) = match raw.into_extract_parts() {
+            Ok(parts) => parts,
+            Err(error) => panic!("unexpected narrative extraction error: {error}"),
+        };
+        assert_eq!(findings.len(), 1);
+        assert!(links.is_empty());
+        assert!(needs_fallback);
+    }
+
+    #[test]
+    fn merge_results_round_trip_for_retry_checkpoint() {
+        let result = MergeResult {
+            semantic: semantic("Arithmetic Overflow"),
+            action: MergeAction::Merge {
+                target_ids: vec![7, 9],
+                updated_description: Some("Concrete updated description".to_string()),
+                appended_description: Some("Concrete merge delta".to_string()),
+            },
+        };
+        let encoded = match serde_json::to_string(&vec![result.clone()]) {
+            Ok(encoded) => encoded,
+            Err(error) => panic!("unexpected merge serialization error: {error}"),
+        };
+        let decoded: Vec<MergeResult> = match serde_json::from_str(&encoded) {
+            Ok(decoded) => decoded,
+            Err(error) => panic!("unexpected merge deserialization error: {error}"),
+        };
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].semantic.name, result.semantic.name);
+        assert!(matches!(
+            &decoded[0].action,
+            MergeAction::Merge { target_ids, .. } if target_ids == &vec![7, 9]
+        ));
+    }
+
+    #[test]
+    fn finding_merge_results_round_trip_for_retry_checkpoint() {
+        let result = FindingMergeResult {
+            finding: finding("Overflow", "Unchecked arithmetic"),
+            action: FindingMergeAction::New,
+        };
+        let encoded = match serde_json::to_string(&vec![result]) {
+            Ok(encoded) => encoded,
+            Err(error) => panic!("unexpected finding merge serialization error: {error}"),
+        };
+        let decoded: Vec<FindingMergeResult> = match serde_json::from_str(&encoded) {
+            Ok(decoded) => decoded,
+            Err(error) => panic!("unexpected finding merge deserialization error: {error}"),
+        };
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].finding.title, "Overflow");
+        assert!(matches!(decoded[0].action, FindingMergeAction::New));
+    }
+
+    #[test]
+    fn narrative_chunk_serialization_preserves_all_item_kinds() {
+        let chunk = NarrativeCombinedChunk {
+            items: vec![
+                NarrativeCombinedItem::Semantic(NarrativeSemanticRecord {
+                    id: "sem-0".to_string(),
+                    semantic: semantic("Governance Capture"),
+                }),
+                NarrativeCombinedItem::Finding(NarrativeFindingRecord {
+                    id: "finding-0".to_string(),
+                    finding: finding("Governance Takeover", "Missing timelock"),
+                }),
+                NarrativeCombinedItem::Link(NarrativeLinkRecord {
+                    finding_id: "finding-0".to_string(),
+                    semantic_ids: vec!["sem-0".to_string()],
+                }),
+            ],
+        };
+        let encoded = match serde_json::to_string(&chunk) {
+            Ok(encoded) => encoded,
+            Err(error) => panic!("unexpected narrative serialization error: {error}"),
+        };
+        let decoded: NarrativeCombinedChunk = match serde_json::from_str(&encoded) {
+            Ok(decoded) => decoded,
+            Err(error) => panic!("unexpected narrative deserialization error: {error}"),
+        };
+        assert_eq!(decoded.items.len(), 3);
+    }
+}
+
 impl ProjectData {
     /// Merge newly-extracted semantics against the historical KB. Chunks
     /// the existing canonicals (with their merged-away raw children
@@ -1163,6 +1880,30 @@ impl ProjectData {
         let candidates = db
             .canonical_semantics_with_children_for_categories(&semantic_categories)
             .await?;
+        let manifest = SemanticMergeCheckpointManifest {
+            version: "semantic-merge-v1",
+            stage: "semantic_merge",
+            model: llm.model.model_id_str().to_string(),
+            max_agent_steps: agent_options.max_agent_steps,
+            context_window_utilization: agent_options.context_window_utilization,
+            new_item_token_ratio: merge_chunking.new_item_token_ratio,
+            merge_concurrency: merge_chunking.concurrency,
+            new_item_batch_size: merge_chunking.new_item_batch_size,
+            extracted: extract.semantics.clone(),
+            candidates: candidates.clone(),
+        };
+        let content_hash = Self::serialized_hash(&manifest)?;
+        if let Some(results) = self
+            .load_merge_checkpoint::<MergeResult>(
+                db,
+                "semantic_merge",
+                llm.model.model_id_str(),
+                &content_hash,
+            )
+            .await?
+        {
+            return Ok(results);
+        }
         let merger = SemanticMerger {
             new_semantics: extract.semantics.clone(),
             candidates,
@@ -1174,10 +1915,17 @@ impl ProjectData {
             label_root: format!("semantic-merge-{}", self.display_id()),
         };
         let aggregated = merger.run().await?;
-        Ok(Self::semantic_merge_results_from_aggregated(
-            &extract.semantics,
-            aggregated,
-        ))
+        let results = Self::semantic_merge_results_from_aggregated(&extract.semantics, aggregated);
+        db.save_extraction_chunk(
+            &self.display_id(),
+            "semantic_merge",
+            0,
+            llm.model.model_id_str(),
+            &content_hash,
+            &serde_json::to_string(&results)?,
+        )
+        .await?;
+        Ok(results)
     }
 
     /// Convert the orchestrator's `(name → AggregatedSemanticMergeDecision)`
@@ -1233,6 +1981,30 @@ impl ProjectData {
         let candidates = db
             .canonical_findings_with_children_for_categories(&finding_categories)
             .await?;
+        let manifest = FindingMergeCheckpointManifest {
+            version: "finding-merge-v1",
+            stage: "finding_merge",
+            model: llm.model.model_id_str().to_string(),
+            max_agent_steps: agent_options.max_agent_steps,
+            context_window_utilization: agent_options.context_window_utilization,
+            new_item_token_ratio: merge_chunking.new_item_token_ratio,
+            merge_concurrency: merge_chunking.concurrency,
+            new_item_batch_size: merge_chunking.new_item_batch_size,
+            extracted: extract.findings.clone(),
+            candidates: candidates.clone(),
+        };
+        let content_hash = Self::serialized_hash(&manifest)?;
+        if let Some(results) = self
+            .load_merge_checkpoint::<FindingMergeResult>(
+                db,
+                "finding_merge",
+                llm.model.model_id_str(),
+                &content_hash,
+            )
+            .await?
+        {
+            return Ok(results);
+        }
         let merger = FindingMerger {
             new_findings: extract.findings.clone(),
             candidates,
@@ -1244,10 +2016,17 @@ impl ProjectData {
             label_root: format!("finding-merge-{}", self.display_id()),
         };
         let aggregated = merger.run().await?;
-        Ok(Self::finding_merge_results_from_aggregated(
-            &extract.findings,
-            aggregated,
-        ))
+        let results = Self::finding_merge_results_from_aggregated(&extract.findings, aggregated);
+        db.save_extraction_chunk(
+            &self.display_id(),
+            "finding_merge",
+            0,
+            llm.model.model_id_str(),
+            &content_hash,
+            &serde_json::to_string(&results)?,
+        )
+        .await?;
+        Ok(results)
     }
 
     fn finding_merge_results_from_aggregated(

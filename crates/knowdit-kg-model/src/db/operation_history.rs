@@ -26,6 +26,14 @@ pub enum OperationType {
     /// `knowdit learn link` — global finding-to-semantic linking pass.
     #[sea_orm(string_value = "link")]
     Link,
+    /// `knowdit feed reports` — ingest narrative security reports (attack
+    /// analyses, post-mortems, audit findings) into the KG.
+    #[sea_orm(string_value = "reportsfeed")]
+    ReportsFeed,
+    /// `knowdit db remap-links` — one-time move of link / function /
+    /// provenance rows off merge sources onto their canonicals.
+    #[sea_orm(string_value = "remaplinks")]
+    RemapLinks,
 }
 
 impl OperationType {
@@ -34,6 +42,8 @@ impl OperationType {
             Self::C4Learn => "c4learn",
             Self::SherlockLearn => "sherlocklearn",
             Self::Link => "link",
+            Self::ReportsFeed => "reportsfeed",
+            Self::RemapLinks => "remaplinks",
         }
     }
 }

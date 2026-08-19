@@ -2877,6 +2877,7 @@ dependencies = [
  "sea-orm",
  "serde",
  "serde_json",
+ "sha2",
  "tikv-jemallocator",
  "tokio",
  "toml",
@@ -3279,8 +3280,6 @@ dependencies = [
 [[package]]
 name = "llmy-tokenizer"
 version = "0.17.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c39a9b6595d0b4144de5aa2378eecc744fa3e9a9e4b98f1ae99185240c31c181"
 dependencies = [
  "base64",
  "rust_decimal",
