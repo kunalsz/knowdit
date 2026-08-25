@@ -34,6 +34,10 @@ pub enum OperationType {
     /// provenance rows off merge sources onto their canonicals.
     #[sea_orm(string_value = "remaplinks")]
     RemapLinks,
+    /// `knowdit learn reclassify-others` — LLM re-classification of
+    /// canonical semantics stranded in the `Others` bucket.
+    #[sea_orm(string_value = "reclassifyothers")]
+    ReclassifyOthers,
 }
 
 impl OperationType {
@@ -44,6 +48,7 @@ impl OperationType {
             Self::Link => "link",
             Self::ReportsFeed => "reportsfeed",
             Self::RemapLinks => "remaplinks",
+            Self::ReclassifyOthers => "reclassifyothers",
         }
     }
 }

@@ -2109,3 +2109,273 @@ pub(crate) fn sanitize_prompt_prefix(value: &str) -> String {
 // existing canonical id set. With the agent-tool form, validation is
 // inlined into `project_*_merge_results`: decisions referencing an
 // unknown id are downgraded to `New` (and logged) rather than rejected.
+
+// ── `Others`-bucket re-classification ────────────────────────────────
+
+/// One LLM decision for a single stranded canonical node.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ReclassifyNodeDecision {
+    pub semantic_id: i32,
+    pub category: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReclassifyBatchResponse {
+    nodes: Vec<ReclassifyNodeDecision>,
+}
+
+/// Re-classify every canonical semantic parked in `Others` into a real
+/// category. Renders each node with up to three linked finding titles as
+/// coverage evidence, batches them, and runs one JSON-mode LLM call per
+/// batch. `Others` answers are dropped with a warning — the pass's whole
+/// point is emptying that bucket.
+///
+/// Returns the validated `(semantic_id, category)` decisions; the caller
+/// decides whether to apply them (dry-run vs `--apply`).
+pub async fn reclassify_others(
+    db: &HistoricalDatabase,
+    llm: &LLM,
+    batch_size: usize,
+    context_window_utilization: f64,
+) -> Result<Vec<ReclassifyNodeDecision>> {
+    use crate::prompts;
+
+    let nodes = db
+        .canonical_semantics_in_category(DeFiCategory::Others)
+        .await?;
+    if nodes.is_empty() {
+        tracing::info!("No canonical semantics in `Others`; nothing to reclassify.");
+        return Ok(Vec::new());
+    }
+
+    // Coverage evidence: top linked findings per node (title + root cause).
+    let linked = db
+        .findings_for_semantic_ids(&nodes.iter().map(|n| n.id).collect::<Vec<_>>())
+        .await?;
+    let mut findings_by_semantic: HashMap<i32, Vec<(String, String)>> = HashMap::new();
+    for lf in linked {
+        findings_by_semantic
+            .entry(lf.canonical_semantic_id)
+            .or_default()
+            .push((lf.finding.title.clone(), lf.finding.root_cause.clone()));
+    }
+    for entries in findings_by_semantic.values_mut() {
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        entries.dedup_by(|a, b| a.0 == b.0);
+        entries.truncate(3);
+    }
+
+    let model = &llm.model;
+    let system_prompt = prompts::RECLASSIFY_SEMANTIC_SYSTEM;
+    let budget = crate::learn::get_context_budget(model, context_window_utilization)
+        .saturating_sub(model.config.count_tokens_lossy(system_prompt))
+        .saturating_sub(
+            model
+                .config
+                .count_tokens_lossy(prompts::RECLASSIFY_SEMANTIC_USER_HEADER),
+        )
+        .saturating_sub(
+            model
+                .config
+                .count_tokens_lossy(prompts::RECLASSIFY_SEMANTIC_USER_FOOTER),
+        );
+
+    let render_node = |node: &knowdit_kg_model::db::semantic_node::Model| -> String {
+        let evidence = findings_by_semantic
+            .get(&node.id)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .map(|(title, root_cause)| {
+                        format!(
+                            "- finding \"{title}\" — root cause: {}",
+                            root_cause.trim().chars().take(200).collect::<String>()
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_else(|| "- (no linked findings)".to_string());
+        format!(
+            "### semantic_id={}\nname: {}\ndefinition: {}\ndescription: {}\ncoverage evidence:\n{}\n",
+            node.id,
+            node.name,
+            node.definition.trim(),
+            node.description.trim(),
+            evidence,
+        )
+    };
+
+    // ── DB checkpoints: reuse decisions from a previous run (e.g. a
+    //    dry-run that was never applied) so `--apply` doesn't re-bill
+    //    the LLM. Keyed per node id under project_key
+    //    "reclassify-others", stage "reclassify".
+    let checkpoint_key = "reclassify-others";
+    let checkpoint_stage = "reclassify";
+    let mut decisions: Vec<ReclassifyNodeDecision> = Vec::new();
+    let mut pending: Vec<knowdit_kg_model::db::semantic_node::Model> = Vec::new();
+    let checkpoint_chunks = db
+        .load_extraction_chunks(checkpoint_key, checkpoint_stage)
+        .await?;
+    for node in &nodes {
+        let hit = checkpoint_chunks.iter().find(|chunk| {
+            chunk
+                .chunk_json
+                .contains(&format!("\"semantic_id\":{}", node.id))
+        });
+        if let Some(chunk) = hit {
+            if let Ok(entry) = serde_json::from_str::<ReclassifyNodeDecision>(&chunk.chunk_json) {
+                tracing::info!(
+                    "reclassify checkpoint hit for sem-{} — skipped LLM call ({})",
+                    node.id,
+                    entry.category
+                );
+                decisions.push(entry);
+                continue;
+            }
+        }
+        pending.push(node.clone());
+    }
+
+    let mut batch: Vec<String> = Vec::new();
+    let mut batch_nodes: Vec<knowdit_kg_model::db::semantic_node::Model> = Vec::new();
+    let mut batch_tokens = 0usize;
+    for node in pending {
+        let record = render_node(&node);
+        let record_tokens = model.config.count_tokens_lossy(&record);
+        if !batch.is_empty()
+            && (batch.len() >= batch_size.max(1) || batch_tokens + record_tokens > budget)
+        {
+            let batch_decisions = run_reclassify_batch(llm, &batch_nodes, &batch).await?;
+            persist_reclassify_checkpoints(
+                db,
+                checkpoint_key,
+                checkpoint_stage,
+                model.model_id_str(),
+                &batch_decisions,
+            )
+            .await?;
+            decisions.extend(batch_decisions);
+            batch.clear();
+            batch_nodes.clear();
+            batch_tokens = 0;
+        }
+        batch_tokens += record_tokens;
+        batch.push(record);
+        batch_nodes.push(node);
+    }
+    if !batch.is_empty() {
+        let batch_decisions = run_reclassify_batch(llm, &batch_nodes, &batch).await?;
+        persist_reclassify_checkpoints(
+            db,
+            checkpoint_key,
+            checkpoint_stage,
+            model.model_id_str(),
+            &batch_decisions,
+        )
+        .await?;
+        decisions.extend(batch_decisions);
+    }
+
+    Ok(decisions)
+}
+
+/// Persist one reclassify decision per `extraction_chunk` row, so a
+/// follow-up run (e.g. `--apply` after a dry-run) reuses the LLM verdict
+/// instead of re-calling the model.
+async fn persist_reclassify_checkpoints(
+    db: &HistoricalDatabase,
+    project_key: &str,
+    stage: &str,
+    model: &str,
+    decisions: &[ReclassifyNodeDecision],
+) -> Result<()> {
+    for decision in decisions {
+        let json = serde_json::to_string(decision)?;
+        db.save_extraction_chunk(
+            project_key,
+            stage,
+            decision.semantic_id,
+            model,
+            "reclassify",
+            &json,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// One JSON-mode LLM call for a batch of stranded nodes. Validates ids,
+/// parses categories, and drops `Others` answers.
+async fn run_reclassify_batch(
+    llm: &LLM,
+    batch: &[knowdit_kg_model::db::semantic_node::Model],
+    records: &[String],
+) -> Result<Vec<ReclassifyNodeDecision>> {
+    use crate::prompts;
+
+    let batch_ids: HashSet<i32> = batch.iter().map(|n| n.id).collect();
+    let records = records.join("\n");
+    let user_prompt = format!(
+        "{}\n\n## Semantic nodes to re-classify\n\n{}{}",
+        prompts::RECLASSIFY_SEMANTIC_USER_HEADER,
+        records,
+        prompts::RECLASSIFY_SEMANTIC_USER_FOOTER,
+    );
+
+    let cache_key = format!(
+        "reclassify-others-{}",
+        batch.iter().map(|n| n.id).min().unwrap_or(0)
+    );
+    let parsed: ReclassifyBatchResponse = llm
+        .prompt_json_with_retry(
+            prompts::RECLASSIFY_SEMANTIC_SYSTEM,
+            &user_prompt,
+            None,
+            Some(&cache_key),
+            None,
+        )
+        .await?;
+
+    let mut out: Vec<ReclassifyNodeDecision> = Vec::new();
+    let mut seen: HashSet<i32> = HashSet::new();
+    for decision in parsed.nodes {
+        if !batch_ids.contains(&decision.semantic_id) {
+            tracing::warn!(
+                "reclassify batch: dropping decision for unknown semantic_id {}",
+                decision.semantic_id
+            );
+            continue;
+        }
+        if !seen.insert(decision.semantic_id) {
+            tracing::warn!(
+                "reclassify batch: dropping duplicate decision for semantic_id {}",
+                decision.semantic_id
+            );
+            continue;
+        }
+        match DeFiCategory::parse(&decision.category) {
+            Some(DeFiCategory::Others) | None => {
+                tracing::warn!(
+                    "reclassify batch: dropping decision for semantic_id {} with unusable category '{}'",
+                    decision.semantic_id,
+                    decision.category
+                );
+            }
+            Some(category) => out.push(ReclassifyNodeDecision {
+                semantic_id: decision.semantic_id,
+                category: category.as_str().to_string(),
+            }),
+        }
+    }
+    let covered: HashSet<i32> = seen.into_iter().collect();
+    for node in batch {
+        if !covered.contains(&node.id) {
+            tracing::warn!(
+                "reclassify batch: semantic_id {} left unjudged by the model",
+                node.id
+            );
+        }
+    }
+    Ok(out)
+}

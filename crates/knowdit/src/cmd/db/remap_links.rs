@@ -85,12 +85,13 @@ impl RemapLinksArgs {
         );
         tracing::info!(
             "semantic side: {} link(s) moved, {} link(s) collided, {} function(s) moved, \
-             {} function(s) deduplicated, {} provenance row(s) moved",
+             {} function(s) deduplicated, {} provenance row(s) moved, {} secondary categor(y/ies) added",
             report.semantic.links_moved,
             report.semantic.links_collided,
             report.semantic.functions_moved,
             report.semantic.functions_skipped_dup,
             report.semantic.provenance_moved,
+            report.semantic.secondary_categories_added,
         );
         tracing::info!(
             "finding side: {} link(s) moved, {} link(s) collided, {} provenance row(s) moved",

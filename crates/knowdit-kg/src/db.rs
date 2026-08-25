@@ -9,7 +9,7 @@ use knowdit_kg_model::db::{
     audit_finding, audit_finding_category, category, extraction_chunk, feed_report_source,
     finding_category, finding_link_status, finding_merge, merge_status, pending_semantic, project,
     project_category, project_finding, project_platform, project_semantic, semantic_finding_link,
-    semantic_function, semantic_merge, semantic_node,
+    semantic_function, semantic_merge, semantic_node, semantic_node_category,
 };
 use knowdit_kg_model::link_strength::LinkStrength;
 use sea_orm::{
@@ -87,6 +87,9 @@ pub struct RemapSemanticOutcome {
     pub functions_skipped_dup: usize,
     /// `project_semantic` rows moved raw → canonical.
     pub provenance_moved: usize,
+    /// `semantic_node_category` rows added on canonicals because the raw
+    /// folded in from a different non-`Others` category.
+    pub secondary_categories_added: usize,
 }
 
 /// Per-table movement counts produced by one
@@ -451,6 +454,8 @@ impl HistoricalDatabase {
     /// queries) and safe.
     pub async fn migrate_schema(&self) -> Result<()> {
         self.migrate_link_strength_columns_within(&self.db).await?;
+        self.migrate_semantic_node_category_table_within(&self.db)
+            .await?;
         Ok(())
     }
 
@@ -460,6 +465,29 @@ impl HistoricalDatabase {
     /// caller's transaction.
     async fn migrate_schema_within<C: ConnectionTrait>(&self, conn: &C) -> Result<()> {
         self.migrate_link_strength_columns_within(conn).await?;
+        self.migrate_semantic_node_category_table_within(conn)
+            .await?;
+        Ok(())
+    }
+
+    /// Idempotent SQLite-only migration: create `semantic_node_category`
+    /// if absent, so pre-existing KGs get the secondary-category table
+    /// before any category-recall query runs. New DBs get it through
+    /// `create_tables`; this only fires for older files opened in place.
+    async fn migrate_semantic_node_category_table_within<C: ConnectionTrait>(
+        &self,
+        conn: &C,
+    ) -> Result<()> {
+        if conn.get_database_backend() != DatabaseBackend::Sqlite {
+            return Ok(());
+        }
+        conn.execute_unprepared(
+            "CREATE TABLE IF NOT EXISTS semantic_node_category ( \
+             semantic_node_id integer NOT NULL, \
+             category_id integer NOT NULL, \
+             PRIMARY KEY (semantic_node_id, category_id))",
+        )
+        .await?;
         Ok(())
     }
 
@@ -526,6 +554,9 @@ impl HistoricalDatabase {
             // historical-DB refactor.
             schema.create_table_from_entity(project_semantic::Entity),
             schema.create_table_from_entity(project_finding::Entity),
+            // Secondary categories carried onto canonicals when a raw folds
+            // in from a different category (category-recall fix).
+            schema.create_table_from_entity(semantic_node_category::Entity),
             schema.create_table_from_entity(knowdit_kg_model::db::pending_semantic::Entity),
             schema.create_table_from_entity(merge_status::Entity),
             // Append-only audit log of top-level learn operations. No FKs —
@@ -1385,29 +1416,42 @@ impl HistoricalDatabase {
         Ok(values)
     }
 
-    /// Transaction-scoped seed used by [`Self::init`]. Atomicity
-    /// matters: a kill mid-loop on the standalone variant would
-    /// leave a partial taxonomy that the `if !existing.is_empty()`
-    /// gate then refuses to re-seed, so the table is permanently
-    /// short of rows. Inside the init transaction, mid-seed kill
-    /// rolls back to zero rows — next run seeds from scratch.
+    /// Transaction-scoped seed used by [`Self::init`]. Idempotent:
+    /// inserts only the names missing from the `category` table, so
+    /// both fresh DBs and pre-existing DBs opened after a taxonomy
+    /// expansion converge on the full set.
     async fn seed_categories_within<C: ConnectionTrait>(&self, conn: &C) -> Result<()> {
         use crate::category::DeFiCategory;
 
-        let existing = category::Entity::find().all(conn).await?;
-        if !existing.is_empty() {
-            return Ok(());
-        }
-
+        // Insert-missing-per-name: idempotent for both fresh DBs AND
+        // pre-existing DBs opened after a taxonomy expansion (new enum
+        // variants appear as new `category` rows without touching the
+        // already-seeded ones).
+        let existing: HashSet<DeFiCategory> = category::Entity::find()
+            .all(conn)
+            .await?
+            .into_iter()
+            .map(|row| row.name)
+            .collect();
+        let mut inserted = 0usize;
         for cat in DeFiCategory::ALL {
+            if existing.contains(cat) {
+                continue;
+            }
             let am = category::ActiveModel {
                 name: Set(*cat),
                 ..Default::default()
             };
             category::Entity::insert(am).exec(conn).await?;
+            inserted += 1;
         }
 
-        tracing::info!("Seeded {} DeFi categories", DeFiCategory::ALL.len());
+        if inserted > 0 {
+            tracing::info!(
+                "Seeded {inserted} missing DeFi categor(y/ies) ({} total)",
+                DeFiCategory::ALL.len()
+            );
+        }
         Ok(())
     }
 
@@ -2005,11 +2049,17 @@ impl HistoricalDatabase {
 
     /// Fetch existing active semantic nodes for the given categories.
     /// Returns nodes that have NOT been merged away.
+    ///
+    /// Category-recall expansion: a canonical also surfaces when any of its
+    /// SECONDARY categories (`semantic_node_category`, carried from folded
+    /// raws) matches — not just its primary `semantic_node.category`. This is
+    /// the single choke point feeding the mapper, the merge agent, and the
+    /// merge-kg candidate pools, so the expansion applies everywhere at once.
     pub async fn existing_semantics_for_categories(
         &self,
         categories: &[crate::category::DeFiCategory],
     ) -> Result<Vec<semantic_node::Model>> {
-        let existing_node_ids: Vec<i32> = semantic_node::Entity::find()
+        let mut existing_node_ids: Vec<i32> = semantic_node::Entity::find()
             .filter(semantic_node::Column::Category.is_in(categories.iter().copied()))
             .all(&self.db)
             .await?
@@ -2017,6 +2067,28 @@ impl HistoricalDatabase {
             .map(|node| node.id)
             .unique()
             .collect();
+
+        if self.table_exists("semantic_node_category").await? {
+            let category_ids: Vec<i32> = category::Entity::find()
+                .filter(category::Column::Name.is_in(categories.iter().copied()))
+                .all(&self.db)
+                .await?
+                .into_iter()
+                .map(|row| row.id)
+                .collect();
+            if !category_ids.is_empty() {
+                let secondary_ids: Vec<i32> = semantic_node_category::Entity::find()
+                    .filter(semantic_node_category::Column::CategoryId.is_in(category_ids))
+                    .all(&self.db)
+                    .await?
+                    .into_iter()
+                    .map(|row| row.semantic_node_id)
+                    .unique()
+                    .collect();
+                existing_node_ids.extend(secondary_ids);
+                existing_node_ids = existing_node_ids.into_iter().unique().collect();
+            }
+        }
 
         let merged_away: Vec<i32> = if !existing_node_ids.is_empty() {
             semantic_merge::Entity::find()
@@ -2045,6 +2117,113 @@ impl HistoricalDatabase {
         };
 
         Ok(nodes)
+    }
+
+    /// Secondary categories per canonical semantic id, resolved from
+    /// `semantic_node_category` → `category`. Returns an empty map when the
+    /// table is absent (pre-migration DB) so callers degrade to primary-only.
+    pub async fn semantic_secondary_categories(
+        &self,
+        semantic_ids: &[i32],
+    ) -> Result<HashMap<i32, Vec<DeFiCategory>>> {
+        let mut out: HashMap<i32, Vec<DeFiCategory>> = HashMap::new();
+        if semantic_ids.is_empty() || !self.table_exists("semantic_node_category").await? {
+            return Ok(out);
+        }
+        let links = semantic_node_category::Entity::find()
+            .filter(
+                semantic_node_category::Column::SemanticNodeId.is_in(semantic_ids.iter().copied()),
+            )
+            .all(&self.db)
+            .await?;
+        if links.is_empty() {
+            return Ok(out);
+        }
+        let category_ids: Vec<i32> = links.iter().map(|row| row.category_id).unique().collect();
+        let category_rows = category::Entity::find()
+            .filter(category::Column::Id.is_in(category_ids))
+            .all(&self.db)
+            .await?;
+        let name_by_id: HashMap<i32, DeFiCategory> = category_rows
+            .into_iter()
+            .map(|row| (row.id, row.name))
+            .collect();
+        for link in links {
+            if let Some(name) = name_by_id.get(&link.category_id) {
+                out.entry(link.semantic_node_id).or_default().push(*name);
+            }
+        }
+        for names in out.values_mut() {
+            names.sort_unstable();
+            names.dedup();
+        }
+        Ok(out)
+    }
+
+    /// Canonical semantic nodes whose primary category is `category`
+    /// (merged-away raws excluded). Backs the `reclassify-others`
+    /// maintenance pass; primary-only by design — the pass re-judges
+    /// exactly the nodes parked in the target bucket.
+    pub async fn canonical_semantics_in_category(
+        &self,
+        category: DeFiCategory,
+    ) -> Result<Vec<semantic_node::Model>> {
+        self.existing_semantics_for_categories(&[category]).await
+    }
+
+    /// Apply an LLM re-classification batch: update each node's PRIMARY
+    /// category (a deliberate correction — unlike merge, which never
+    /// touches identity), and drop now-redundant `semantic_node_category`
+    /// rows whose category equals the new primary. One transaction:
+    /// any error rolls the whole batch back.
+    pub async fn reclassify_semantic_categories(
+        &self,
+        decisions: &[(i32, DeFiCategory)],
+    ) -> Result<usize> {
+        if decisions.is_empty() {
+            return Ok(0);
+        }
+        let txn = self.db.begin().await?;
+        let mut updated = 0usize;
+        for (semantic_id, new_category) in decisions {
+            let Some(node) = semantic_node::Entity::find_by_id(*semantic_id)
+                .one(&txn)
+                .await?
+            else {
+                return Err(KgError::other(format!(
+                    "reclassify target sem-{semantic_id} does not exist; rolling back"
+                )));
+            };
+            if node.category == *new_category {
+                continue;
+            }
+            let mut active = node.into_active_model();
+            active.category = Set(*new_category);
+            active.update(&txn).await?;
+            updated += 1;
+
+            // The old primary (now secondary) rows stay; only rows that
+            // duplicate the NEW primary become redundant.
+            let Some(category_row) = category::Entity::find()
+                .filter(category::Column::Name.eq(*new_category))
+                .one(&txn)
+                .await?
+            else {
+                return Err(KgError::other(format!(
+                    "category row missing for {}; rolling back",
+                    new_category.as_str()
+                )));
+            };
+            if self.table_exists("semantic_node_category").await? {
+                semantic_node_category::Entity::delete_many()
+                    .filter(semantic_node_category::Column::SemanticNodeId.eq(*semantic_id))
+                    .filter(semantic_node_category::Column::CategoryId.eq(category_row.id))
+                    .exec(&txn)
+                    .await?;
+            }
+        }
+        txn.commit().await?;
+        Ok(updated)
     }
 
     /// Fetch every finding linked to any of `semantic_ids` via
@@ -3047,10 +3226,70 @@ impl HistoricalDatabase {
             project_semantic::Entity::delete(project_semantic::ActiveModel {
                 project_id: Set(row.project_id),
                 semantic_node_id: Set(from_semantic_id),
-                ..Default::default()
             })
             .exec(conn)
             .await?;
+        }
+
+        // ── Category recall: carry the raw's category onto canonicals ──
+        // When a raw folds in from a DIFFERENT category (and that category
+        // is not the `Others` catch-all), the canonical gains a secondary
+        // category row so category-scoped candidate pools still surface it.
+        // Canonical-side carry is guaranteed before the raw's own secondary
+        // rows are deleted — same lossless order as the link moves.
+        if self.table_exists("semantic_node_category").await? {
+            let raw_node = semantic_node::Entity::find_by_id(from_semantic_id)
+                .one(conn)
+                .await?
+                .ok_or_else(|| {
+                    KgError::other(format!(
+                        "semantic remap source sem-{from_semantic_id} does not exist"
+                    ))
+                })?;
+            if raw_node.category != DeFiCategory::Others {
+                let raw_category_row = category::Entity::find()
+                    .filter(category::Column::Name.eq(raw_node.category))
+                    .one(conn)
+                    .await?;
+                if let Some(raw_category_row) = raw_category_row {
+                    for to_semantic_id in to_semantic_ids {
+                        let Some(target) = semantic_node::Entity::find_by_id(*to_semantic_id)
+                            .one(conn)
+                            .await?
+                        else {
+                            continue;
+                        };
+                        if target.category == raw_node.category {
+                            continue;
+                        }
+                        let exists = semantic_node_category::Entity::find()
+                            .filter(
+                                semantic_node_category::Column::SemanticNodeId.eq(*to_semantic_id),
+                            )
+                            .filter(
+                                semantic_node_category::Column::CategoryId.eq(raw_category_row.id),
+                            )
+                            .one(conn)
+                            .await?
+                            .is_some();
+                        if !exists {
+                            semantic_node_category::Entity::insert(
+                                semantic_node_category::ActiveModel {
+                                    semantic_node_id: Set(*to_semantic_id),
+                                    category_id: Set(raw_category_row.id),
+                                },
+                            )
+                            .exec(conn)
+                            .await?;
+                            out.secondary_categories_added += 1;
+                        }
+                    }
+                }
+            }
+            semantic_node_category::Entity::delete_many()
+                .filter(semantic_node_category::Column::SemanticNodeId.eq(from_semantic_id))
+                .exec(conn)
+                .await?;
         }
 
         Ok(out)
@@ -3115,7 +3354,6 @@ impl HistoricalDatabase {
             project_finding::Entity::delete(project_finding::ActiveModel {
                 project_id: Set(row.project_id),
                 audit_finding_id: Set(from_finding_id),
-                ..Default::default()
             })
             .exec(conn)
             .await?;
@@ -3168,6 +3406,7 @@ impl HistoricalDatabase {
             report.semantic.functions_moved += outcome.functions_moved;
             report.semantic.functions_skipped_dup += outcome.functions_skipped_dup;
             report.semantic.provenance_moved += outcome.provenance_moved;
+            report.semantic.secondary_categories_added += outcome.secondary_categories_added;
         }
 
         for (from_finding_id, target_ids) in
@@ -3187,7 +3426,10 @@ impl HistoricalDatabase {
             .unique()
             .collect();
         let residual_semantic_links = semantic_finding_link::Entity::find()
-            .filter(semantic_finding_link::Column::SemanticNodeId.is_in(semantic_sources))
+            .filter(
+                semantic_finding_link::Column::SemanticNodeId
+                    .is_in(semantic_sources.iter().copied()),
+            )
             .count(&txn)
             .await?;
         if residual_semantic_links > 0 {
@@ -3209,6 +3451,18 @@ impl HistoricalDatabase {
             return Err(KgError::other(format!(
                 "{residual_finding_links} semantic_finding_link row(s) still reference a merge-source finding after remap; rolling back"
             )));
+        }
+
+        if self.table_exists("semantic_node_category").await? {
+            let residual_secondary = semantic_node_category::Entity::find()
+                .filter(semantic_node_category::Column::SemanticNodeId.is_in(semantic_sources))
+                .count(&txn)
+                .await?;
+            if residual_secondary > 0 {
+                return Err(KgError::other(format!(
+                    "{residual_secondary} semantic_node_category row(s) still reference a merge source after remap; rolling back"
+                )));
+            }
         }
 
         txn.commit().await?;
@@ -7493,6 +7747,442 @@ INSERT INTO `demo` (`value`) VALUES ('backslash \' quote');
 
         let merges = finding_merge::Entity::find().all(&db.db).await.unwrap();
         assert_eq!(merges.len(), 1, "finding_merge row must survive as history");
+
+        drop(db);
+        cleanup_test_db(&path);
+    }
+
+    /// Cross-category folds carry the raw's category onto every canonical
+    /// target as a secondary category; same-category folds and `Others`
+    /// raws carry nothing.
+    #[tokio::test]
+    async fn remap_semantic_merge_carries_secondary_categories() {
+        let (db, path) = create_test_db().await;
+
+        let canonical_others = semantic_node::Entity::insert(semantic_node::ActiveModel {
+            name: Set("canon-others".to_string()),
+            category: Set(DeFiCategory::Others),
+            definition: Set("d".to_string()),
+            description: Set("d".to_string()),
+            ..Default::default()
+        })
+        .exec(&db.db)
+        .await
+        .unwrap()
+        .last_insert_id;
+        let canonical_dex = semantic_node::Entity::insert(semantic_node::ActiveModel {
+            name: Set("canon-dex".to_string()),
+            category: Set(DeFiCategory::Dexes),
+            definition: Set("d".to_string()),
+            description: Set("d".to_string()),
+            ..Default::default()
+        })
+        .exec(&db.db)
+        .await
+        .unwrap()
+        .last_insert_id;
+
+        let raw_dex = semantic_node::Entity::insert(semantic_node::ActiveModel {
+            name: Set("raw-dex".to_string()),
+            category: Set(DeFiCategory::Dexes),
+            definition: Set("d".to_string()),
+            description: Set("d".to_string()),
+            ..Default::default()
+        })
+        .exec(&db.db)
+        .await
+        .unwrap()
+        .last_insert_id;
+        let raw_same_dex = semantic_node::Entity::insert(semantic_node::ActiveModel {
+            name: Set("raw-same-dex".to_string()),
+            category: Set(DeFiCategory::Dexes),
+            definition: Set("d".to_string()),
+            description: Set("d".to_string()),
+            ..Default::default()
+        })
+        .exec(&db.db)
+        .await
+        .unwrap()
+        .last_insert_id;
+        let raw_others = semantic_node::Entity::insert(semantic_node::ActiveModel {
+            name: Set("raw-others".to_string()),
+            category: Set(DeFiCategory::Others),
+            definition: Set("d".to_string()),
+            description: Set("d".to_string()),
+            ..Default::default()
+        })
+        .exec(&db.db)
+        .await
+        .unwrap()
+        .last_insert_id;
+
+        for (raw, to) in [
+            (raw_dex, canonical_others),
+            (raw_same_dex, canonical_dex),
+            (raw_others, canonical_dex),
+        ] {
+            semantic_merge::Entity::insert(semantic_merge::ActiveModel {
+                from_semantic_id: Set(raw),
+                to_semantic_id: Set(to),
+                appended_description: Set(String::new()),
+            })
+            .exec(&db.db)
+            .await
+            .unwrap();
+        }
+
+        let report = db.remap_all_merge_links().await.unwrap();
+
+        // raw_dex → canon-others (Dexes → Others): carries Dexes.
+        assert_eq!(report.semantic.secondary_categories_added, 1);
+
+        let secondary = semantic_node_category::Entity::find()
+            .all(&db.db)
+            .await
+            .unwrap();
+        assert_eq!(secondary.len(), 1);
+        assert_eq!(secondary[0].semantic_node_id, canonical_others);
+
+        let dex_category = category::Entity::find()
+            .filter(category::Column::Name.eq(DeFiCategory::Dexes))
+            .one(&db.db)
+            .await
+            .unwrap()
+            .expect("Dexes category should be seeded");
+        assert_eq!(secondary[0].category_id, dex_category.id);
+
+        // Idempotent on re-run: no duplicate rows, no extra count.
+        let report2 = db.remap_all_merge_links().await.unwrap();
+        assert_eq!(report2.semantic.secondary_categories_added, 0);
+        assert_eq!(
+            semantic_node_category::Entity::find()
+                .all(&db.db)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        drop(db);
+        cleanup_test_db(&path);
+    }
+
+    /// `existing_semantics_for_categories` surfaces a canonical when only a
+    /// SECONDARY category matches — the recall expansion itself.
+    #[tokio::test]
+    async fn category_query_expands_through_secondary_categories() {
+        let (db, path) = create_test_db().await;
+
+        let canonical = semantic_node::Entity::insert(semantic_node::ActiveModel {
+            name: Set("canon".to_string()),
+            category: Set(DeFiCategory::Others),
+            definition: Set("d".to_string()),
+            description: Set("d".to_string()),
+            ..Default::default()
+        })
+        .exec(&db.db)
+        .await
+        .unwrap()
+        .last_insert_id;
+        let raw = semantic_node::Entity::insert(semantic_node::ActiveModel {
+            name: Set("raw".to_string()),
+            category: Set(DeFiCategory::Lending),
+            definition: Set("d".to_string()),
+            description: Set("d".to_string()),
+            ..Default::default()
+        })
+        .exec(&db.db)
+        .await
+        .unwrap()
+        .last_insert_id;
+        semantic_merge::Entity::insert(semantic_merge::ActiveModel {
+            from_semantic_id: Set(raw),
+            to_semantic_id: Set(canonical),
+            appended_description: Set(String::new()),
+        })
+        .exec(&db.db)
+        .await
+        .unwrap();
+        db.remap_all_merge_links().await.unwrap();
+
+        let lending_results = db
+            .existing_semantics_for_categories(&[DeFiCategory::Lending])
+            .await
+            .unwrap();
+        assert!(
+            lending_results.iter().any(|n| n.id == canonical),
+            "canonical with secondary Lending must surface for Lending queries"
+        );
+
+        let dex_results = db
+            .existing_semantics_for_categories(&[DeFiCategory::Dexes])
+            .await
+            .unwrap();
+        assert!(
+            !dex_results.iter().any(|n| n.id == canonical),
+            "canonical must NOT surface for categories it never carried"
+        );
+
+        let others_results = db
+            .existing_semantics_for_categories(&[DeFiCategory::Others])
+            .await
+            .unwrap();
+        assert!(others_results.iter().any(|n| n.id == canonical));
+
+        drop(db);
+        cleanup_test_db(&path);
+    }
+
+    /// `semantic_secondary_categories` resolves carried categories per
+    /// canonical and returns an empty map for unknown ids.
+    #[tokio::test]
+    async fn semantic_secondary_categories_resolves_carried_rows() {
+        let (db, path) = create_test_db().await;
+
+        let canonical = semantic_node::Entity::insert(semantic_node::ActiveModel {
+            name: Set("canon".to_string()),
+            category: Set(DeFiCategory::Others),
+            definition: Set("d".to_string()),
+            description: Set("d".to_string()),
+            ..Default::default()
+        })
+        .exec(&db.db)
+        .await
+        .unwrap()
+        .last_insert_id;
+        let raw = semantic_node::Entity::insert(semantic_node::ActiveModel {
+            name: Set("raw".to_string()),
+            category: Set(DeFiCategory::Yield),
+            definition: Set("d".to_string()),
+            description: Set("d".to_string()),
+            ..Default::default()
+        })
+        .exec(&db.db)
+        .await
+        .unwrap()
+        .last_insert_id;
+        semantic_merge::Entity::insert(semantic_merge::ActiveModel {
+            from_semantic_id: Set(raw),
+            to_semantic_id: Set(canonical),
+            appended_description: Set(String::new()),
+        })
+        .exec(&db.db)
+        .await
+        .unwrap();
+        db.remap_all_merge_links().await.unwrap();
+
+        let map = db
+            .semantic_secondary_categories(&[canonical, 999_999])
+            .await
+            .unwrap();
+        assert_eq!(map.get(&canonical), Some(&vec![DeFiCategory::Yield]));
+        assert!(!map.contains_key(&999_999));
+
+        drop(db);
+        cleanup_test_db(&path);
+    }
+
+    /// A pre-existing DB without the table gets it via `connect()`'s
+    /// migration (idempotent — no error on the second connect).
+    #[tokio::test]
+    async fn migration_creates_semantic_node_category_on_existing_db() {
+        let (db, path) = create_test_db().await;
+        // Fresh init already creates the table through create_tables.
+        assert!(db.table_exists("semantic_node_category").await.unwrap());
+
+        // Drop it to simulate a pre-migration DB, then re-connect.
+        db.db
+            .execute_unprepared("DROP TABLE semantic_node_category")
+            .await
+            .unwrap();
+        assert!(!db.table_exists("semantic_node_category").await.unwrap());
+        drop(db);
+
+        let url = format!("sqlite://{}?mode=rwc", path.to_string_lossy());
+        let reconnected = HistoricalDatabase::connect(&url)
+            .await
+            .expect("reconnect should succeed");
+        assert!(
+            reconnected
+                .table_exists("semantic_node_category")
+                .await
+                .unwrap(),
+            "connect() must migrate the table in on a pre-existing DB"
+        );
+        // Idempotent: a second connect is a no-op.
+        let again = HistoricalDatabase::connect(&url)
+            .await
+            .expect("second connect should succeed");
+        assert!(again.table_exists("semantic_node_category").await.unwrap());
+
+        drop(reconnected);
+        drop(again);
+        cleanup_test_db(&path);
+    }
+
+    /// The idempotent seed gains the new taxonomy rows on a DB whose
+    /// `category` table pre-dates the expansion.
+    #[tokio::test]
+    async fn seed_categories_inserts_missing_rows_on_existing_db() {
+        let (db, path) = create_test_db().await;
+        let before = category::Entity::find().count(&db.db).await.unwrap();
+        assert_eq!(before, DeFiCategory::ALL.len() as u64);
+
+        // Simulate a pre-expansion DB: drop the new rows, then re-init.
+        for name in [
+            DeFiCategory::Tokens,
+            DeFiCategory::Governance,
+            DeFiCategory::Custody,
+            DeFiCategory::Privacy,
+        ] {
+            category::Entity::delete_many()
+                .filter(category::Column::Name.eq(name))
+                .exec(&db.db)
+                .await
+                .unwrap();
+        }
+        db.init().await.unwrap();
+        let after = category::Entity::find().count(&db.db).await.unwrap();
+        assert_eq!(after, DeFiCategory::ALL.len() as u64);
+
+        drop(db);
+        cleanup_test_db(&path);
+    }
+
+    /// `reclassify_semantic_categories` updates primary categories, skips
+    /// no-op decisions, prunes now-redundant secondary rows, and rolls
+    /// back the whole batch on a bad id.
+    #[tokio::test]
+    async fn reclassify_semantic_categories_writes_and_prunes() {
+        let (db, path) = create_test_db().await;
+
+        let node = semantic_node::Entity::insert(semantic_node::ActiveModel {
+            name: Set("n".to_string()),
+            category: Set(DeFiCategory::Others),
+            definition: Set("d".to_string()),
+            description: Set("d".to_string()),
+            ..Default::default()
+        })
+        .exec(&db.db)
+        .await
+        .unwrap()
+        .last_insert_id;
+        let tokens_row = category::Entity::find()
+            .filter(category::Column::Name.eq(DeFiCategory::Tokens))
+            .one(&db.db)
+            .await
+            .unwrap()
+            .expect("Tokens seeded");
+        semantic_node_category::Entity::insert(semantic_node_category::ActiveModel {
+            semantic_node_id: Set(node),
+            category_id: Set(tokens_row.id),
+        })
+        .exec(&db.db)
+        .await
+        .unwrap();
+
+        let updated = db
+            .reclassify_semantic_categories(&[(node, DeFiCategory::Tokens)])
+            .await
+            .unwrap();
+        assert_eq!(updated, 1);
+        let reloaded = semantic_node::Entity::find_by_id(node)
+            .one(&db.db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reloaded.category, DeFiCategory::Tokens);
+        // The old secondary row duplicates the new primary → pruned.
+        assert_eq!(
+            semantic_node_category::Entity::find()
+                .filter(semantic_node_category::Column::SemanticNodeId.eq(node))
+                .count(&db.db)
+                .await
+                .unwrap(),
+            0
+        );
+
+        // Same-category decision is a no-op.
+        let updated2 = db
+            .reclassify_semantic_categories(&[(node, DeFiCategory::Tokens)])
+            .await
+            .unwrap();
+        assert_eq!(updated2, 0);
+
+        // Bad id rolls the batch back (good id included).
+        let second = semantic_node::Entity::insert(semantic_node::ActiveModel {
+            name: Set("n2".to_string()),
+            category: Set(DeFiCategory::Others),
+            definition: Set("d".to_string()),
+            description: Set("d".to_string()),
+            ..Default::default()
+        })
+        .exec(&db.db)
+        .await
+        .unwrap()
+        .last_insert_id;
+        let result = db
+            .reclassify_semantic_categories(&[
+                (second, DeFiCategory::Yield),
+                (999_999, DeFiCategory::Dexes),
+            ])
+            .await;
+        assert!(result.is_err());
+        let reloaded2 = semantic_node::Entity::find_by_id(second)
+            .one(&db.db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reloaded2.category, DeFiCategory::Others, "rolled back");
+
+        drop(db);
+        cleanup_test_db(&path);
+    }
+
+    /// `canonical_semantics_in_category` returns Others canonicals and
+    /// excludes merged-away raws.
+    #[tokio::test]
+    async fn canonical_semantics_in_category_scopes_to_active_canonicals() {
+        let (db, path) = create_test_db().await;
+
+        let canonical = semantic_node::Entity::insert(semantic_node::ActiveModel {
+            name: Set("c".to_string()),
+            category: Set(DeFiCategory::Others),
+            definition: Set("d".to_string()),
+            description: Set("d".to_string()),
+            ..Default::default()
+        })
+        .exec(&db.db)
+        .await
+        .unwrap()
+        .last_insert_id;
+        let raw = semantic_node::Entity::insert(semantic_node::ActiveModel {
+            name: Set("r".to_string()),
+            category: Set(DeFiCategory::Others),
+            definition: Set("d".to_string()),
+            description: Set("d".to_string()),
+            ..Default::default()
+        })
+        .exec(&db.db)
+        .await
+        .unwrap()
+        .last_insert_id;
+        semantic_merge::Entity::insert(semantic_merge::ActiveModel {
+            from_semantic_id: Set(raw),
+            to_semantic_id: Set(canonical),
+            appended_description: Set(String::new()),
+        })
+        .exec(&db.db)
+        .await
+        .unwrap();
+
+        let nodes = db
+            .canonical_semantics_in_category(DeFiCategory::Others)
+            .await
+            .unwrap();
+        let ids: Vec<i32> = nodes.iter().map(|n| n.id).collect();
+        assert!(ids.contains(&canonical));
+        assert!(!ids.contains(&raw), "merged-away raw must be excluded");
 
         drop(db);
         cleanup_test_db(&path);
