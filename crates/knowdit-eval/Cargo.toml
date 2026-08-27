@@ -1,0 +1,36 @@
+[package]
+name = "knowdit-eval"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Benchmarking and evaluation harness for the knowdit learning pipeline."
+homepage.workspace = true
+repository.workspace = true
+readme.workspace = true
+
+[dependencies]
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+color-eyre.workspace = true
+sea-orm.workspace = true
+sha2 = "0.10"
+hex = "0.4"
+flate2 = "1"
+walkdir = "2"
+tempfile = "3"
+rand = "0.8"
+llmy.workspace = true
+
+knowdit-kg.workspace = true
+knowdit-kg-model.workspace = true
+knowdit-project.workspace = true
+
+[dev-dependencies]
+assert_cmd = "2"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("linux"))'] }

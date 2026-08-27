@@ -332,6 +332,29 @@ impl ProjectData {
         Ok(())
     }
 
+    /// Run both merge passes against the live DB and return the
+    /// per-raw decisions WITHOUT writing anything. The production
+    /// path embeds the same calls inside [`Self::merge_and_write_txn`];
+    /// this accessor exists so evaluation drivers can capture
+    /// merge-judgment artifacts separately from persistence (the
+    /// merge agents are read-only against the historical KG).
+    pub async fn merge_decisions(
+        &self,
+        db: &HistoricalDatabase,
+        llm: &LLM,
+        extract: &ExtractResult,
+        agent_options: &AgentRunOptions,
+        merge_chunking: MergeChunkingOptions,
+    ) -> Result<(Vec<MergeResult>, Vec<FindingMergeResult>)> {
+        let semantic_merge_results = self
+            .merge_with_existing(db, llm, extract, agent_options, merge_chunking)
+            .await?;
+        let finding_merge_results = self
+            .merge_findings_with_existing(db, llm, extract, agent_options, merge_chunking)
+            .await?;
+        Ok((semantic_merge_results, finding_merge_results))
+    }
+
     /// Transaction-scoped variant of [`Self::merge_and_write`].
     /// Performs the merge-LLM passes (against the LIVE DB — these
     /// are reads, not writes, so don't depend on the txn) and then

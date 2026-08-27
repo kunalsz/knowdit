@@ -53,3 +53,4 @@ knowdit-agents = { version = "1.0.1", path = "./crates/knowdit-agents" }
 knowdit-audit = { version = "1.0.1", path = "./crates/knowdit-audit" }
 knowdit-cg-static = { version = "1.0.1", path = "./crates/knowdit-cg-static" }
 knowdit-project = { version = "1.0.1", path = "./crates/knowdit-project" }
+knowdit-eval = { version = "1.0.1", path = "./crates/knowdit-eval" }

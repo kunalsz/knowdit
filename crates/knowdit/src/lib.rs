@@ -34,6 +34,9 @@ pub enum KnowditSubCommands {
 
     /// Historical-KG database tools: snapshot in/out and direct DB-to-DB copy (no LLM)
     Db(DbCommand),
+
+    /// Benchmarking and evaluation harness for the learning pipeline
+    Eval(EvalCommand),
 }
 
 #[derive(Args)]
@@ -95,6 +98,36 @@ pub enum WorkflowCommands {
 pub struct DbCommand {
     #[command(subcommand)]
     pub command: DbCommands,
+}
+
+/// `knowdit eval ...` — benchmarking harness. Lives outside `learn`
+/// because run-mode commands flatten their own `OpenAISetup` while
+/// corpus/baseline/compare commands need none.
+#[derive(Args)]
+pub struct EvalCommand {
+    #[command(subcommand)]
+    pub command: EvalCommands,
+}
+
+#[derive(Subcommand)]
+pub enum EvalCommands {
+    /// Load and verify a benchmark suite (documents, baseline hash, gold links)
+    Corpus(cmd::eval::corpus::CorpusArgs),
+
+    /// Freeze a database into an immutable suite baseline
+    Baseline(cmd::eval::baseline::BaselineArgs),
+
+    /// Execute a fixed-context or growth-replay learning run
+    Run(cmd::eval::run::EvalRunArgs),
+
+    /// Score a run's captured artifacts against suite gold labels
+    Score(cmd::eval::score::EvalScoreArgs),
+
+    /// Compare baseline vs candidate with paired bootstrap + promotion gate
+    Compare(cmd::eval::compare::EvalCompareArgs),
+
+    /// Inspect run artifacts, stage events, or one document
+    Inspect(cmd::eval::inspect::EvalInspectArgs),
 }
 
 #[derive(Subcommand)]
@@ -301,6 +334,7 @@ impl KnowditSubCommands {
             KnowditSubCommands::Agentic(command) => command.run().await,
             KnowditSubCommands::Workflow(command) => command.run().await,
             KnowditSubCommands::Db(command) => command.run().await,
+            KnowditSubCommands::Eval(command) => command.run().await,
         }
     }
 }
@@ -330,6 +364,19 @@ impl DbCommand {
             DbCommands::Snapshot(args) => args.run().await,
             DbCommands::ImportSnapshot(args) => args.run().await,
             DbCommands::Copy(args) => args.run().await,
+        }
+    }
+}
+
+impl EvalCommand {
+    pub async fn run(self) -> color_eyre::Result<()> {
+        match self.command {
+            EvalCommands::Corpus(args) => args.run().await,
+            EvalCommands::Baseline(args) => args.run().await,
+            EvalCommands::Run(args) => args.run().await,
+            EvalCommands::Score(args) => args.run().await,
+            EvalCommands::Compare(args) => args.run().await,
+            EvalCommands::Inspect(args) => args.run().await,
         }
     }
 }
