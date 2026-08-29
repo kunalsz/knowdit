@@ -126,7 +126,7 @@ pub async fn merge_kg(
     // ── ③a retro-link — A findings × B new semantics ────────────────────
     if phase < MergePhase::Retro {
         if opts.run_retro_link {
-            retro_link_pending_semantics(dst, llm, opts.link).await?;
+            retro_link_pending_semantics(dst, llm, opts.link.clone()).await?;
             report.retro_linked = true;
         } else {
             // Don't leave the enqueued New semantics as dead queue rows.

@@ -143,7 +143,7 @@ impl LinkArgs {
         options.context_window_utilization = context_window_utilization;
 
         if !shared.until_all_linked {
-            options.link_pending_findings(db, llm).await?;
+            options.clone().link_pending_findings(db, llm).await?;
             return Ok(());
         }
 
@@ -158,7 +158,7 @@ impl LinkArgs {
         let mut prev_pending: Option<HashSet<i32>> = None;
         loop {
             tracing::info!("--until-all-linked: iteration {iteration}");
-            options.link_pending_findings(db, llm).await?;
+            options.clone().link_pending_findings(db, llm).await?;
 
             let pending: HashSet<i32> = db
                 .list_pending_findings_for_linking()

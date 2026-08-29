@@ -587,7 +587,7 @@ impl HistoricalDatabase {
                 description: sem.description.clone(),
                 variant_notes,
             };
-            body_c += chars(&candidate.render(variant_render_cap, raw_child_char_cap));
+            body_c += chars(&candidate.render(variant_render_cap, raw_child_char_cap, false));
         }
         let n = stats.semantics_canonical;
         stats.semantic_name_chars = avg(name_c, n);

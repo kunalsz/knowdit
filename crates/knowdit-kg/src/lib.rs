@@ -9,5 +9,6 @@ pub mod link;
 pub mod merge_kg;
 pub mod project_loader;
 pub mod prompts;
+pub mod router_eval;
 pub mod stats;
 pub mod vulnerability;

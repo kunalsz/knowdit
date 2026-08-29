@@ -38,6 +38,29 @@ pub enum KnowditSubCommands {
     /// Ingest external security reports (post-mortems, attack analyses, audit
     /// findings, CVE disclosures) as narrative projects into the historical KG
     Feed(FeedCommand),
+
+    /// Quality and efficiency evaluation tools, including cached embedding setup
+    Eval(EvalCommand),
+}
+
+#[derive(Args)]
+pub struct EvalCommand {
+    #[command(flatten)]
+    pub database: HistoricalDatabaseArgs,
+
+    #[command(subcommand)]
+    pub command: EvalCommands,
+}
+
+#[derive(Subcommand)]
+pub enum EvalCommands {
+    /// Build or incrementally refresh the persistent link-router embedding cache
+    BuildLinkRouterEmbeddings(
+        cmd::eval::build_link_router_embeddings::BuildLinkRouterEmbeddingsArgs,
+    ),
+
+    /// Replay accepted High/Medium links through a candidate router
+    LinkRouter(cmd::eval::link_router::LinkRouterEvalArgs),
 }
 
 #[derive(Args)]
@@ -332,6 +355,17 @@ impl KnowditSubCommands {
             KnowditSubCommands::Workflow(command) => command.run().await,
             KnowditSubCommands::Db(command) => command.run().await,
             KnowditSubCommands::Feed(command) => command.run().await,
+            KnowditSubCommands::Eval(command) => command.run().await,
+        }
+    }
+}
+
+impl EvalCommand {
+    pub async fn run(self) -> color_eyre::Result<()> {
+        let db = self.database.connect().await?;
+        match self.command {
+            EvalCommands::BuildLinkRouterEmbeddings(args) => args.run(&db).await,
+            EvalCommands::LinkRouter(args) => args.run(&db).await,
         }
     }
 }

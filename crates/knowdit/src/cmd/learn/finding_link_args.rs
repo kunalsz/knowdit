@@ -1,8 +1,11 @@
 use clap::Args;
 use color_eyre::eyre::{Result, ensure};
 use knowdit_kg::learn::FindingLinkOptions;
+use knowdit_kg::router_eval::RouterEmbeddingCache;
+use std::path::PathBuf;
+use std::sync::Arc;
 
-#[derive(Args, Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[derive(Args, Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FindingLinkCliArgs {
     /// Absolute ceiling on total input tokens per linking prompt. Unset ⇒
     /// derived from the model window × `--link-context-window-utilization`; can
@@ -26,6 +29,22 @@ pub struct FindingLinkCliArgs {
     /// set a number to cap how many semantics the model must weigh per prompt.
     #[arg(long, default_value_t = usize::MAX)]
     pub max_semantics_per_batch: usize,
+
+    /// Maximum canonical semantics retained by the production candidate
+    /// router. The default 768 matches the validated shadow replay; set to
+    /// 0 to disable filtering and send the exhaustive corpus.
+    #[arg(long = "link-max-candidates", default_value_t = 768)]
+    pub max_link_candidates: usize,
+
+    /// Optional validated embedding cache produced by the evaluator's local
+    /// embedding builder. Invalid caches fall back to lexical retrieval.
+    #[arg(long = "link-embedding-cache")]
+    pub embedding_cache: Option<PathBuf>,
+
+    /// Use compact semantic cards in the candidate block. Full finding text
+    /// remains unchanged; disable when richer semantic prose is required.
+    #[arg(long = "link-full-semantic-cards", default_value_t = false)]
+    pub full_semantic_cards: bool,
 
     /// Hard ceiling on findings per batch — independent of token budget.
     /// The default (135) does two jobs at once: it bounds the agent
@@ -180,11 +199,30 @@ impl FindingLinkCliArgs {
     }
 
     pub fn to_options(&self, concurrency: usize) -> FindingLinkOptions {
+        let embedding_cache = self.embedding_cache.as_ref().and_then(|path| {
+            let bytes = std::fs::read(path).ok()?;
+            match serde_json::from_slice::<RouterEmbeddingCache>(&bytes) {
+                Ok(cache) if cache.schema_version == knowdit_kg::router_eval::ROUTER_EMBEDDING_CACHE_VERSION
+                    && cache.dimensions > 0
+                    && cache.records.iter().all(|record| record.vector.len() == cache.dimensions && record.vector.iter().all(|value| value.is_finite())) => Some(Arc::new(cache)),
+                Ok(_) => {
+                    tracing::warn!(path = %path.display(), "incompatible link embedding cache; using lexical retrieval");
+                    None
+                }
+                Err(error) => {
+                    tracing::warn!(path = %path.display(), %error, "invalid link embedding cache; using lexical retrieval");
+                    None
+                }
+            }
+        });
         FindingLinkOptions {
             concurrency,
             input_token_budget: self.input_token_budget,
             finding_token_ratio: self.finding_token_ratio,
             max_semantics_per_batch: self.max_semantics_per_batch,
+            max_link_candidates: self.max_link_candidates,
+            compact_semantic_cards: !self.full_semantic_cards,
+            embedding_cache,
             max_findings_per_batch: self.max_findings_per_batch,
             max_response_attempts: self.max_response_attempts,
             max_agent_steps: self
