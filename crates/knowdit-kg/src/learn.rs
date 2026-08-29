@@ -148,6 +148,10 @@ struct SemanticMergeCheckpointManifest {
     new_item_token_ratio: f64,
     merge_concurrency: usize,
     new_item_batch_size: usize,
+    raw_child_variant_cap: usize,
+    raw_child_char_cap: usize,
+    full_candidate_context: bool,
+    candidate_routing: bool,
     extracted: Vec<ExtractedSemantic>,
     candidates:
         Vec<crate::agents::CanonicalWithChildren<knowdit_kg_model::db::semantic_node::Model>>,
@@ -163,6 +167,10 @@ struct FindingMergeCheckpointManifest {
     new_item_token_ratio: f64,
     merge_concurrency: usize,
     new_item_batch_size: usize,
+    raw_child_variant_cap: usize,
+    raw_child_char_cap: usize,
+    full_candidate_context: bool,
+    candidate_routing: bool,
     extracted: Vec<ExtractedFinding>,
     candidates: Vec<crate::agents::FindingCanonicalWithTaxonomy>,
 }
@@ -1889,6 +1897,10 @@ impl ProjectData {
             new_item_token_ratio: merge_chunking.new_item_token_ratio,
             merge_concurrency: merge_chunking.concurrency,
             new_item_batch_size: merge_chunking.new_item_batch_size,
+            raw_child_variant_cap: merge_chunking.raw_child_variant_cap,
+            raw_child_char_cap: merge_chunking.raw_child_char_cap,
+            full_candidate_context: merge_chunking.full_candidate_context,
+            candidate_routing: merge_chunking.candidate_routing,
             extracted: extract.semantics.clone(),
             candidates: candidates.clone(),
         };
@@ -1990,6 +2002,10 @@ impl ProjectData {
             new_item_token_ratio: merge_chunking.new_item_token_ratio,
             merge_concurrency: merge_chunking.concurrency,
             new_item_batch_size: merge_chunking.new_item_batch_size,
+            raw_child_variant_cap: merge_chunking.raw_child_variant_cap,
+            raw_child_char_cap: merge_chunking.raw_child_char_cap,
+            full_candidate_context: merge_chunking.full_candidate_context,
+            candidate_routing: merge_chunking.candidate_routing,
             extracted: extract.findings.clone(),
             candidates: candidates.clone(),
         };

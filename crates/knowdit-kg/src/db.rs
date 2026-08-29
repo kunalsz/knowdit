@@ -2013,6 +2013,8 @@ impl HistoricalDatabase {
         let canonical_ids: Vec<i32> = canonicals.iter().map(|n| n.id).collect();
         let merge_rows = semantic_merge::Entity::find()
             .filter(semantic_merge::Column::ToSemanticId.is_in(canonical_ids.clone()))
+            .order_by_asc(semantic_merge::Column::ToSemanticId)
+            .order_by_asc(semantic_merge::Column::FromSemanticId)
             .all(&self.db)
             .await?;
         let raw_ids: Vec<i32> = merge_rows.iter().map(|m| m.from_semantic_id).collect();
@@ -2700,6 +2702,8 @@ impl HistoricalDatabase {
         let canonical_ids: Vec<i32> = canonicals.iter().map(|(f, _)| f.id).collect();
         let merge_rows = finding_merge::Entity::find()
             .filter(finding_merge::Column::ToFindingId.is_in(canonical_ids.clone()))
+            .order_by_asc(finding_merge::Column::ToFindingId)
+            .order_by_asc(finding_merge::Column::FromFindingId)
             .all(&self.db)
             .await?;
         let raw_ids: Vec<i32> = merge_rows.iter().map(|m| m.from_finding_id).collect();

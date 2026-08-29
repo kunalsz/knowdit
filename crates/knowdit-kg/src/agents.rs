@@ -34,6 +34,7 @@ use llmy::client::client::LLM;
 use llmy::client::model::OpenAIModel;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 
@@ -44,6 +45,123 @@ use knowdit_kg_model::{ExtractedFinding, ExtractedSemantic};
 use crate::agent_runner::{AgentChunkBuffer, AgentChunkRunner, AgentRunOptions, AgentRunOutcome};
 use crate::error::{KgError, Result};
 use crate::vulnerability::validate_taxonomy_pair;
+
+fn bounded_chars(value: &str, cap: usize) -> String {
+    if cap == usize::MAX || value.chars().count() <= cap {
+        return value.to_string();
+    }
+    let mut out: String = value.chars().take(cap).collect();
+    out.push_str("...[truncated]");
+    out
+}
+
+fn reduction_percent(original: usize, reduced: usize) -> f64 {
+    if original == 0 {
+        0.0
+    } else {
+        (original.saturating_sub(reduced) as f64 / original as f64) * 100.0
+    }
+}
+
+fn content_addressed_merge_cache_key(root: &str, candidate_text: &str) -> String {
+    let digest = Sha256::digest(candidate_text.as_bytes());
+    format!("{root}-candidate-{digest:x}")
+}
+
+const MERGE_ROUTE_TOP_K: usize = 64;
+const MERGE_ROUTE_MIN_SCORE: usize = 3;
+const MERGE_ROUTE_MIN_MARGIN: usize = 1;
+
+fn routing_terms(text: &str) -> HashSet<String> {
+    text.split(|ch: char| !ch.is_alphanumeric())
+        .map(str::to_ascii_lowercase)
+        .filter(|term| {
+            term.len() >= 3
+                && !matches!(
+                    term.as_str(),
+                    "the"
+                        | "and"
+                        | "for"
+                        | "with"
+                        | "from"
+                        | "that"
+                        | "this"
+                        | "into"
+                        | "when"
+                        | "then"
+                        | "than"
+                        | "can"
+                        | "has"
+                        | "have"
+                        | "are"
+                        | "not"
+                        | "only"
+                        | "same"
+                        | "also"
+                        | "new"
+                        | "one"
+                        | "all"
+                        | "any"
+                        | "its"
+                        | "their"
+                        | "during"
+                        | "after"
+                        | "before"
+                )
+        })
+        .collect()
+}
+
+/// Route a batch to a small candidate subset only when every new item has a
+/// strong, unambiguous lexical signal. A weak or tied signal returns the full
+/// set; this keeps the router conservative, while replay-based recall checks
+/// remain necessary because lexical routing is still a heuristic.
+fn route_merge_candidates<T: Clone>(
+    candidates: &[T],
+    query_texts: &[String],
+    candidate_text: impl Fn(&T) -> String,
+    enabled: bool,
+) -> (Vec<T>, bool) {
+    if !enabled || candidates.len() <= MERGE_ROUTE_TOP_K || query_texts.is_empty() {
+        return (candidates.to_vec(), false);
+    }
+    let candidate_terms: Vec<HashSet<String>> = candidates
+        .iter()
+        .map(|candidate| routing_terms(&candidate_text(candidate)))
+        .collect();
+    let mut selected = BTreeSet::new();
+    for query in query_texts {
+        let query_terms = routing_terms(query);
+        let mut scores: Vec<(usize, usize)> = candidate_terms
+            .iter()
+            .enumerate()
+            .map(|(idx, terms)| (query_terms.intersection(terms).count(), idx))
+            .collect();
+        scores.sort_by(|(left_score, left_idx), (right_score, right_idx)| {
+            right_score
+                .cmp(left_score)
+                .then_with(|| left_idx.cmp(right_idx))
+        });
+        let best = scores.first().map(|(score, _)| *score).unwrap_or(0);
+        let second = scores.get(1).map(|(score, _)| *score).unwrap_or(0);
+        if best < MERGE_ROUTE_MIN_SCORE || best.saturating_sub(second) < MERGE_ROUTE_MIN_MARGIN {
+            return (candidates.to_vec(), false);
+        }
+        for (_, idx) in scores.into_iter().take(MERGE_ROUTE_TOP_K) {
+            selected.insert(idx);
+        }
+    }
+    if selected.is_empty() || selected.len() >= candidates.len() {
+        return (candidates.to_vec(), false);
+    }
+    (
+        selected
+            .into_iter()
+            .map(|idx| candidates[idx].clone())
+            .collect(),
+        true,
+    )
+}
 
 // ---------------------------------------------------------------------------
 // Shared finalize-tool argument shape
@@ -742,6 +860,21 @@ pub struct MergeChunkingOptions {
     /// Thresholds for the concreteness guard applied to `updated_*` merge
     /// fields at the emit-tool boundary.
     pub field_guard: MergeFieldGuard,
+    /// Maximum historical raw variants rendered under each canonical. The
+    /// canonical itself is always rendered in full. This bounds provenance
+    /// fan-out without changing the candidate set.
+    pub raw_child_variant_cap: usize,
+    /// Maximum characters rendered per historical raw field. Zero leaves only
+    /// the field labels; `usize::MAX` preserves legacy unbounded behavior.
+    pub raw_child_char_cap: usize,
+    /// Restore the pre-optimization full historical-child payload. Intended
+    /// for incident investigation and quality comparisons.
+    pub full_candidate_context: bool,
+    /// Use conservative local lexical routing to reduce the candidate set.
+    /// Ambiguous or weakly-overlapping batches always fall back to every
+    /// candidate. Because routing is heuristic, production rollout should
+    /// monitor known-edge recall and retain the disable switch for rollback.
+    pub candidate_routing: bool,
 }
 
 impl Default for MergeChunkingOptions {
@@ -751,6 +884,10 @@ impl Default for MergeChunkingOptions {
             concurrency: 1,
             new_item_batch_size: 40,
             field_guard: MergeFieldGuard::default(),
+            raw_child_variant_cap: 8,
+            raw_child_char_cap: 1_200,
+            full_candidate_context: false,
+            candidate_routing: true,
         }
     }
 }
@@ -767,7 +904,25 @@ impl MergeChunkingOptions {
             concurrency: concurrency.max(1),
             new_item_batch_size: new_item_batch_size.max(1),
             field_guard,
+            ..Self::default()
         }
+    }
+
+    pub fn with_candidate_context(
+        mut self,
+        raw_child_variant_cap: usize,
+        raw_child_char_cap: usize,
+        full_candidate_context: bool,
+    ) -> Self {
+        self.raw_child_variant_cap = raw_child_variant_cap;
+        self.raw_child_char_cap = raw_child_char_cap;
+        self.full_candidate_context = full_candidate_context;
+        self
+    }
+
+    pub fn with_candidate_routing(mut self, enabled: bool) -> Self {
+        self.candidate_routing = enabled;
+        self
     }
 
     /// Greedy token+count packer for a merge agent's new items, mirroring the
@@ -1084,9 +1239,6 @@ impl SemanticMerger {
             self.agent_options.context_window_utilization,
             self.chunking.new_item_token_ratio,
         );
-        let chunks = self.pack_into_chunks(candidates, split.candidate_budget);
-        let by_name = SemanticMergeAggregator::name_index(&self.new_semantics);
-        let known_targets = SemanticMergeAggregator::known_canonical_ids(&chunks);
         let batches = MergeChunkingOptions::pack_new_item_batches(
             self.new_semantics.clone(),
             split.new_item_budget,
@@ -1097,19 +1249,34 @@ impl SemanticMerger {
                     .count_tokens_lossy(&Self::render_new_block(std::slice::from_ref(sem)))
             },
         );
+        let actual_new_tokens = batches
+            .iter()
+            .map(|batch| {
+                model
+                    .config
+                    .count_tokens_lossy(&Self::render_new_block(batch))
+            })
+            .max()
+            .unwrap_or(0);
+        let split = split.for_actual_new_block(actual_new_tokens);
+        let by_name = SemanticMergeAggregator::name_index(&self.new_semantics);
+        let known_targets = candidates.iter().map(|c| c.canonical.id).collect();
+        let candidate_count = candidates.len();
+        let (chunk_results, work_units) = self
+            .dispatch_batched(&candidates, &batches, split.candidate_budget)
+            .await?;
         tracing::info!(
-            "{}: {} candidate chunk(s) × {} new-item batch(es) = {} work unit(s) (concurrency={}, new_item_ratio={:.2}, candidate_budget={}, new_item_budget={}, count_cap={})",
+            "{}: {} candidate(s), {} work unit(s) (concurrency={}, routing={}, new_item_ratio={:.2}, candidate_budget={}, new_item_budget={}, count_cap={})",
             self.label_root,
-            chunks.len(),
-            batches.len(),
-            chunks.len() * batches.len(),
+            candidate_count,
+            work_units,
             self.chunking.concurrency,
+            self.chunking.candidate_routing,
             self.chunking.new_item_token_ratio,
             split.candidate_budget,
             split.new_item_budget,
             self.chunking.new_item_batch_size,
         );
-        let chunk_results = self.dispatch_batched(&chunks, &batches).await?;
         SemanticMergeAggregator::merge(&mut aggregated, chunk_results, &by_name, &known_targets);
         Ok(aggregated)
     }
@@ -1120,24 +1287,61 @@ impl SemanticMerger {
         candidate_budget: usize,
     ) -> Vec<Vec<CanonicalWithChildren<semantic_node::Model>>> {
         let model = self.llm.model.clone();
-        Self::pack_chunks(&model, candidates, candidate_budget)
+        if !self.chunking.full_candidate_context {
+            let compact_chars: usize = candidates
+                .iter()
+                .map(|entry| {
+                    Self::render_candidate_chunk_with_options(
+                        std::slice::from_ref(entry),
+                        self.chunking,
+                    )
+                    .len()
+                })
+                .sum();
+            let full_options = self
+                .chunking
+                .with_candidate_context(usize::MAX, usize::MAX, true);
+            let full_chars: usize = candidates
+                .iter()
+                .map(|entry| {
+                    Self::render_candidate_chunk_with_options(
+                        std::slice::from_ref(entry),
+                        full_options,
+                    )
+                    .len()
+                })
+                .sum();
+            tracing::info!(
+                "{}: merge candidate context {} -> {} chars ({:.1}% reduction; canonical set unchanged)",
+                self.label_root,
+                full_chars,
+                compact_chars,
+                reduction_percent(full_chars, compact_chars),
+            );
+        }
+        Self::pack_chunks(&model, candidates, candidate_budget, self.chunking)
     }
 
     fn build_chunk_runner(
         &self,
-        idx: usize,
-        total: usize,
+        batch_idx: usize,
+        candidate_idx: usize,
         chunk: &[CanonicalWithChildren<semantic_node::Model>],
         new_semantics_block: &str,
         valid_names: Arc<HashSet<String>>,
     ) -> SemanticMergeChunkRunner {
-        let user_prompt = crate::prompts::merge_semantics_user_message(
-            &Self::render_candidate_chunk(chunk),
-            new_semantics_block,
+        let candidate_text = Self::render_candidate_chunk_with_options(chunk, self.chunking);
+        let user_prompt =
+            crate::prompts::merge_semantics_user_message(&candidate_text, new_semantics_block);
+        let cache_key = content_addressed_merge_cache_key(&self.cache_key_root, &candidate_text);
+        let debug_scope = format!(
+            "{}-batch{batch_idx:04}-candidate{candidate_idx:04}",
+            self.debug_key_root
         );
-        let cache_key = format!("{}-chunk{idx:04}", self.cache_key_root);
-        let debug_scope = format!("{}-chunk{idx:04}", self.debug_key_root);
-        let label = format!("{}-chunk{idx:04}of{total:04}", self.label_root);
+        let label = format!(
+            "{}-batch{batch_idx:04}-candidate{candidate_idx:04}",
+            self.label_root
+        );
         let valid_target_ids: Arc<HashSet<i32>> =
             Arc::new(chunk.iter().map(|c| c.canonical.id).collect());
         let target_descriptions: Arc<HashMap<i32, String>> = Arc::new(
@@ -1166,28 +1370,47 @@ impl SemanticMerger {
     /// the aggregator folds every unit's decisions by name.
     async fn dispatch_batched(
         &self,
-        chunks: &[Vec<CanonicalWithChildren<semantic_node::Model>>],
+        candidates: &[CanonicalWithChildren<semantic_node::Model>],
         batches: &[Vec<ExtractedSemantic>],
-    ) -> Result<Vec<Vec<SemanticMergeDecision>>> {
-        let total_units = batches.len().saturating_mul(chunks.len());
-        let mut runners = Vec::with_capacity(total_units);
-        let mut unit_idx = 0usize;
-        for batch in batches {
+        candidate_budget: usize,
+    ) -> Result<(Vec<Vec<SemanticMergeDecision>>, usize)> {
+        let mut runners = Vec::new();
+        let mut work_units = 0;
+        for (batch_idx, batch) in batches.iter().enumerate() {
             let new_block = Self::render_new_block(batch);
             let valid_names: Arc<HashSet<String>> =
                 Arc::new(batch.iter().map(|s| s.name.to_lowercase()).collect());
-            for chunk in chunks {
+            let queries: Vec<String> = batch.iter().map(Self::routing_query_text).collect();
+            let (routed, was_routed) = route_merge_candidates(
+                candidates,
+                &queries,
+                Self::routing_candidate_text,
+                self.chunking.candidate_routing,
+            );
+            let chunks = self.pack_into_chunks(routed, candidate_budget);
+            work_units += chunks.len();
+            if was_routed {
+                tracing::info!(
+                    "{} batch {} routed {} -> {} candidate(s), {} chunk(s)",
+                    self.label_root,
+                    batch_idx,
+                    candidates.len(),
+                    chunks.iter().map(Vec::len).sum::<usize>(),
+                    chunks.len(),
+                );
+            }
+            for (candidate_idx, chunk) in chunks.iter().enumerate() {
                 runners.push(self.build_chunk_runner(
-                    unit_idx,
-                    total_units,
+                    batch_idx,
+                    candidate_idx,
                     chunk,
                     &new_block,
                     valid_names.clone(),
                 ));
-                unit_idx += 1;
             }
         }
-        Self::run_runners(runners, self.chunking.concurrency.max(1)).await
+        let results = Self::run_runners(runners, self.chunking.concurrency.max(1)).await?;
+        Ok((results, work_units))
     }
 
     /// Run pre-built merge-chunk runners through a bounded-concurrency pool.
@@ -1236,6 +1459,7 @@ impl SemanticMerger {
 /// usable block of each kind.
 #[derive(Debug, Clone, Copy)]
 struct MergeWindowSplit {
+    usable_tokens: usize,
     /// Per-chunk cap on the rendered candidate (existing-canonical) block.
     candidate_budget: usize,
     /// Per-batch cap on the rendered new-items block.
@@ -1259,8 +1483,24 @@ impl MergeWindowSplit {
             .saturating_sub(new_item_budget)
             .max(Self::MIN_BLOCK_TOKENS);
         Self {
+            usable_tokens: usable,
             candidate_budget,
             new_item_budget,
+        }
+    }
+
+    fn for_actual_new_block(self, actual_new_tokens: usize) -> Self {
+        let new_tokens = actual_new_tokens.max(Self::MIN_BLOCK_TOKENS);
+        // Reclaim slack, but keep candidate prompts close to the tuned shape.
+        // A whole-window candidate block is cheaper in request count yet can
+        // degrade model attention and increase retry/quality cost.
+        let reclaimed = self
+            .usable_tokens
+            .saturating_sub(new_tokens)
+            .max(Self::MIN_BLOCK_TOKENS);
+        Self {
+            candidate_budget: reclaimed.min(self.candidate_budget.saturating_mul(2)),
+            ..self
         }
     }
 
@@ -1291,15 +1531,6 @@ impl SemanticMergeAggregator {
             .iter()
             .enumerate()
             .map(|(idx, s)| (s.name.to_lowercase(), idx))
-            .collect()
-    }
-
-    fn known_canonical_ids(
-        chunks: &[Vec<CanonicalWithChildren<semantic_node::Model>>],
-    ) -> std::collections::HashSet<i32> {
-        chunks
-            .iter()
-            .flat_map(|chunk| chunk.iter().map(|c| c.canonical.id))
             .collect()
     }
 
@@ -1365,7 +1596,36 @@ impl SemanticMerger {
         buf
     }
 
-    fn render_candidate_chunk(chunk: &[CanonicalWithChildren<semantic_node::Model>]) -> String {
+    fn routing_query_text(semantic: &ExtractedSemantic) -> String {
+        format!(
+            "{} {} {} {}",
+            semantic.category, semantic.name, semantic.definition, semantic.description
+        )
+    }
+
+    fn routing_candidate_text(entry: &CanonicalWithChildren<semantic_node::Model>) -> String {
+        let mut text = format!(
+            "{} {} {} {}",
+            entry.canonical.category,
+            entry.canonical.name,
+            entry.canonical.definition,
+            entry.canonical.description
+        );
+        for raw in &entry.raw_children {
+            text.push(' ');
+            text.push_str(&raw.name);
+            text.push(' ');
+            text.push_str(&raw.definition);
+            text.push(' ');
+            text.push_str(&raw.description);
+        }
+        text
+    }
+
+    fn render_candidate_chunk_with_options(
+        chunk: &[CanonicalWithChildren<semantic_node::Model>],
+        options: MergeChunkingOptions,
+    ) -> String {
         let mut buf = String::new();
         for entry in chunk {
             let canonical = &entry.canonical;
@@ -1377,7 +1637,23 @@ impl SemanticMerger {
                 canonical.definition,
                 canonical.description,
             ));
-            if !entry.raw_children.is_empty() {
+            if !entry.raw_children.is_empty() && !options.full_candidate_context {
+                buf.push_str(
+                    "Merged from (historical raws — for context, not selectable as merge_target_ids):\n",
+                );
+                for raw in entry
+                    .raw_children
+                    .iter()
+                    .take(options.raw_child_variant_cap)
+                {
+                    buf.push_str(&format!(
+                        "  - Name: {}\n    Definition: {}\n    Description: {}\n",
+                        raw.name,
+                        bounded_chars(&raw.definition, options.raw_child_char_cap),
+                        bounded_chars(&raw.description, options.raw_child_char_cap),
+                    ));
+                }
+            } else if !entry.raw_children.is_empty() {
                 buf.push_str(
                     "Merged from (historical raws — for context, not selectable as merge_target_ids):\n",
                 );
@@ -1397,12 +1673,14 @@ impl SemanticMerger {
         model: &OpenAIModel,
         candidates: Vec<CanonicalWithChildren<semantic_node::Model>>,
         chunk_token_budget: usize,
+        options: MergeChunkingOptions,
     ) -> Vec<Vec<CanonicalWithChildren<semantic_node::Model>>> {
         let mut chunks: Vec<Vec<CanonicalWithChildren<semantic_node::Model>>> = Vec::new();
         let mut current: Vec<CanonicalWithChildren<semantic_node::Model>> = Vec::new();
         let mut current_tokens: usize = 0;
         for entry in candidates {
-            let single = Self::render_candidate_chunk(std::slice::from_ref(&entry));
+            let single =
+                Self::render_candidate_chunk_with_options(std::slice::from_ref(&entry), options);
             let cost = model.config.count_tokens_lossy(&single);
             if !current.is_empty() && current_tokens + cost > chunk_token_budget {
                 chunks.push(std::mem::take(&mut current));
@@ -1726,17 +2004,6 @@ impl FindingMerger {
             self.agent_options.context_window_utilization,
             self.chunking.new_item_token_ratio,
         );
-        let chunks = self.pack_into_chunks(candidates, split.candidate_budget);
-        let by_title: std::collections::HashMap<String, usize> = self
-            .new_findings
-            .iter()
-            .enumerate()
-            .map(|(idx, f)| (f.title.to_lowercase(), idx))
-            .collect();
-        let known_targets: std::collections::HashSet<i32> = chunks
-            .iter()
-            .flat_map(|chunk| chunk.iter().map(|c| c.canonical.id))
-            .collect();
         let batches = MergeChunkingOptions::pack_new_item_batches(
             self.new_findings.clone(),
             split.new_item_budget,
@@ -1747,19 +2014,40 @@ impl FindingMerger {
                     .count_tokens_lossy(&Self::render_new_block(std::slice::from_ref(finding)))
             },
         );
+        let actual_new_tokens = batches
+            .iter()
+            .map(|batch| {
+                model
+                    .config
+                    .count_tokens_lossy(&Self::render_new_block(batch))
+            })
+            .max()
+            .unwrap_or(0);
+        let split = split.for_actual_new_block(actual_new_tokens);
+        let by_title: std::collections::HashMap<String, usize> = self
+            .new_findings
+            .iter()
+            .enumerate()
+            .map(|(idx, f)| (f.title.to_lowercase(), idx))
+            .collect();
+        let known_targets: std::collections::HashSet<i32> =
+            candidates.iter().map(|c| c.canonical.id).collect();
+        let candidate_count = candidates.len();
+        let (chunk_results, work_units) = self
+            .dispatch_batched(&candidates, &batches, split.candidate_budget)
+            .await?;
         tracing::info!(
-            "{}: {} candidate chunk(s) × {} new-item batch(es) = {} work unit(s) (concurrency={}, new_item_ratio={:.2}, candidate_budget={}, new_item_budget={}, count_cap={})",
+            "{}: {} candidate(s), {} work unit(s) (concurrency={}, routing={}, new_item_ratio={:.2}, candidate_budget={}, new_item_budget={}, count_cap={})",
             self.label_root,
-            chunks.len(),
-            batches.len(),
-            chunks.len() * batches.len(),
+            candidate_count,
+            work_units,
             self.chunking.concurrency,
+            self.chunking.candidate_routing,
             self.chunking.new_item_token_ratio,
             split.candidate_budget,
             split.new_item_budget,
             self.chunking.new_item_batch_size,
         );
-        let chunk_results = self.dispatch_batched(&chunks, &batches).await?;
         for decisions in chunk_results {
             for decision in decisions {
                 let Some(&idx) = by_title.get(&decision.new_finding_title.to_lowercase()) else {
@@ -1818,24 +2106,61 @@ impl FindingMerger {
         candidate_budget: usize,
     ) -> Vec<Vec<FindingCanonicalWithTaxonomy>> {
         let model = self.llm.model.clone();
-        Self::pack_chunks(&model, candidates, candidate_budget)
+        if !self.chunking.full_candidate_context {
+            let compact_chars: usize = candidates
+                .iter()
+                .map(|entry| {
+                    Self::render_candidate_chunk_with_options(
+                        std::slice::from_ref(entry),
+                        self.chunking,
+                    )
+                    .len()
+                })
+                .sum();
+            let full_options = self
+                .chunking
+                .with_candidate_context(usize::MAX, usize::MAX, true);
+            let full_chars: usize = candidates
+                .iter()
+                .map(|entry| {
+                    Self::render_candidate_chunk_with_options(
+                        std::slice::from_ref(entry),
+                        full_options,
+                    )
+                    .len()
+                })
+                .sum();
+            tracing::info!(
+                "{}: merge candidate context {} -> {} chars ({:.1}% reduction; canonical set unchanged)",
+                self.label_root,
+                full_chars,
+                compact_chars,
+                reduction_percent(full_chars, compact_chars),
+            );
+        }
+        Self::pack_chunks(&model, candidates, candidate_budget, self.chunking)
     }
 
     fn build_chunk_runner(
         &self,
-        idx: usize,
-        total: usize,
+        batch_idx: usize,
+        candidate_idx: usize,
         chunk: &[FindingCanonicalWithTaxonomy],
         new_findings_block: &str,
         valid_titles: Arc<HashSet<String>>,
     ) -> FindingMergeChunkRunner {
-        let user_prompt = crate::prompts::merge_findings_user_message(
-            &Self::render_candidate_chunk(chunk),
-            new_findings_block,
+        let candidate_text = Self::render_candidate_chunk_with_options(chunk, self.chunking);
+        let user_prompt =
+            crate::prompts::merge_findings_user_message(&candidate_text, new_findings_block);
+        let cache_key = content_addressed_merge_cache_key(&self.cache_key_root, &candidate_text);
+        let debug_scope = format!(
+            "{}-batch{batch_idx:04}-candidate{candidate_idx:04}",
+            self.debug_key_root
         );
-        let cache_key = format!("{}-chunk{idx:04}", self.cache_key_root);
-        let debug_scope = format!("{}-chunk{idx:04}", self.debug_key_root);
-        let label = format!("{}-chunk{idx:04}of{total:04}", self.label_root);
+        let label = format!(
+            "{}-batch{batch_idx:04}-candidate{candidate_idx:04}",
+            self.label_root
+        );
         let valid_target_ids: Arc<HashSet<i32>> =
             Arc::new(chunk.iter().map(|c| c.canonical.id).collect());
         let target_texts: Arc<HashMap<i32, FindingTargetText>> = Arc::new(
@@ -1870,28 +2195,47 @@ impl FindingMerger {
     /// Mirror of [`SemanticMerger::dispatch_batched`] for findings.
     async fn dispatch_batched(
         &self,
-        chunks: &[Vec<FindingCanonicalWithTaxonomy>],
+        candidates: &[FindingCanonicalWithTaxonomy],
         batches: &[Vec<ExtractedFinding>],
-    ) -> Result<Vec<Vec<FindingMergeDecision>>> {
-        let total_units = batches.len().saturating_mul(chunks.len());
-        let mut runners = Vec::with_capacity(total_units);
-        let mut unit_idx = 0usize;
-        for batch in batches {
+        candidate_budget: usize,
+    ) -> Result<(Vec<Vec<FindingMergeDecision>>, usize)> {
+        let mut runners = Vec::new();
+        let mut work_units = 0;
+        for (batch_idx, batch) in batches.iter().enumerate() {
             let new_block = Self::render_new_block(batch);
             let valid_titles: Arc<HashSet<String>> =
                 Arc::new(batch.iter().map(|f| f.title.to_lowercase()).collect());
-            for chunk in chunks {
+            let queries: Vec<String> = batch.iter().map(Self::routing_query_text).collect();
+            let (routed, was_routed) = route_merge_candidates(
+                candidates,
+                &queries,
+                Self::routing_candidate_text,
+                self.chunking.candidate_routing,
+            );
+            let chunks = self.pack_into_chunks(routed, candidate_budget);
+            work_units += chunks.len();
+            if was_routed {
+                tracing::info!(
+                    "{} batch {} routed {} -> {} candidate(s), {} chunk(s)",
+                    self.label_root,
+                    batch_idx,
+                    candidates.len(),
+                    chunks.iter().map(Vec::len).sum::<usize>(),
+                    chunks.len(),
+                );
+            }
+            for (candidate_idx, chunk) in chunks.iter().enumerate() {
                 runners.push(self.build_chunk_runner(
-                    unit_idx,
-                    total_units,
+                    batch_idx,
+                    candidate_idx,
                     chunk,
                     &new_block,
                     valid_titles.clone(),
                 ));
-                unit_idx += 1;
             }
         }
-        Self::run_runners(runners, self.chunking.concurrency.max(1)).await
+        let results = Self::run_runners(runners, self.chunking.concurrency.max(1)).await?;
+        Ok((results, work_units))
     }
 
     /// Bounded-concurrency pool for pre-built finding-merge runners. Mirror of
@@ -1949,7 +2293,49 @@ impl FindingMerger {
         buf
     }
 
-    fn render_candidate_chunk(chunk: &[FindingCanonicalWithTaxonomy]) -> String {
+    fn routing_query_text(finding: &ExtractedFinding) -> String {
+        format!(
+            "{} {} {} {} {} {} {}",
+            finding.category,
+            finding.subcategory,
+            finding.title,
+            finding.root_cause,
+            finding.description,
+            finding.patterns,
+            finding.exploits
+        )
+    }
+
+    fn routing_candidate_text(entry: &FindingCanonicalWithTaxonomy) -> String {
+        let mut text = format!(
+            "{} {} {} {} {} {} {}",
+            entry.category.category,
+            entry.category.name,
+            entry.canonical.title,
+            entry.canonical.root_cause,
+            entry.canonical.description,
+            entry.canonical.patterns,
+            entry.canonical.exploits
+        );
+        for raw in &entry.raw_children {
+            text.push(' ');
+            text.push_str(&raw.title);
+            text.push(' ');
+            text.push_str(&raw.root_cause);
+            text.push(' ');
+            text.push_str(&raw.description);
+            text.push(' ');
+            text.push_str(&raw.patterns);
+            text.push(' ');
+            text.push_str(&raw.exploits);
+        }
+        text
+    }
+
+    fn render_candidate_chunk_with_options(
+        chunk: &[FindingCanonicalWithTaxonomy],
+        options: MergeChunkingOptions,
+    ) -> String {
         let mut buf = String::new();
         for entry in chunk {
             let f = &entry.canonical;
@@ -1965,7 +2351,26 @@ impl FindingMerger {
                 f.patterns,
                 f.exploits,
             ));
-            if !entry.raw_children.is_empty() {
+            if !entry.raw_children.is_empty() && !options.full_candidate_context {
+                buf.push_str(
+                    "Merged from (historical raws — for context, not selectable as merge_target_ids):\n",
+                );
+                for raw in entry
+                    .raw_children
+                    .iter()
+                    .take(options.raw_child_variant_cap)
+                {
+                    buf.push_str(&format!(
+                        "  - Title: {}\n    Severity: {}\n    Root Cause: {}\n    Description: {}\n    Patterns: {}\n    Exploits: {}\n",
+                        raw.title,
+                        raw.severity,
+                        bounded_chars(&raw.root_cause, options.raw_child_char_cap),
+                        bounded_chars(&raw.description, options.raw_child_char_cap),
+                        bounded_chars(&raw.patterns, options.raw_child_char_cap),
+                        bounded_chars(&raw.exploits, options.raw_child_char_cap),
+                    ));
+                }
+            } else if !entry.raw_children.is_empty() {
                 buf.push_str(
                     "Merged from (historical raws — for context, not selectable as merge_target_ids):\n",
                 );
@@ -1985,12 +2390,14 @@ impl FindingMerger {
         model: &OpenAIModel,
         candidates: Vec<FindingCanonicalWithTaxonomy>,
         chunk_token_budget: usize,
+        options: MergeChunkingOptions,
     ) -> Vec<Vec<FindingCanonicalWithTaxonomy>> {
         let mut chunks: Vec<Vec<FindingCanonicalWithTaxonomy>> = Vec::new();
         let mut current: Vec<FindingCanonicalWithTaxonomy> = Vec::new();
         let mut current_tokens: usize = 0;
         for entry in candidates {
-            let single = Self::render_candidate_chunk(std::slice::from_ref(&entry));
+            let single =
+                Self::render_candidate_chunk_with_options(std::slice::from_ref(&entry), options);
             let cost = model.config.count_tokens_lossy(&single);
             if !current.is_empty() && current_tokens + cost > chunk_token_budget {
                 chunks.push(std::mem::take(&mut current));
@@ -2049,6 +2456,67 @@ mod tests {
         let split = MergeWindowSplit::from_usable(100_000, 2.0);
         assert_eq!(split.new_item_budget, 95_000);
         assert_eq!(split.candidate_budget, 5_000);
+    }
+
+    #[test]
+    fn merge_window_split_reclaims_unused_new_item_budget() {
+        let split = MergeWindowSplit::from_usable(100_000, 0.8);
+        let adaptive = split.for_actual_new_block(4_000);
+        assert_eq!(adaptive.new_item_budget, split.new_item_budget);
+        assert_eq!(adaptive.candidate_budget, 40_000);
+        assert!(adaptive.candidate_budget <= split.candidate_budget * 2);
+    }
+
+    #[test]
+    fn bounded_chars_is_utf8_safe_and_only_truncates_over_cap() {
+        assert_eq!(bounded_chars("abc", 3), "abc");
+        assert_eq!(bounded_chars("abcdef", 3), "abc...[truncated]");
+        assert_eq!(bounded_chars("caf\u{e9}", 3), "caf...[truncated]");
+    }
+
+    #[test]
+    fn merge_cache_key_is_stable_for_same_candidate_prefix() {
+        let first = content_addressed_merge_cache_key("finding-merge", "candidate block");
+        let same = content_addressed_merge_cache_key("finding-merge", "candidate block");
+        let changed = content_addressed_merge_cache_key("finding-merge", "changed block");
+        assert_eq!(first, same);
+        assert_ne!(first, changed);
+        assert!(first.starts_with("finding-merge-candidate-"));
+    }
+
+    #[test]
+    fn candidate_router_selects_confident_top_candidates() {
+        let candidates: Vec<String> = (0..100)
+            .map(|idx| {
+                if idx == 42 {
+                    "beneficiary transfer refund principal blacklist".to_string()
+                } else {
+                    format!("unrelated candidate {idx}")
+                }
+            })
+            .collect();
+        let queries = vec!["beneficiary transfer refund principal blacklist".to_string()];
+        let (routed, was_routed) =
+            route_merge_candidates(&candidates, &queries, |candidate| candidate.clone(), true);
+        assert!(was_routed);
+        assert!(routed.len() <= MERGE_ROUTE_TOP_K);
+        assert!(
+            routed
+                .iter()
+                .any(|candidate| candidate.contains("beneficiary"))
+        );
+    }
+
+    #[test]
+    fn candidate_router_falls_back_on_ambiguous_queries() {
+        let candidates: Vec<String> = (0..100)
+            .map(|idx| format!("transfer refund candidate {idx}"))
+            .collect();
+        let queries = vec!["transfer refund".to_string()];
+        let (routed, was_routed) =
+            route_merge_candidates(&candidates, &queries, |candidate| candidate.clone(), true);
+        assert!(!was_routed);
+        assert_eq!(routed.len(), candidates.len());
     }
 
     // A substantial, concrete current description used to exercise the

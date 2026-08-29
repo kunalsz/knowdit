@@ -8,6 +8,14 @@ use color_eyre::eyre::{Result, ensure};
 use knowdit_kg::agent_runner::AgentRunOptions;
 use knowdit_kg::agents::{MergeChunkingOptions, MergeFieldGuard};
 
+fn default_merge_raw_child_variant_cap() -> usize {
+    8
+}
+
+fn default_merge_raw_child_char_cap() -> usize {
+    1_200
+}
+
 #[derive(Args, Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MergeCliArgs {
     /// Remove saved extraction chunks when their source or model no longer
@@ -83,6 +91,29 @@ pub struct MergeCliArgs {
     /// a tighter note.
     #[arg(long, default_value_t = 600)]
     pub merge_field_appended_max_chars: usize,
+
+    /// Maximum historical raw variants shown under each existing canonical.
+    /// Canonicals remain exhaustive; this only bounds provenance context.
+    #[arg(long, default_value_t = 8)]
+    #[serde(default = "default_merge_raw_child_variant_cap")]
+    pub merge_raw_child_variant_cap: usize,
+
+    /// Maximum characters per historical raw field shown to the merge agent.
+    #[arg(long, default_value_t = 1_200)]
+    #[serde(default = "default_merge_raw_child_char_cap")]
+    pub merge_raw_child_char_cap: usize,
+
+    /// Include every historical raw field in merge prompts. This is useful for
+    /// investigating a quality regression, but is intentionally opt-in.
+    #[arg(long)]
+    #[serde(default)]
+    pub merge_full_candidate_context: bool,
+
+    /// Disable the conservative local lexical candidate router. When routing
+    /// is disabled, every merge agent receives the exhaustive candidate set.
+    #[arg(long)]
+    #[serde(default)]
+    pub merge_disable_candidate_routing: bool,
 }
 
 impl MergeCliArgs {
@@ -119,6 +150,14 @@ impl MergeCliArgs {
             self.merge_field_appended_max_chars > 0,
             "merge_field_appended_max_chars must be greater than zero",
         );
+        ensure!(
+            self.merge_raw_child_variant_cap > 0,
+            "merge_raw_child_variant_cap must be greater than zero",
+        );
+        ensure!(
+            self.merge_raw_child_char_cap > 0,
+            "merge_raw_child_char_cap must be greater than zero",
+        );
         Ok(())
     }
 
@@ -139,5 +178,11 @@ impl MergeCliArgs {
                 appended_max_chars: self.merge_field_appended_max_chars,
             },
         )
+        .with_candidate_context(
+            self.merge_raw_child_variant_cap,
+            self.merge_raw_child_char_cap,
+            self.merge_full_candidate_context,
+        )
+        .with_candidate_routing(!self.merge_disable_candidate_routing)
     }
 }
