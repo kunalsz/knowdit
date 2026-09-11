@@ -171,11 +171,13 @@ impl HarnessBackend for SolidityHarness {
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn codegen_for_in_memory_spec(
         &self,
         repo: &RepoDatabase,
         llm: &LLM,
         extract_id: i32,
+        historical_id: i32,
         finding_id: i32,
         spec: AuditSpecification,
         synthetic_spec_id: i32,
@@ -184,6 +186,7 @@ impl HarnessBackend for SolidityHarness {
         self.make_generator(repo, llm)
             .regen_codegen_with_explicit_spec(
                 extract_id,
+                historical_id,
                 finding_id,
                 spec,
                 synthetic_spec_id,

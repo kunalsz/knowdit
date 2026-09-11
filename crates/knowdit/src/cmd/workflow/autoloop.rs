@@ -201,6 +201,7 @@ impl AutoloopArgs {
             .may_llm()
             .await
             .map_err(|err| eyre!("failed to build reflect LLM: {err}"))?
+            .map(crate::llm::provider_compat)
             .unwrap_or_else(|| primary_llm.clone());
 
         let project_data = self.project.to_project_data().await?;

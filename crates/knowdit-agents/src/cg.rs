@@ -108,9 +108,22 @@ pub async fn analyze_repo_call_graph(
     let extraction = extract_repo_contracts_functions(&config.extraction).await?;
 
     let memory = build_agent_memory(semantics, &extraction.contracts).await?;
-    let compact_threshold = config
-        .compact_context_threshold_tokens
-        .unwrap_or_else(|| (llm.model.config.max_input() as f64 * 0.8) as usize);
+    let max_input = llm.model.config.max_input();
+    let (compact_threshold, using_fallback) = knowdit_kg_model::resolve_threshold(
+        config.compact_context_threshold_tokens,
+        max_input,
+        0.8,
+    );
+    if using_fallback && knowdit_kg_model::warn_once_for("call-graph-agent") {
+        tracing::warn!(
+            "Call-graph agent: model `{}` is not in the llmy registry (max_input_tokens=0); \
+             using a {} token fallback context window (compact threshold {}). Add the model to \
+             the registry, or pass a compact-context threshold override to silence this.",
+            llm.model.model_id_str(),
+            knowdit_kg_model::FALLBACK_CONTEXT_WINDOW_TOKENS,
+            compact_threshold,
+        );
+    }
     let mut runner = FunctionAgentRunner::new(
         config,
         extraction.repo_root,
@@ -506,8 +519,10 @@ impl FunctionAgentRunner {
         let mut steps = 1;
         let mut compact_count = 0;
         let function_str = function.to_string();
-        let mut step_result = agent
-            .step_with_user(
+        let mut truncation = knowdit_kg::agent_retry::TruncationRetry::default();
+        let mut step_result = truncation
+            .first_step_with_user(
+                &mut agent,
                 user_prompt,
                 llm,
                 debug_prefix.as_deref(),
@@ -561,19 +576,33 @@ impl FunctionAgentRunner {
             }
 
             steps += 1;
-            step_result = agent
+            match truncation
                 .step(
+                    &mut agent,
                     llm,
                     debug_prefix.as_deref(),
                     self.config.llm_settings.clone(),
                 )
                 .await
-                .wrap_err_with(|| {
-                    format!(
-                        "callgraph agent failed at step {steps} for {}",
-                        function_str
-                    )
-                })?;
+            {
+                Ok(result) => step_result = result,
+                Err(err) if knowdit_kg::agent_retry::is_output_length(&err) => {
+                    return Err(color_eyre::eyre::eyre!(
+                        "callgraph agent response truncated by the provider output cap {} times in a \
+                         row at step {steps} for {function_str}; raise --llm-max-completion-tokens \
+                         or use a model with a larger output limit",
+                        truncation.consecutive_failures(),
+                    ));
+                }
+                Err(err) => {
+                    return Err(err).wrap_err_with(|| {
+                        format!(
+                            "callgraph agent failed at step {steps} for {}",
+                            function_str
+                        )
+                    });
+                }
+            }
         }
     }
 }

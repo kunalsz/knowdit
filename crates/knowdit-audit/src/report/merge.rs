@@ -272,7 +272,7 @@ impl MergeAgent {
     fn pack_candidate_chunks(&self, input: &MergeInput) -> Vec<Vec<MergeCandidate>> {
         let model = &self.llm.model;
         let tok = |s: &str| model.config.count_tokens_lossy(s);
-        let budget = (model.config.max_input() as f64 * self.window_ratio) as usize;
+        let budget = knowdit_kg_model::context_budget(model.config.max_input(), self.window_ratio);
         let finding_only = input.with_candidates(Vec::new());
         let reserve = tok(super::prompt::MERGE_SYSTEM_TEMPLATE)
             + serde_json::to_string(&finding_only)

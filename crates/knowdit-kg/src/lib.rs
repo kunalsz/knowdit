@@ -1,3 +1,4 @@
+pub mod agent_retry;
 pub mod agent_runner;
 pub mod agents;
 pub mod category;

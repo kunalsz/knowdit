@@ -27,6 +27,7 @@ use crate::db::{
     code_gen as code_gen_model, historical_semantic as historical_semantic_model,
     project_semantic as project_semantic_model, specification as specification_model,
 };
+use crate::link::LinkKey;
 use crate::repo::{CodeGenStatus, LinkResumeState, RepoDatabase};
 
 struct TempDb {
@@ -261,4 +262,189 @@ async fn codegen_on_unrelated_spec_does_not_count() {
         LinkResumeState::Partial { .. } => (),
         other => panic!("expected Partial, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn bulk_resume_returns_all_states_and_ascending_ids() {
+    let temp = temp_db().await;
+    insert_extract(&temp.repo, 1).await;
+    insert_extract(&temp.repo, 2).await;
+    insert_historical(&temp.repo, 100).await;
+    insert_historical(&temp.repo, 200).await;
+
+    // Partial: two specs, no code_gen — ids must come back ascending.
+    let p1 = insert_spec(&temp.repo, 1, 100, 7).await;
+    let p2 = insert_spec(&temp.repo, 1, 100, 7).await;
+    // Built: one spec with a code_gen.
+    let b1 = insert_spec(&temp.repo, 1, 200, 8).await;
+    insert_code_gen(&temp.repo, b1).await;
+    // NotStarted: (2, 100, 9) has no rows.
+
+    let partial_key = LinkKey {
+        extract_id: 1,
+        historical_id: 100,
+        finding_id: 7,
+    };
+    let built_key = LinkKey {
+        extract_id: 1,
+        historical_id: 200,
+        finding_id: 8,
+    };
+    let fresh_key = LinkKey {
+        extract_id: 2,
+        historical_id: 100,
+        finding_id: 9,
+    };
+
+    let map = temp
+        .repo
+        .load_link_resume_states(&[partial_key, built_key, fresh_key])
+        .await
+        .unwrap();
+    assert_eq!(map.len(), 3);
+    assert_eq!(
+        map[&partial_key],
+        LinkResumeState::Partial {
+            spec_ids: vec![p1, p2]
+        }
+    );
+    assert_eq!(map[&built_key], LinkResumeState::Built);
+    assert_eq!(map[&fresh_key], LinkResumeState::NotStarted);
+}
+
+/// Sibling historicals must not bleed into each other through the bulk
+/// loader, and the chunking path (>300 keys) must still be exact.
+#[tokio::test]
+async fn bulk_resume_chunks_above_bind_limit() {
+    let temp = temp_db().await;
+    insert_extract(&temp.repo, 1).await;
+    insert_historical(&temp.repo, 100).await;
+    insert_historical(&temp.repo, 200).await;
+    let h100 = insert_spec(&temp.repo, 1, 100, 7).await;
+    let h200 = insert_spec(&temp.repo, 1, 200, 7).await;
+
+    let mut keys: Vec<LinkKey> = (0..700)
+        .map(|i| LinkKey {
+            extract_id: 1,
+            historical_id: 100,
+            finding_id: 1_000 + i,
+        })
+        .collect();
+    keys.push(LinkKey {
+        extract_id: 1,
+        historical_id: 100,
+        finding_id: 7,
+    });
+    keys.push(LinkKey {
+        extract_id: 1,
+        historical_id: 200,
+        finding_id: 7,
+    });
+
+    let map = temp.repo.load_link_resume_states(&keys).await.unwrap();
+    assert_eq!(map.len(), 702);
+    assert_eq!(
+        map[&LinkKey {
+            extract_id: 1,
+            historical_id: 100,
+            finding_id: 7,
+        }],
+        LinkResumeState::Partial {
+            spec_ids: vec![h100]
+        }
+    );
+    assert_eq!(
+        map[&LinkKey {
+            extract_id: 1,
+            historical_id: 200,
+            finding_id: 7,
+        }],
+        LinkResumeState::Partial {
+            spec_ids: vec![h200]
+        }
+    );
+    assert_eq!(
+        map[&LinkKey {
+            extract_id: 1,
+            historical_id: 100,
+            finding_id: 1_000,
+        }],
+        LinkResumeState::NotStarted
+    );
+}
+
+/// The bulk resume loader must project only key/id columns — never the JSON
+/// spec body or the code_gen harness payload — so a resume read cannot
+/// overfetch heavy columns.
+#[test]
+fn resume_queries_project_only_keys() {
+    use sea_orm::{DatabaseBackend, QueryTrait};
+
+    let spec_sql = crate::repo::specification_resume_query(vec![1], vec![2], vec![3])
+        .build(DatabaseBackend::Sqlite)
+        .sql;
+    assert!(
+        spec_sql.contains(r#""specification"."id""#),
+        "selects id: {spec_sql}"
+    );
+    assert!(spec_sql.contains(r#""specification"."semantic_id""#));
+    assert!(spec_sql.contains(r#""specification"."historical_id""#));
+    assert!(spec_sql.contains(r#""specification"."finding_id""#));
+    assert!(
+        !spec_sql.contains(r#""specification"."specification""#),
+        "must not select the JSON payload: {spec_sql}"
+    );
+
+    let cg_sql = crate::repo::codegen_resume_query(vec![1])
+        .build(DatabaseBackend::Sqlite)
+        .sql;
+    assert!(
+        cg_sql.contains(r#""code_gen"."spec_id""#),
+        "selects spec_id: {cg_sql}"
+    );
+    assert!(
+        !cg_sql.to_lowercase().contains("harness_source"),
+        "must not select harness_source: {cg_sql}"
+    );
+    assert!(
+        !cg_sql.to_lowercase().contains("harness_relative_path"),
+        "must not select harness_relative_path: {cg_sql}"
+    );
+}
+
+/// The compound `(semantic_id, historical_id, finding_id)` index must actually
+/// be usable for the loader's triple filter (no full-table scan).
+#[tokio::test]
+async fn resume_query_uses_compound_specification_index() {
+    use sea_orm::{FromQueryResult, Statement};
+
+    let temp = temp_db().await;
+    insert_extract(&temp.repo, 1).await;
+    insert_historical(&temp.repo, 100).await;
+    insert_spec(&temp.repo, 1, 100, 7).await;
+
+    #[derive(FromQueryResult)]
+    struct PlanRow {
+        detail: String,
+    }
+
+    let plan = PlanRow::find_by_statement(Statement::from_string(
+        sea_orm::DatabaseBackend::Sqlite,
+        "EXPLAIN QUERY PLAN SELECT id, semantic_id, historical_id, finding_id \
+         FROM specification WHERE semantic_id = 1 AND historical_id = 100 AND finding_id = 7"
+            .to_string(),
+    ))
+    .all(temp.repo.connection())
+    .await
+    .expect("explain query plan runs");
+
+    let joined = plan
+        .into_iter()
+        .map(|r| r.detail)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        joined.contains("ix_specification_extract_historical_finding"),
+        "expected compound index in plan, got:\n{joined}"
+    );
 }

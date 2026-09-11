@@ -47,6 +47,7 @@ use crate::db::{
     state_variable as state_variable_model, valid_finding as valid_finding_model,
 };
 use crate::inheritance::{ContractInherit, InheritanceGraph};
+use crate::link::LinkKey;
 use crate::move_lang::{
     MoveAbility, MoveField, MoveFunctionMetadata, MoveGenericParam, MovePackageStructure,
     MoveStruct,
@@ -85,7 +86,18 @@ impl RepoDatabase {
     }
 
     async fn connect(url: &str) -> Result<DatabaseConnection> {
-        let db = Database::connect(url)
+        // SQLite allows a single writer at a time. Within this process the
+        // SeaORM SQLite pool is capped at one connection, so our own tasks
+        // serialize on pool acquire — but the file is also touched by other
+        // processes (a second knowdit invocation, `sqlite3`, the running
+        // audit's WAL checkpoints). The sqlx default `busy_timeout` is 5s,
+        // which a long write from another process can exceed and surface as
+        // a spurious `SQLITE_BUSY`. Raising it makes a contending writer wait
+        // its turn instead of failing; WAL already lets readers proceed
+        // during a write.
+        let mut opts = sea_orm::ConnectOptions::new(url);
+        opts.map_sqlx_sqlite_opts(|o| o.busy_timeout(std::time::Duration::from_secs(30)));
+        let db = Database::connect(opts)
             .await
             .wrap_err_with(|| format!("failed to connect to project database {url}"))?;
         if db.get_database_backend() == DatabaseBackend::Sqlite {
@@ -2244,11 +2256,64 @@ impl RepoDatabase {
     }
 
     /// Clear every row in the `specification` table.
+    ///
+    /// NOTE: this is **not** FK-safe on its own. When `code_gen` /
+    /// `reflection` / `specification_regen` rows reference these specs and
+    /// `PRAGMA foreign_keys=ON` is active, the delete fails. Use
+    /// [`Self::reset_for_regenerate`] for a full from-scratch reset.
     pub async fn clear_specifications(&self) -> Result<()> {
         specification_model::Entity::delete_many()
             .exec(&self.db)
             .await
             .wrap_err("failed to clear specification rows")?;
+        Ok(())
+    }
+
+    /// Clear the complete spec-generation **downstream** pipeline in one
+    /// transaction, in FK-safe order (children before parents). Used by
+    /// `--gen-specs-regenerate` so a reset can never strand or violate a
+    /// foreign key regardless of how much of the fuzz/reflect/regen pipeline
+    /// had already run.
+    ///
+    /// Deletion order:
+    /// `finding_merge` → `valid_finding` → `finding_review` → `line_coverage`
+    /// → `reflection` → `harness_run` → `code_gen_regen` → `specification_regen`
+    /// → `code_gen` → `report_finding` → `specification`.
+    ///
+    /// Upstream tables (`project_semantic`, `semantic_matched`, call graph,
+    /// storage/inheritance, `historical_*`) are preserved — they are
+    /// pre-spec-phase inputs, not spec outputs.
+    pub async fn reset_for_regenerate(&self) -> Result<()> {
+        let txn = self
+            .db
+            .begin()
+            .await
+            .wrap_err("failed to begin regenerate reset transaction")?;
+
+        macro_rules! clear {
+            ($entity:ty, $label:expr) => {
+                <$entity>::delete_many()
+                    .exec(&txn)
+                    .await
+                    .wrap_err_with(|| format!("failed to clear {} during regenerate reset", $label))?;
+            };
+        }
+
+        clear!(finding_merge_model::Entity, "finding_merge");
+        clear!(valid_finding_model::Entity, "valid_finding");
+        clear!(finding_review_model::Entity, "finding_review");
+        clear!(line_coverage_model::Entity, "line_coverage");
+        clear!(reflection_model::Entity, "reflection");
+        clear!(harness_run_model::Entity, "harness_run");
+        clear!(code_gen_regen_model::Entity, "code_gen_regen");
+        clear!(specification_regen_model::Entity, "specification_regen");
+        clear!(code_gen_model::Entity, "code_gen");
+        clear!(report_finding_model::Entity, "report_finding");
+        clear!(specification_model::Entity, "specification");
+
+        txn.commit()
+            .await
+            .wrap_err("failed to commit regenerate reset transaction")?;
         Ok(())
     }
 
@@ -2333,6 +2398,118 @@ impl RepoDatabase {
         })
     }
 
+    /// Bulk resume lookup for many links at once. Equivalent to calling
+    /// [`Self::link_resume_state`] per key, but:
+    ///
+    /// * reads in bounded key chunks (below SQLite's bind-parameter limit),
+    /// * projects only the `(id, semantic_id, historical_id, finding_id)`
+    ///   columns of `specification` and the `spec_id` column of `code_gen`,
+    ///   so no JSON / harness payloads are overfetched,
+    /// * does two projected query families per chunk (specs, then codegens)
+    ///   instead of two queries per candidate link.
+    ///
+    /// The returned map has an entry for every distinct input key; keys with
+    /// no spec rows map to [`LinkResumeState::NotStarted`]. `Partial.spec_ids`
+    /// is always in ascending id order.
+    pub async fn load_link_resume_states(
+        &self,
+        keys: &[LinkKey],
+    ) -> Result<HashMap<LinkKey, LinkResumeState>> {
+        use sea_orm::FromQueryResult;
+
+        #[derive(FromQueryResult)]
+        struct SpecRow {
+            id: i32,
+            semantic_id: i32,
+            historical_id: i32,
+            finding_id: i32,
+        }
+        #[derive(FromQueryResult)]
+        struct CodeGenRow {
+            spec_id: i32,
+        }
+
+        // 300 triples == 900 bind params, comfortably under the legacy
+        // SQLITE_MAX_VARIABLE_NUMBER of 999.
+        const KEY_CHUNK: usize = 300;
+        // Cap on `spec_id IN (...)` params per code_gen query.
+        const SPEC_ID_CHUNK: usize = 900;
+
+        let mut out: HashMap<LinkKey, LinkResumeState> = HashMap::new();
+        let mut unique: Vec<LinkKey> = keys.to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+
+        for chunk in unique.chunks(KEY_CHUNK) {
+            let mut extract_ids: Vec<i32> = chunk.iter().map(|k| k.extract_id).collect();
+            extract_ids.sort_unstable();
+            extract_ids.dedup();
+            let mut historical_ids: Vec<i32> = chunk.iter().map(|k| k.historical_id).collect();
+            historical_ids.sort_unstable();
+            historical_ids.dedup();
+            let mut finding_ids: Vec<i32> = chunk.iter().map(|k| k.finding_id).collect();
+            finding_ids.sort_unstable();
+            finding_ids.dedup();
+            let wanted: std::collections::HashSet<LinkKey> = chunk.iter().copied().collect();
+
+            let rows = specification_resume_query(extract_ids, historical_ids, finding_ids)
+                .into_model::<SpecRow>()
+                .all(&self.db)
+                .await
+                .wrap_err("failed to load specification rows for bulk resume")?;
+
+            let mut spec_ids_by_key: HashMap<LinkKey, Vec<i32>> = HashMap::new();
+            for row in rows {
+                let key = LinkKey {
+                    extract_id: row.semantic_id,
+                    historical_id: row.historical_id,
+                    finding_id: row.finding_id,
+                };
+                if wanted.contains(&key) {
+                    spec_ids_by_key.entry(key).or_default().push(row.id);
+                }
+            }
+
+            let all_spec_ids: Vec<i32> = spec_ids_by_key
+                .values()
+                .flatten()
+                .copied()
+                .collect::<BTreeSet<i32>>()
+                .into_iter()
+                .collect();
+            let mut built_spec_ids: std::collections::HashSet<i32> =
+                std::collections::HashSet::new();
+            for ids_chunk in all_spec_ids.chunks(SPEC_ID_CHUNK) {
+                let rows = codegen_resume_query(ids_chunk.to_vec())
+                    .into_model::<CodeGenRow>()
+                    .all(&self.db)
+                    .await
+                    .wrap_err("failed to load code_gen rows for bulk resume")?;
+                built_spec_ids.extend(rows.into_iter().map(|r| r.spec_id));
+            }
+
+            for key in chunk {
+                match spec_ids_by_key.get(key) {
+                    None => {
+                        out.insert(*key, LinkResumeState::NotStarted);
+                    }
+                    Some(ids) => {
+                        if ids.iter().any(|id| built_spec_ids.contains(id)) {
+                            out.insert(*key, LinkResumeState::Built);
+                        } else {
+                            // Rows arrive ordered by id ASC, so `ids` is
+                            // already ascending; sort defensively anyway.
+                            let mut ids = ids.clone();
+                            ids.sort_unstable();
+                            out.insert(*key, LinkResumeState::Partial { spec_ids: ids });
+                        }
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Read every specification row from the project database.
     pub async fn load_specifications(&self) -> Result<Vec<LoadedSpecification>> {
         let rows = specification_model::Entity::find()
@@ -2351,6 +2528,43 @@ impl RepoDatabase {
             })
             .collect())
     }
+}
+
+/// Projected `specification` query used by [`RepoDatabase::load_link_resume_states`].
+///
+/// Selects **only** the key/id columns — never the JSON `specification`
+/// payload — so a bulk resume read cannot overfetch spec bodies. Exposed as a
+/// standalone builder so the projection can be asserted in tests.
+pub(crate) fn specification_resume_query(
+    extract_ids: Vec<i32>,
+    historical_ids: Vec<i32>,
+    finding_ids: Vec<i32>,
+) -> sea_orm::Select<specification_model::Entity> {
+    use sea_orm::{ColumnTrait, QueryFilter, QuerySelect};
+    specification_model::Entity::find()
+        .select_only()
+        .column(specification_model::Column::Id)
+        .column(specification_model::Column::SemanticId)
+        .column(specification_model::Column::HistoricalId)
+        .column(specification_model::Column::FindingId)
+        .filter(specification_model::Column::SemanticId.is_in(extract_ids))
+        .filter(specification_model::Column::HistoricalId.is_in(historical_ids))
+        .filter(specification_model::Column::FindingId.is_in(finding_ids))
+        .order_by_asc(specification_model::Column::Id)
+}
+
+/// Projected `code_gen` query used by [`RepoDatabase::load_link_resume_states`].
+///
+/// Selects **only** `spec_id` — never the harness source/path payload. Exposed
+/// as a standalone builder so the projection can be asserted in tests.
+pub(crate) fn codegen_resume_query(
+    spec_ids: Vec<i32>,
+) -> sea_orm::Select<code_gen_model::Entity> {
+    use sea_orm::{ColumnTrait, QueryFilter, QuerySelect};
+    code_gen_model::Entity::find()
+        .select_only()
+        .column(code_gen_model::Column::SpecId)
+        .filter(code_gen_model::Column::SpecId.is_in(spec_ids))
 }
 
 // ---------------------------------------------------------------------------

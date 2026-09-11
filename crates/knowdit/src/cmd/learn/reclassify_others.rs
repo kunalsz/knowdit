@@ -52,7 +52,7 @@ impl ReclassifyOthersArgs {
     /// CLI entry: the enclosing `LearnCommand` passes the connected DB and
     /// its URL (for the auto-snapshot path) in.
     pub async fn run(self, db: &HistoricalDatabase, database_url: &str) -> Result<()> {
-        let llm = self.llm.clone().to_llm().await;
+        let llm = crate::llm::provider_compat(self.llm.clone().to_llm().await);
         let decisions =
             learn::reclassify_others(db, &llm, self.batch_size, self.context_window_utilization)
                 .await

@@ -150,6 +150,13 @@ pub struct StreamloopArgs {
     #[arg(short, long)]
     pub force_clean_output: bool,
 
+    /// Maximum number of detailed per-link usage rows retained in
+    /// `usage/run_usage.json`. Token/USD totals stay exact; rows beyond this
+    /// are counted as omitted. `0` retains no detailed rows. Default:
+    /// `10000`.
+    #[arg(long = "usage-max-link-rows", default_value_t = 10000)]
+    pub usage_max_link_rows: usize,
+
     /// After the link pipeline finishes, run the `review-findings` report
     /// phase (review → dedup-merge → write → export `audit_report.md`) into
     /// the same output folder. Off by default; run it standalone via
@@ -167,6 +174,9 @@ impl StreamloopArgs {
         // Validate --mapper-extra-categories up front so a typo aborts before
         // any LLM work instead of mid-pipeline at the map phase.
         self.map.extra_categories()?;
+        // Reject unsafe gen-specs knob values (e.g. batch_links = 0) before any
+        // pipeline work.
+        self.gen_specs.validate()?;
         tracing::info!("[streamloop stage 1/8] preparing output folder");
         self.prepare_output_folder()?;
         self.harness.harness_via_ir = self.backend.foundry.via_ir;
@@ -192,6 +202,7 @@ impl StreamloopArgs {
             .may_llm()
             .await
             .map_err(|err| eyre!("failed to build reflect LLM: {err}"))?
+            .map(crate::llm::provider_compat)
             .unwrap_or_else(|| primary_llm.clone());
 
         let project_data = self.project.to_project_data().await?;
@@ -300,7 +311,7 @@ impl StreamloopArgs {
             usage.run_total.usd,
             usage.run_total.tokens.input_tokens,
             usage.run_total.tokens.output_tokens,
-            usage.links.len(),
+            usage.link_count,
             self.output_folder.display(),
         );
 
@@ -315,7 +326,7 @@ impl StreamloopArgs {
                 abort.scope.as_deref().unwrap_or("root"),
                 abort.cap,
                 abort.current,
-                usage.links.len(),
+                usage.link_count,
                 self.output_folder.display(),
             ));
         }
@@ -436,6 +447,7 @@ impl StreamloopArgs {
             max_inner_cycles: self.max_inner_cycles_per_batch.max(1),
             concurrency: self.stream_link_concurrency.unwrap_or(1).max(1),
             report_cfg,
+            usage_max_link_rows: self.usage_max_link_rows,
         }
         .run()
         .await?;
@@ -1031,15 +1043,23 @@ pub(crate) struct LinkUsageRow {
 
 /// Centralized run-level usage report written to
 /// `<output_folder>/usage/run_usage.json`. `run_total` is the sum of every
-/// named scope (global phases + per-link totals), so it does not depend on the
-/// root-snapshot / reflect-tree identity.
+/// named scope (global phases + the aggregate per-link `link_total`), so it does
+/// not depend on the root-snapshot / reflect-tree identity — and it stays exact
+/// even when detailed `links` rows are omitted.
 #[derive(Debug, Clone, Default, Serialize)]
 pub(crate) struct RunUsageReport {
     run_total: PhaseUsage,
     pub(crate) profile: PhaseUsage,
     pub(crate) extract: PhaseUsage,
     pub(crate) mapper: PhaseUsage,
+    /// Exact aggregate over every processed link, independent of the retained
+    /// `links` detail rows.
+    pub(crate) link_total: PhaseUsage,
+    /// Number of links processed in the run (exact, not `links.len()`).
+    pub(crate) link_count: usize,
     pub(crate) links: Vec<LinkUsageRow>,
+    /// Detailed link rows dropped because `--usage-max-link-rows` was reached.
+    pub(crate) omitted_link_rows: usize,
     /// Present only when the run aborted on a billing-cap exhaustion. Recorded
     /// in the report so the on-disk `run_usage.json` shows *why* the run stopped
     /// (which scope, the cap, and how much was spent) alongside the partial
@@ -1049,13 +1069,15 @@ pub(crate) struct RunUsageReport {
 }
 
 impl RunUsageReport {
-    /// Compute `run_total` = profile + extract + mapper + Σ(per-link totals).
+    /// Compute `run_total` = profile + extract + mapper + the aggregate
+    /// per-link `link_total` (never a sum over possibly-truncated detail rows).
     pub(crate) fn finalize_total(&mut self) {
-        let mut total = PhaseUsage::sum([&self.profile, &self.extract, &self.mapper]);
-        for row in &self.links {
-            total.add(&row.usage.total);
-        }
-        self.run_total = total;
+        self.run_total = PhaseUsage::sum([
+            &self.profile,
+            &self.extract,
+            &self.mapper,
+            &self.link_total,
+        ]);
     }
 
     /// Write to `<output_folder>/usage/run_usage.json` (atomic tmp+rename).
@@ -1125,6 +1147,8 @@ impl LinkScopes {
 struct LinkScheduler<B: HarnessBackend + Clone + 'static> {
     ctx: Arc<LinkContext<B>>,
     concurrency: usize,
+    /// Cap on retained per-link usage detail rows. `0` retains none.
+    max_link_rows: usize,
     /// When set, review + merge are drained into it after each completed link
     /// (serial — this runs in the scheduler's single-threaded join loop, so no
     /// lock is needed). Returned to the caller to finalize.
@@ -1174,7 +1198,8 @@ impl<B: HarnessBackend + Clone + 'static> LinkScheduler<B> {
                     if tally.abandoned {
                         stats.abandoned_links += 1;
                     }
-                    stats.link_usages.push(tally.usage_row);
+                    // Exact aggregate regardless of detail retention.
+                    record_link_usage(&mut stats, tally.usage_row, self.max_link_rows);
                     // Drain review + merge for whatever findings this link
                     // produced. Serial (we're in the single-threaded join
                     // loop) so the merge accumulator needs no lock. A drain
@@ -1250,6 +1275,8 @@ pub(crate) struct LinkPipelineInputs<B: HarnessBackend + Clone + Send + Sync + '
     /// and finalizes (writer + export) at the end. `None` for plain runs and
     /// for `external-validate` (which has its own reporting).
     pub(crate) report_cfg: Option<review_findings::ReportInlineCfg>,
+    /// Cap on retained per-link usage detail rows (`0` = none).
+    pub(crate) usage_max_link_rows: usize,
 }
 
 impl<B: HarnessBackend + Clone + Send + Sync + 'static> LinkPipelineInputs<B> {
@@ -1275,6 +1302,7 @@ impl<B: HarnessBackend + Clone + Send + Sync + 'static> LinkPipelineInputs<B> {
             max_inner_cycles,
             concurrency,
             report_cfg,
+            usage_max_link_rows,
         } = self;
         let concurrency = concurrency.max(1);
 
@@ -1335,6 +1363,7 @@ impl<B: HarnessBackend + Clone + Send + Sync + 'static> LinkPipelineInputs<B> {
         let scheduler = LinkScheduler {
             ctx,
             concurrency,
+            max_link_rows: usage_max_link_rows,
             report,
         };
         let (stats, report) = scheduler.run(stream).await?;
@@ -1356,7 +1385,10 @@ impl<B: HarnessBackend + Clone + Send + Sync + 'static> LinkPipelineInputs<B> {
             stats.abandoned_links,
         );
         Ok(RunUsageReport {
+            link_total: stats.link_total,
+            link_count: stats.processed_links,
             links: stats.link_usages,
+            omitted_link_rows: stats.omitted_link_rows,
             billing_abort: stats.billing_abort,
             ..Default::default()
         })
@@ -1377,12 +1409,29 @@ struct StreamStats {
     built_specs: usize,
     abandoned_links: usize,
     errors: usize,
-    /// Per-link token/USD rows collected for the centralized usage report.
+    /// Exact aggregate token/USD spend over every processed link.
+    link_total: PhaseUsage,
+    /// Retained per-link token/USD detail rows (bounded by
+    /// `--usage-max-link-rows`).
     link_usages: Vec<LinkUsageRow>,
+    /// Detail rows dropped because the retention cap was reached.
+    omitted_link_rows: usize,
     /// Set when a link pipeline failed with a billing-cap exhaustion. The
     /// scheduler stops launching new links and drains the in-flight ones; the
     /// run then aborts with a clear error instead of silently "finishing".
     billing_abort: Option<BillingExhausted>,
+}
+
+/// Fold one completed link's usage into the running stats: the aggregate
+/// `link_total` is always exact, while the detailed row is retained only up to
+/// `max_rows` (the remainder counted in `omitted_link_rows`).
+fn record_link_usage(stats: &mut StreamStats, row: LinkUsageRow, max_rows: usize) {
+    stats.link_total.add(&row.usage.total);
+    if stats.link_usages.len() < max_rows {
+        stats.link_usages.push(row);
+    } else {
+        stats.omitted_link_rows += 1;
+    }
 }
 
 /// Minimal per-link summary returned by [`LinkContext::run_link`] —
@@ -1470,5 +1519,72 @@ impl OnDiskFinding {
             provenance,
             merged_to: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::*;
+
+    fn phase(usd: i64) -> PhaseUsage {
+        PhaseUsage {
+            tokens: TokenUsage::default(),
+            usd: Decimal::new(usd, 0),
+        }
+    }
+
+    fn row(ordinal: usize, usd: i64) -> LinkUsageRow {
+        LinkUsageRow {
+            ordinal,
+            extract_id: 1,
+            historical_id: 1,
+            finding_id: ordinal as i32,
+            usage: LinkUsageReport {
+                total: phase(usd),
+                ..Default::default()
+            },
+        }
+    }
+
+    /// Truncating detail rows must not change the run total: `finalize_total`
+    /// sums the exact `link_total`, never the retained `links`.
+    #[test]
+    fn finalize_total_uses_link_aggregate_not_truncated_rows() {
+        let mut report = RunUsageReport {
+            profile: phase(1),
+            extract: phase(2),
+            mapper: phase(3),
+            link_total: phase(40),
+            link_count: 100,
+            links: Vec::new(), // every detail row truncated away
+            omitted_link_rows: 100,
+            ..Default::default()
+        };
+        report.finalize_total();
+        assert_eq!(report.run_total.usd, Decimal::new(46, 0));
+    }
+
+    /// `--usage-max-link-rows 0` retains no detail rows while the aggregate
+    /// and count stay exact.
+    #[test]
+    fn zero_max_link_rows_retains_none_but_keeps_exact_total() {
+        let mut stats = StreamStats::default();
+        record_link_usage(&mut stats, row(1, 5), 0);
+        record_link_usage(&mut stats, row(2, 7), 0);
+        assert!(stats.link_usages.is_empty());
+        assert_eq!(stats.omitted_link_rows, 2);
+        assert_eq!(stats.link_total.usd, Decimal::new(12, 0));
+    }
+
+    /// A positive cap retains exactly that many rows and counts the rest.
+    #[test]
+    fn positive_cap_retains_prefix_and_counts_remainder() {
+        let mut stats = StreamStats::default();
+        for i in 1..=3 {
+            record_link_usage(&mut stats, row(i, 1), 2);
+        }
+        assert_eq!(stats.link_usages.len(), 2);
+        assert_eq!(stats.omitted_link_rows, 1);
+        assert_eq!(stats.link_total.usd, Decimal::new(3, 0));
     }
 }

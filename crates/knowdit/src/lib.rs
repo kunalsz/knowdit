@@ -10,6 +10,7 @@ use crate::cli::HistoricalDatabaseArgs;
 
 pub mod cli;
 pub mod cmd;
+pub mod llm;
 
 #[derive(Parser)]
 #[command(name = "knowdit", about = "DeFi audit knowledge graph builder")]
@@ -376,7 +377,7 @@ impl WorkflowCommand {
             llm: llm_setup,
             command,
         } = self;
-        let llm = llm_setup.to_llm().await;
+        let llm = llm::provider_compat(llm_setup.to_llm().await);
         match command {
             WorkflowCommands::Autoloop(args) => args.run(&llm).await?,
             WorkflowCommands::Streamloop(args) => args.run(&llm).await?,
@@ -469,7 +470,7 @@ impl AgenticCommand {
         // downstream is free; reusing the same instance also lets
         // the autoloop / future multi-phase orchestrators enforce
         // one global billing cap.
-        let llm = llm_setup.to_llm().await;
+        let llm = llm::provider_compat(llm_setup.to_llm().await);
         match command {
             AgenticCommands::Solidity(command) => command.run().await?,
             AgenticCommands::ExtractSemantics(args) => args.run(&llm).await?,

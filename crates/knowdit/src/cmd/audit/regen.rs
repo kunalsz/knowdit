@@ -604,6 +604,7 @@ impl<B: HarnessBackend + 'static> RegenRunner<B> {
                 &self.repo,
                 &self.llm,
                 extract_id,
+                historical_id,
                 finding_id,
                 new_spec.clone(),
                 synthetic_spec_id,

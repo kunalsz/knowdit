@@ -97,7 +97,7 @@ impl RetroLinkArgs {
             self.context_window_utilization > 0.0 && self.context_window_utilization <= 1.0,
             "context_window_utilization must be in (0, 1]",
         );
-        let llm = self.llm.clone().to_llm().await;
+        let llm = crate::llm::provider_compat(self.llm.clone().to_llm().await);
         Self::retro_link(
             db,
             &llm,

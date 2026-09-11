@@ -7,23 +7,44 @@
 //! knowledge-graph rows, and is shared by the Solidity (`knowdit-audit`)
 //! and Move (`knowdit-move`) spec pipelines.
 
-use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use knowdit_kg_model::ExtractedSemantic;
 use knowdit_kg_model::db::{audit_finding, semantic_node};
 use knowdit_kg_model::link_strength::LinkStrength;
 
-use crate::{HistoricalSemanticRecord, MatchStrength, SemanticMatch};
+use crate::{HistoricalLinkedFinding, HistoricalSemanticRecord, MatchStrength};
+#[cfg(test)]
+use std::collections::{BTreeMap, BTreeSet};
+#[cfg(test)]
+use crate::SemanticMatch;
 
 /// Stable identifier for one expanded `(extract, historical, finding)` link.
 /// Public so orchestrators can log / snapshot progress without reaching into
 /// a generator's private runtime state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct LinkKey {
     pub extract_id: i32,
     pub historical_id: i32,
     pub finding_id: i32,
+}
+
+/// Compact, cloneable description of one pending `(extract, historical,
+/// finding)` link, without any of the heavy per-link source payloads.
+///
+/// This is what a spec planner keeps in memory while ordering / capping
+/// candidates; the full [`LinkInput`] (which owns cloned prompt strings and
+/// KG row models) is only materialized for the batch actually being run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkCandidate {
+    pub key: LinkKey,
+    /// Mapper-emitted strength on the `(extract, historical)` pair.
+    pub match_strength: MatchStrength,
+    /// Global-linker-emitted strength on the `(historical, finding)` edge.
+    pub link_strength: LinkStrength,
+    /// Spec ids already committed for this link in a prior run; empty for a
+    /// fresh link. Populated by the planner's resume pass.
+    pub pre_committed_spec_ids: Vec<i32>,
 }
 
 /// One expanded `(extract, historical, finding)` link ready to run.
@@ -80,10 +101,81 @@ impl LinkInput {
         }
     }
 
+    /// Build one [`LinkInput`] from its exact source rows. The primitive the
+    /// planner calls for each materialized candidate; `build_all` is just a
+    /// fan-out over this.
+    #[allow(clippy::too_many_arguments)]
+    pub fn materialize(
+        extract_id: i32,
+        historical_id: i32,
+        finding_id: i32,
+        strength: MatchStrength,
+        link_strength: LinkStrength,
+        extract: &ExtractedSemantic,
+        record: &HistoricalSemanticRecord,
+        linked: &HistoricalLinkedFinding,
+    ) -> Self {
+        let finding = &linked.finding;
+        LinkInput {
+            extract_id,
+            historical_id,
+            finding_id,
+            strength,
+            link_strength,
+            extract: extract.clone(),
+            historical_rendered_description: rendered_or(
+                &record.rendered_description,
+                &record.semantic.description,
+            ),
+            finding_rendered_description: rendered_or(
+                &linked.rendered_description,
+                &finding.description,
+            ),
+            finding_rendered_patterns: rendered_or(&linked.rendered_patterns, &finding.patterns),
+            finding_rendered_exploits: rendered_or(&linked.rendered_exploits, &finding.exploits),
+            historical: record.semantic.clone(),
+            finding: finding.clone(),
+            pre_committed_spec_ids: Vec::new(),
+        }
+    }
+
+    /// Exact materialization for one `(E, H, F)` identity. Locates the linked
+    /// finding inside `record` and delegates to [`Self::materialize`]. Returns
+    /// `None` only when the historical record has no finding with the requested
+    /// id — i.e. the KG changed since the reference was recorded.
+    pub fn materialize_exact(
+        key: LinkKey,
+        strength: MatchStrength,
+        extract: &ExtractedSemantic,
+        record: &HistoricalSemanticRecord,
+    ) -> Option<Self> {
+        let linked = record
+            .findings
+            .iter()
+            .find(|linked| linked.finding.id == key.finding_id)?;
+        Some(Self::materialize(
+            key.extract_id,
+            key.historical_id,
+            key.finding_id,
+            strength,
+            linked.strength,
+            extract,
+            record,
+            linked,
+        ))
+    }
+
     /// Fan out mapper matches into one [`LinkInput`] per linked finding,
     /// deduplicated on the `(extract, historical, finding)` triple. Matches
     /// with no project-side extract row, no historical row, or no linked
     /// findings are skipped.
+    ///
+    /// **Test-only reference implementation.** Production planners materialize
+    /// candidates on demand via [`Self::materialize_exact`] instead of
+    /// expanding every link up front; this method exists solely as the
+    /// equivalence-test oracle for that path and is not compiled into
+    /// production builds.
+    #[cfg(test)]
     pub fn build_all(
         matches: &[SemanticMatch],
         extracted_by_id: &BTreeMap<i32, ExtractedSemantic>,
@@ -123,33 +215,16 @@ impl LinkInput {
                 if !seen.insert((extract_id, historical_id, finding.id)) {
                     continue;
                 }
-                out.push(LinkInput {
+                out.push(Self::materialize(
                     extract_id,
                     historical_id,
-                    finding_id: finding.id,
-                    strength: m.strength,
-                    link_strength: linked.strength,
-                    extract: extract.clone(),
-                    historical_rendered_description: rendered_or(
-                        &record.rendered_description,
-                        &record.semantic.description,
-                    ),
-                    finding_rendered_description: rendered_or(
-                        &linked.rendered_description,
-                        &finding.description,
-                    ),
-                    finding_rendered_patterns: rendered_or(
-                        &linked.rendered_patterns,
-                        &finding.patterns,
-                    ),
-                    finding_rendered_exploits: rendered_or(
-                        &linked.rendered_exploits,
-                        &finding.exploits,
-                    ),
-                    historical: record.semantic.clone(),
-                    finding: finding.clone(),
-                    pre_committed_spec_ids: Vec::new(),
-                });
+                    finding.id,
+                    m.strength,
+                    linked.strength,
+                    extract,
+                    record,
+                    linked,
+                ));
             }
         }
         out
@@ -163,5 +238,151 @@ impl fmt::Display for LinkInput {
             "Link(id={}, extract={}, historical={}, finding={}, strength={})",
             self.extract_id, self.extract_id, self.historical_id, self.finding_id, self.strength,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use knowdit_kg_model::audit_finding::FindingSeverity;
+    use knowdit_kg_model::category::DeFiCategory;
+
+    fn extract(name: &str) -> ExtractedSemantic {
+        ExtractedSemantic {
+            name: name.to_string(),
+            category: DeFiCategory::Lending,
+            definition: String::new(),
+            description: format!("{name} description"),
+            functions: Vec::new(),
+        }
+    }
+
+    fn finding(id: i32) -> audit_finding::Model {
+        audit_finding::Model {
+            id,
+            title: format!("finding {id}"),
+            severity: FindingSeverity::Medium,
+            root_cause: String::new(),
+            description: format!("finding {id} description"),
+            patterns: String::new(),
+            exploits: String::new(),
+        }
+    }
+
+    fn historical(id: i32, finding_ids: &[i32]) -> HistoricalSemanticRecord {
+        HistoricalSemanticRecord {
+            semantic: semantic_node::Model {
+                id,
+                name: format!("hist {id}"),
+                definition: String::new(),
+                description: format!("hist {id} description"),
+                category: DeFiCategory::Lending,
+            },
+            findings: finding_ids
+                .iter()
+                .map(|finding_id| HistoricalLinkedFinding {
+                    finding: finding(*finding_id),
+                    strength: LinkStrength::Medium,
+                    evidence: String::new(),
+                    raw_children: Vec::new(),
+                    rendered_description: String::new(),
+                    rendered_patterns: String::new(),
+                    rendered_exploits: String::new(),
+                })
+                .collect(),
+            raw_children: Vec::new(),
+            rendered_description: String::new(),
+        }
+    }
+
+    /// The removed production fan-out (`build_all`) and the on-demand
+    /// `materialize_exact` path must produce identical links for the same
+    /// source rows — this is the equivalence oracle that justified migrating
+    /// production off `build_all`.
+    #[test]
+    fn build_all_matches_materialize_exact() {
+        let mut extracted = BTreeMap::new();
+        extracted.insert(1, extract("e1"));
+        extracted.insert(2, extract("e2"));
+        let mut historicals = BTreeMap::new();
+        historicals.insert(100, historical(100, &[1, 2]));
+        historicals.insert(200, historical(200, &[3]));
+
+        let matches = vec![
+            SemanticMatch {
+                extract_id: 1,
+                historical_id: 100,
+                strength: MatchStrength::High,
+                evidence: "a".to_string(),
+            },
+            SemanticMatch {
+                extract_id: 1,
+                historical_id: 200,
+                strength: MatchStrength::Medium,
+                evidence: "b".to_string(),
+            },
+            SemanticMatch {
+                extract_id: 2,
+                historical_id: 100,
+                strength: MatchStrength::Low,
+                evidence: "c".to_string(),
+            },
+            // Duplicate triple — must be deduped identically by both paths.
+            SemanticMatch {
+                extract_id: 1,
+                historical_id: 100,
+                strength: MatchStrength::High,
+                evidence: "dup".to_string(),
+            },
+        ];
+
+        let all = LinkInput::build_all(&matches, &extracted, &historicals);
+
+        let mut expected = Vec::new();
+        let mut seen = BTreeSet::new();
+        for m in &matches {
+            let Some(extract) = extracted.get(&m.extract_id) else {
+                continue;
+            };
+            let Some(record) = historicals.get(&m.historical_id) else {
+                continue;
+            };
+            for linked in &record.findings {
+                if !seen.insert((m.extract_id, m.historical_id, linked.finding.id)) {
+                    continue;
+                }
+                expected.push(
+                    LinkInput::materialize_exact(
+                        LinkKey {
+                            extract_id: m.extract_id,
+                            historical_id: m.historical_id,
+                            finding_id: linked.finding.id,
+                        },
+                        m.strength,
+                        extract,
+                        record,
+                    )
+                    .expect("exact materialization"),
+                );
+            }
+        }
+
+        assert_eq!(all.len(), expected.len());
+        for (a, b) in all.iter().zip(expected.iter()) {
+            assert_eq!(a.key(), b.key());
+            assert_eq!(a.strength, b.strength);
+            assert_eq!(a.link_strength, b.link_strength);
+            assert_eq!(a.extract.name, b.extract.name);
+            assert_eq!(
+                a.historical_rendered_description,
+                b.historical_rendered_description
+            );
+            assert_eq!(
+                a.finding_rendered_description,
+                b.finding_rendered_description
+            );
+            assert_eq!(a.historical.id, b.historical.id);
+            assert_eq!(a.finding.id, b.finding.id);
+        }
     }
 }

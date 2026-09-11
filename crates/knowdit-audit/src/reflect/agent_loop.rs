@@ -176,8 +176,10 @@ pub async fn drive_agent_loop<T: Send + Sync + 'static>(
     )
     .await;
 
-    let mut step = agent
-        .step_with_user(
+    let mut truncation = knowdit_kg::agent_retry::TruncationRetry::default();
+    let mut step = truncation
+        .first_step_with_user(
+            &mut agent,
             user_prompt,
             llm,
             debug_prefix.as_deref(),
@@ -187,9 +189,23 @@ pub async fn drive_agent_loop<T: Send + Sync + 'static>(
         .wrap_err("reflection agent failed on initial step")?;
     let mut steps = 1usize;
 
-    let compact_threshold = options
-        .compact_context_threshold_tokens
-        .unwrap_or_else(|| (llm.model.config.max_input() as f64 * DEFAULT_COMPACT_RATIO) as usize);
+    let max_input = llm.model.config.max_input();
+    let (compact_threshold, using_fallback) = knowdit_kg_model::resolve_threshold(
+        options.compact_context_threshold_tokens,
+        max_input,
+        DEFAULT_COMPACT_RATIO,
+    );
+    if using_fallback && knowdit_kg_model::warn_once_for("reflection-agent") {
+        tracing::warn!(
+            "Reflection agent: model `{}` is not in the llmy registry (max_input_tokens=0); \
+             using a {} token fallback context window (compact threshold {}). Add the model to \
+             the registry, or pass --grader-compact-context-threshold-tokens to set it explicitly \
+             and silence this.",
+            llm.model.model_id_str(),
+            knowdit_kg_model::FALLBACK_CONTEXT_WINDOW_TOKENS,
+            compact_threshold,
+        );
+    }
 
     while !attempt.is_set().await {
         if matches!(step, StepResult::Stop(_)) {
@@ -227,10 +243,32 @@ pub async fn drive_agent_loop<T: Send + Sync + 'static>(
                 .wrap_err("reflection agent failed to compact context")?;
         }
         steps += 1;
-        step = agent
-            .step(llm, debug_prefix.as_deref(), options.llm_settings.clone())
+        match truncation
+            .step(
+                &mut agent,
+                llm,
+                debug_prefix.as_deref(),
+                options.llm_settings.clone(),
+            )
             .await
-            .wrap_err_with(|| format!("reflection agent failed at step {steps}"))?;
+        {
+            Ok(result) => step = result,
+            // Truncation retries exhausted: surface a reason that names the
+            // output cap, since the caller otherwise reports a bare error and
+            // the fix (`--llm-max-completion-tokens`) is not obvious.
+            Err(err) if knowdit_kg::agent_retry::is_output_length(&err) => {
+                return Err(color_eyre::eyre::eyre!(
+                    "reflection agent response truncated by the provider output cap {} times in a \
+                     row at step {steps} (cache_key_suffix={cache_key_suffix}); raise \
+                     --llm-max-completion-tokens or use a model with a larger output limit",
+                    truncation.consecutive_failures(),
+                ));
+            }
+            Err(err) => {
+                return Err(err)
+                    .wrap_err_with(|| format!("reflection agent failed at step {steps}"));
+            }
+        }
     }
 
     Ok(steps)

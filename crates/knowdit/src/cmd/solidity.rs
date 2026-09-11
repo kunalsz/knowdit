@@ -255,7 +255,7 @@ impl SolidityCallGraphArgs {
         )
         .await?;
 
-        let llm = self.llm.clone().to_llm().await;
+        let llm = crate::llm::provider_compat(self.llm.clone().to_llm().await);
         let agent_options = knowdit_kg::agent_runner::AgentRunOptions::new(self.max_agent_steps);
         // The LLM-driven callgraph agent has no CLI knob for the
         // per-chunk input budget; fall back to the model's default
@@ -308,7 +308,7 @@ impl SolidityStorageGraphArgs {
             .await?;
         let extraction_config = build_solidity_extraction_config(&self.source, &self.scope)?;
 
-        let llm = self.llm.clone().to_llm().await;
+        let llm = crate::llm::provider_compat(self.llm.clone().to_llm().await);
         let config = StorageAgentConfig::new(
             extraction_config,
             self.max_agent_steps,

@@ -78,6 +78,19 @@ pub struct GenSpecsSharedArgs {
     #[arg(long = "gen-specs-max-links", default_value_t = 0)]
     pub gen_specs_max_links: usize,
 
+    /// Number of fully materialized links the planner keeps queued at once.
+    /// Bounds heavy per-link memory (cloned prompt strings + KG rows)
+    /// independently of the total candidate count. Must be `> 0`. The
+    /// effective bound is `max(this, --gen-specs-concurrency)`.
+    #[arg(long = "gen-specs-batch-links", default_value_t = 1000)]
+    pub gen_specs_batch_links: usize,
+
+    /// Max per-link detail rows retained in the run summary. Aggregate
+    /// counters stay exact; rows beyond this are reported as omitted. `0`
+    /// retains no detail rows.
+    #[arg(long = "gen-specs-summary-rows", default_value_t = 10000)]
+    pub gen_specs_summary_rows: usize,
+
     /// Cap on findings per *(extract, historical)* pair. `0` means
     /// no cap. When multiple extracts match the same historical,
     /// each pair gets its own quota.
@@ -129,6 +142,17 @@ pub struct GenSpecsSharedArgs {
 }
 
 impl GenSpecsSharedArgs {
+    /// Reject unsafe / contradictory values before any LLM work.
+    pub(crate) fn validate(&self) -> Result<()> {
+        if self.gen_specs_batch_links == 0 {
+            return Err(color_eyre::eyre::eyre!(
+                "--gen-specs-batch-links must be > 0 (0 would re-enable unbounded heavy \
+                 materialization of every link)"
+            ));
+        }
+        Ok(())
+    }
+
     /// Build the [`SpecGenOptions`] for one Specification Generator pass from
     /// these CLI knobs. The cache key defaults to `{project_name}-knowdit-spec`;
     /// `link_source` frames the gen-spec agent (mapper topic-hint vs external
@@ -150,6 +174,8 @@ impl GenSpecsSharedArgs {
             debug_prefix: self.gen_specs_debug_prefix.clone(),
             llm_settings: None,
             max_links: (self.gen_specs_max_links > 0).then_some(self.gen_specs_max_links),
+            batch_links: self.gen_specs_batch_links.max(1),
+            summary_rows: self.gen_specs_summary_rows,
             max_findings_per_historical: (self.gen_specs_max_findings_per_historical > 0)
                 .then_some(self.gen_specs_max_findings_per_historical),
             max_links_per_extract: (self.gen_specs_max_links_per_extract > 0)
@@ -189,6 +215,9 @@ struct RunSummary {
     abandoned_link_count: usize,
     total_specs: usize,
     by_link: Vec<LinkSpecSummary>,
+    /// Per-link detail rows dropped because `--gen-specs-summary-rows` was
+    /// reached. Counters above remain exact.
+    omitted_link_outcomes: usize,
 }
 
 impl GenSpecsArgs {
@@ -199,6 +228,7 @@ impl GenSpecsArgs {
     /// `map-semantics`. Move projects go through `workflow
     /// streamloop`, which passes its harness backend's prefix.
     pub async fn run(self, llm: &LLM) -> Result<()> {
+        self.shared.validate()?;
         let LoadedRepoDatabase { spec, repo, .. } = self
             .project
             .to_repo_database(self.db.database_path.clone(), self.db.variant_render_cap)
@@ -229,6 +259,7 @@ impl GenSpecsArgs {
                 abandoned_link_count: outcome.abandoned_link_count,
                 total_specs: outcome.total_specs,
                 by_link: outcome.by_link.iter().map(LinkSpecSummary::from).collect(),
+                omitted_link_outcomes: outcome.omitted_link_outcomes,
             };
             std::fs::write(out_path, serde_json::to_string_pretty(&summary)?)?;
             tracing::info!("Specification summary written to {}", out_path.display());
@@ -252,6 +283,9 @@ impl GenSpecsArgs {
         language_prompt_prefix: String,
         shared: &GenSpecsSharedArgs,
     ) -> Result<SpecGenOutcome> {
+        // Single choke point for every caller (standalone CLI, autoloop,
+        // streamloop): reject unsafe knobs before any DB or LLM work.
+        shared.validate()?;
         // Profile fetch verifies the upstream pipeline produced one.
         repo.get_project_profile().await?.ok_or_else(|| {
             color_eyre::eyre::eyre!(
@@ -272,6 +306,8 @@ impl GenSpecsArgs {
             debug_prefix: shared.gen_specs_debug_prefix.clone(),
             llm_settings: None,
             max_links: (shared.gen_specs_max_links > 0).then_some(shared.gen_specs_max_links),
+            batch_links: shared.gen_specs_batch_links.max(1),
+            summary_rows: shared.gen_specs_summary_rows,
             max_findings_per_historical: (shared.gen_specs_max_findings_per_historical > 0)
                 .then_some(shared.gen_specs_max_findings_per_historical),
             max_links_per_extract: (shared.gen_specs_max_links_per_extract > 0)

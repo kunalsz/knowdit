@@ -80,7 +80,7 @@ impl LinkArgs {
     /// [`Self::link`].
     pub async fn run(self, db: &HistoricalDatabase) -> Result<()> {
         self.finding_link.validate()?;
-        let llm = self.llm.clone().to_llm().await;
+        let llm = crate::llm::provider_compat(self.llm.clone().to_llm().await);
         Self::link(
             db,
             &llm,

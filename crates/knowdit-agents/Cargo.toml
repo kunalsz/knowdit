@@ -11,6 +11,7 @@ readme.workspace = true
 [dependencies]
 color-eyre.workspace = true
 knowdit-kg.workspace = true
+knowdit-kg-model.workspace = true
 knowdit-repo-model.workspace = true
 knowdit-sol.workspace = true
 llmy.workspace = true

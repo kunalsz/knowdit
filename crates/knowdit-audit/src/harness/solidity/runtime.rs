@@ -27,7 +27,7 @@ use color_eyre::eyre::{Result, WrapErr};
 use knowdit_kg_model::ExtractedSemantic;
 use knowdit_repo_model::{
     CodeGenCore, CodeGenRecord, CodeGenStatus, CoverageEntry, HarnessRunRecord,
-    HistoricalSemanticRecord, RepoDatabase, SemanticMatchSet,
+    HistoricalSemanticRecord, LinkKey, MatchStrength, RepoDatabase, SemanticMatchSet,
 };
 use llmy::agent::StepResult;
 use llmy::agent::tool::ToolBox;
@@ -56,15 +56,20 @@ use crate::types::AuditSpecification;
 
 pub(super) struct FuzzRuntime {
     pub(super) project_index: Arc<ProjectIndex>,
-    pub(super) link_by_pair: BTreeMap<(i32, i32), LinkInput>,
+    /// Source indexes used to materialize links **on demand** for the exact
+    /// `(extract, historical, finding)` identities the loaded specifications
+    /// demand. No expanded `Vec<LinkInput>` is retained.
+    pub(super) extracted_by_id: BTreeMap<i32, ExtractedSemantic>,
+    pub(super) historical_by_id: BTreeMap<i32, HistoricalSemanticRecord>,
+    pub(super) match_strength_by_pair: BTreeMap<(i32, i32), MatchStrength>,
     pub(super) harness_dir: PathBuf,
     pub(super) forge_runner: ForgeRunner,
     pub(super) project_conventions: Arc<ProjectConventions>,
 }
 
 impl FuzzRuntime {
-    /// Build the per-invocation runtime: project index, link-by-pair
-    /// table, harness dir + forge runner, project conventions. Shared
+    /// Build the per-invocation runtime: project index, source indexes,
+    /// harness dir + forge runner, project conventions. Shared
     /// by [`SolidityFuzzGenerator::run`] (full sweep) and the three
     /// single-spec entries (`fuzz_one_existing_spec`, `regen_one_spec`,
     /// `regen_codegen_with_explicit_spec`).
@@ -104,19 +109,17 @@ impl FuzzRuntime {
             .load_semantic_match_results()
             .await
             .wrap_err("failed to load Knowledge Mapper output")?;
-        let historical_by_id: BTreeMap<i32, HistoricalSemanticRecord> = match_set
-            .historicals
-            .iter()
-            .map(|r| (r.semantic.id, r.clone()))
+        // Move historicals into the index (no clone); build the (E, H) strength
+        // index for exact materialization.
+        let SemanticMatchSet { historicals, matches } = match_set;
+        let historical_by_id: BTreeMap<i32, HistoricalSemanticRecord> = historicals
+            .into_iter()
+            .map(|record| (record.semantic.id, record))
             .collect();
-        let link_inputs =
-            LinkInput::build_all(&match_set.matches, &extracted_by_id, &historical_by_id);
-        let mut link_by_pair: BTreeMap<(i32, i32), LinkInput> = BTreeMap::new();
-        for li in link_inputs {
-            link_by_pair
-                .entry((li.extract_id, li.finding_id))
-                .or_insert(li);
-        }
+        let match_strength_by_pair: BTreeMap<(i32, i32), MatchStrength> = matches
+            .iter()
+            .map(|m| ((m.extract_id, m.historical_id), m.strength))
+            .collect();
 
         let harness_dir = options.resolve_harness_dir();
         tokio::fs::create_dir_all(&harness_dir)
@@ -137,11 +140,39 @@ impl FuzzRuntime {
 
         Ok(Self {
             project_index,
-            link_by_pair,
+            extracted_by_id,
+            historical_by_id,
+            match_strength_by_pair,
             harness_dir,
             forge_runner,
             project_conventions,
         })
+    }
+
+    /// Materialize exactly one `(extract, historical, finding)` link from the
+    /// loaded source indexes. Returns `None` when the identity is missing from
+    /// the current mapper output — i.e. the source data changed and a demanded
+    /// spec can no longer be grounded (never because of an arbitrary prefix
+    /// omission).
+    pub(super) fn materialize_link(
+        &self,
+        extract_id: i32,
+        historical_id: i32,
+        finding_id: i32,
+    ) -> Option<LinkInput> {
+        let extract = self.extracted_by_id.get(&extract_id)?;
+        let record = self.historical_by_id.get(&historical_id)?;
+        let strength = *self.match_strength_by_pair.get(&(extract_id, historical_id))?;
+        LinkInput::materialize_exact(
+            LinkKey {
+                extract_id,
+                historical_id,
+                finding_id,
+            },
+            strength,
+            extract,
+            record,
+        )
     }
 }
 
@@ -411,6 +442,10 @@ impl AgentLoopState {
             callgraph: self.callgraph_arc.clone(),
             gate2_fidelity_threshold: self.options.gate2_fidelity_threshold,
             via_ir: self.options.via_ir,
+            // Per-spec coverage report path: keeps concurrent links from
+            // clobbering each other's lcov rows (forge's default is the
+            // shared `<work_dir>/lcov.info`).
+            lcov_path: self.per_spec_dir.join("lcov.info"),
         });
         tools.add_tool(ListTestFilesTool {
             repo_root: self.options.repo_root.clone(),
@@ -542,8 +577,10 @@ impl AgentLoopState {
         restart_count: usize,
         total_steps: &mut usize,
     ) -> AttemptOutcome {
-        let step_res = agent
-            .step_with_user(
+        let mut truncation = knowdit_kg::agent_retry::TruncationRetry::default();
+        let step_res = truncation
+            .first_step_with_user(
+                agent,
                 self.user_prompt.clone(),
                 llm,
                 self.debug_prefix.as_deref(),
@@ -591,8 +628,9 @@ impl AgentLoopState {
                 );
                 return AttemptOutcome::NeedsRestart;
             }
-            let next = agent
+            let next = truncation
                 .step(
+                    agent,
                     llm,
                     self.debug_prefix.as_deref(),
                     self.options.llm_settings.clone(),
@@ -601,7 +639,15 @@ impl AgentLoopState {
             step = match next {
                 Ok(s) => s,
                 Err(e) => {
-                    return AttemptOutcome::AgentError(format!("step {}: {e}", *total_steps));
+                    let hint = if knowdit_kg::agent_retry::is_output_length(&e) {
+                        " (provider output cap; raise --llm-max-completion-tokens)"
+                    } else {
+                        ""
+                    };
+                    return AttemptOutcome::AgentError(format!(
+                        "step {}: {e}{hint}",
+                        *total_steps
+                    ));
                 }
             };
             *total_steps += 1;
@@ -815,13 +861,6 @@ impl SolidityHarnessGenerator {
 
     pub async fn run(&self) -> Result<FuzzOutcome> {
         let runtime = FuzzRuntime::new(&self.repo, &self.options, &self.backend).await?;
-        let FuzzRuntime {
-            project_index,
-            link_by_pair,
-            harness_dir,
-            forge_runner,
-            project_conventions,
-        } = runtime;
 
         let specs = self
             .repo
@@ -847,7 +886,12 @@ impl SolidityHarnessGenerator {
                 .wrap_err("failed to load already-fuzzed spec ids")?
         };
 
-        let mut tasks: Vec<FuzzTask> = Vec::new();
+        // Demand-first: filter by resume, parse the spec JSON, apply the
+        // `max_specs` cap, and only then materialize the exact
+        // `(extract, historical, finding)` links the surviving specs demand.
+        // No expanded `LinkInput` set is ever built, and the heavy payload is
+        // cloned for at most `max_specs` specs.
+        let mut pending: Vec<PendingSpec> = Vec::new();
         let mut skipped_resumed = 0usize;
         let mut skipped_no_link = 0usize;
         let mut skipped_parse = 0usize;
@@ -856,28 +900,54 @@ impl SolidityHarnessGenerator {
                 skipped_resumed += 1;
                 continue;
             }
-            let Some(link) = link_by_pair.get(&(s.semantic_id, s.finding_id)) else {
-                skipped_no_link += 1;
-                continue;
-            };
             let spec: AuditSpecification = match serde_json::from_str(&s.specification_json) {
                 Ok(v) => v,
                 Err(e) => {
                     tracing::warn!(
-                        "Skipping spec id={} (extract={}, finding={}): JSON parse failed: {e}",
+                        "Skipping spec id={} (extract={}, historical={}, finding={}): JSON parse failed: {e}",
                         s.id,
                         s.semantic_id,
+                        s.historical_id,
                         s.finding_id
                     );
                     skipped_parse += 1;
                     continue;
                 }
             };
-            tasks.push(FuzzTask {
+            pending.push(PendingSpec {
                 spec_id: s.id,
                 semantic_id: s.semantic_id,
-                link: link.clone(),
+                historical_id: s.historical_id,
+                finding_id: s.finding_id,
                 spec,
+            });
+        }
+
+        pending = round_robin_pending(pending);
+        if let Some(cap) = (self.options.max_specs > 0).then_some(self.options.max_specs)
+            && pending.len() > cap
+        {
+            tracing::info!(
+                "Fuzz: truncating tasks {} → {} (--max-specs)",
+                pending.len(),
+                cap
+            );
+            pending.truncate(cap);
+        }
+
+        let mut tasks: Vec<FuzzTask> = Vec::with_capacity(pending.len());
+        for p in pending {
+            let Some(link) =
+                runtime.materialize_link(p.semantic_id, p.historical_id, p.finding_id)
+            else {
+                skipped_no_link += 1;
+                continue;
+            };
+            tasks.push(FuzzTask {
+                spec_id: p.spec_id,
+                semantic_id: p.semantic_id,
+                link,
+                spec: p.spec,
             });
         }
         if skipped_resumed > 0 || skipped_no_link > 0 || skipped_parse > 0 {
@@ -886,17 +956,6 @@ impl SolidityHarnessGenerator {
             );
         }
 
-        tasks = round_robin_tasks(tasks);
-        if let Some(cap) = (self.options.max_specs > 0).then_some(self.options.max_specs)
-            && tasks.len() > cap
-        {
-            tracing::info!(
-                "Fuzz: truncating tasks {} → {} (--max-specs)",
-                tasks.len(),
-                cap
-            );
-            tasks.truncate(cap);
-        }
         let total = tasks.len();
         if total == 0 {
             tracing::warn!("Fuzz: no specs to process");
@@ -918,11 +977,11 @@ impl SolidityHarnessGenerator {
         let outcome = self
             .dispatch(
                 tasks,
-                project_index,
-                &forge_runner,
-                &harness_dir,
+                runtime.project_index.clone(),
+                &runtime.forge_runner,
+                &runtime.harness_dir,
                 total,
-                project_conventions,
+                runtime.project_conventions.clone(),
             )
             .await?;
         Ok(FuzzOutcome {
@@ -1018,6 +1077,7 @@ impl SolidityHarnessGenerator {
     pub async fn regen_codegen_with_explicit_spec(
         &self,
         extract_id: i32,
+        historical_id: i32,
         finding_id: i32,
         spec: AuditSpecification,
         synthetic_spec_id: i32,
@@ -1025,13 +1085,12 @@ impl SolidityHarnessGenerator {
     ) -> Result<CodegenRegenInMemory> {
         let runtime = FuzzRuntime::new(&self.repo, &self.options, &self.backend).await?;
         let link = runtime
-            .link_by_pair
-            .get(&(extract_id, finding_id))
-            .cloned()
+            .materialize_link(extract_id, historical_id, finding_id)
             .ok_or_else(|| {
                 color_eyre::eyre::eyre!(
-                    "no LinkInput for (extract={extract_id}, finding={finding_id}) — \
-                     spec regen produced a spec for a pair not in the current matches"
+                    "no LinkInput for (extract={extract_id}, historical={historical_id}, \
+                     finding={finding_id}) — spec regen produced a spec for a triple not in the \
+                     current matches"
                 )
             })?;
         let lo = self
@@ -1072,13 +1131,16 @@ impl SolidityHarnessGenerator {
             color_eyre::eyre::eyre!("spec_id={spec_id} not in specification table")
         })?;
         let link = runtime
-            .link_by_pair
-            .get(&(spec_row.semantic_id, spec_row.finding_id))
-            .cloned()
+            .materialize_link(
+                spec_row.semantic_id,
+                spec_row.historical_id,
+                spec_row.finding_id,
+            )
             .ok_or_else(|| {
                 color_eyre::eyre::eyre!(
-                    "no LinkInput for spec {spec_id} (extract={}, finding={})",
+                    "no LinkInput for spec {spec_id} (extract={}, historical={}, finding={})",
                     spec_row.semantic_id,
+                    spec_row.historical_id,
                     spec_row.finding_id
                 )
             })?;
@@ -1254,19 +1316,30 @@ pub(super) struct FuzzTask {
     pub(super) spec: AuditSpecification,
 }
 
-fn round_robin_tasks(tasks: Vec<FuzzTask>) -> Vec<FuzzTask> {
-    let mut by_sem: BTreeMap<i32, VecDeque<FuzzTask>> = BTreeMap::new();
-    for t in tasks {
-        by_sem.entry(t.semantic_id).or_default().push_back(t);
+/// A parsed, resume-filtered spec that has not yet been grounded to a
+/// [`LinkInput`]. Lets the sweep interleave and cap the batch *before* cloning
+/// the heavy per-link payload.
+pub(super) struct PendingSpec {
+    pub(super) spec_id: i32,
+    pub(super) semantic_id: i32,
+    pub(super) historical_id: i32,
+    pub(super) finding_id: i32,
+    pub(super) spec: AuditSpecification,
+}
+
+fn round_robin_pending(specs: Vec<PendingSpec>) -> Vec<PendingSpec> {
+    let mut by_sem: BTreeMap<i32, VecDeque<PendingSpec>> = BTreeMap::new();
+    for s in specs {
+        by_sem.entry(s.semantic_id).or_default().push_back(s);
     }
     let total: usize = by_sem.values().map(|q| q.len()).sum();
-    let mut out: Vec<FuzzTask> = Vec::with_capacity(total);
+    let mut out: Vec<PendingSpec> = Vec::with_capacity(total);
     while !by_sem.is_empty() {
         let keys: Vec<i32> = by_sem.keys().copied().collect();
         for k in keys {
             if let Some(q) = by_sem.get_mut(&k) {
-                if let Some(t) = q.pop_front() {
-                    out.push(t);
+                if let Some(s) = q.pop_front() {
+                    out.push(s);
                 }
                 if q.is_empty() {
                     by_sem.remove(&k);

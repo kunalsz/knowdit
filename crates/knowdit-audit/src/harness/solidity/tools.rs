@@ -102,6 +102,11 @@ pub(super) struct RunForgeTool {
     pub(super) callgraph: Arc<knowdit_repo_model::cg::CallGraph>,
     pub(super) gate2_fidelity_threshold: f64,
     pub(super) via_ir: bool,
+    /// Absolute path `forge coverage` writes its lcov report to, and this
+    /// tool reads back from. Lives inside the per-spec scratch dir so
+    /// concurrent links never clobber each other's coverage report —
+    /// forge's default `<work_dir>/lcov.info` is shared by every link.
+    pub(super) lcov_path: PathBuf,
 }
 
 impl RunForgeTool {
@@ -147,8 +152,7 @@ impl RunForgeTool {
             let cov_argv = self.build_coverage_argv(&args);
             match self.runner.run(&cov_argv).await {
                 Ok(out) => {
-                    let lcov_path = self.runner.work_dir().join("lcov.info");
-                    let coverage = match tokio::fs::read_to_string(&lcov_path).await {
+                    let coverage = match tokio::fs::read_to_string(&self.lcov_path).await {
                         Ok(text) => parse_lcov(&text),
                         Err(_) => Vec::new(),
                     };
@@ -334,6 +338,12 @@ impl RunForgeTool {
             "coverage".to_string(),
             "--report".to_string(),
             "lcov".to_string(),
+            // Write the report to the per-spec scratch dir. Without this,
+            // forge defaults to `<work_dir>/lcov.info`, which every
+            // concurrent link shares — two links running coverage at once
+            // would read back each other's rows and mis-grade Gate 2.
+            "--report-file".to_string(),
+            self.lcov_path.display().to_string(),
             "--fuzz-runs".to_string(),
             self.coverage_runs.to_string(),
         ];

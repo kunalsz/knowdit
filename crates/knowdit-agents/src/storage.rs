@@ -265,8 +265,10 @@ impl StorageRunner {
             let mut agent = Agent::new(storage_agent_system_prompt(), tools, cache_key);
             let user = storage_agent_user_prompt(prompt_input);
             let mut steps = 1;
-            let mut step_result = agent
-                .step_with_user(
+            let mut truncation = knowdit_kg::agent_retry::TruncationRetry::default();
+            let mut step_result = truncation
+                .first_step_with_user(
+                    &mut agent,
                     user,
                     llm,
                     config.debug_prefix.as_deref(),
@@ -297,19 +299,34 @@ impl StorageRunner {
                     contract.name
                 );
                 steps += 1;
-                step_result = agent
+                match truncation
                     .step(
+                        &mut agent,
                         llm,
                         config.debug_prefix.as_deref(),
                         config.llm_settings.clone(),
                     )
                     .await
-                    .wrap_err_with(|| {
-                        format!(
-                            "storage agent step {} failed for contract {}",
-                            steps, contract.name
-                        )
-                    })?;
+                {
+                    Ok(result) => step_result = result,
+                    Err(err) if knowdit_kg::agent_retry::is_output_length(&err) => {
+                        return Err(color_eyre::eyre::eyre!(
+                            "storage agent response truncated by the provider output cap {} times in \
+                             a row at step {steps} for contract {}; raise \
+                             --llm-max-completion-tokens or use a model with a larger output limit",
+                            truncation.consecutive_failures(),
+                            contract.name,
+                        ));
+                    }
+                    Err(err) => {
+                        return Err(err).wrap_err_with(|| {
+                            format!(
+                                "storage agent step {} failed for contract {}",
+                                steps, contract.name
+                            )
+                        });
+                    }
+                }
             }
             total_steps += steps;
         }

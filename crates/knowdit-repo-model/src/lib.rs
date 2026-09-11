@@ -17,7 +17,7 @@ mod tests;
 
 pub use inheritance::{ContractInherit, InheritanceGraph};
 pub use lang::SourceLanguage;
-pub use link::{LinkInput, LinkKey};
+pub use link::{LinkCandidate, LinkInput, LinkKey};
 pub use move_lang::{
     MoveAbility, MoveField, MoveFunctionMetadata, MoveGenericParam, MovePackageStructure,
     MoveStruct, MoveVisibility,

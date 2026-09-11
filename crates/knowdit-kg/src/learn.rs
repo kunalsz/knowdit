@@ -2087,11 +2087,14 @@ impl ProjectData {
 pub const DEFAULT_CONTEXT_WINDOW_UTILIZATION: f64 = 0.4;
 
 /// Token budget for a single prompt: `utilization` × the model's max input.
+///
+/// Falls back to [`knowdit_kg_model::FALLBACK_CONTEXT_WINDOW_TOKENS`] when the
+/// model is absent from llmy's registry (`max_input_tokens == 0`), which would
+/// otherwise collapse the budget to 0 and produce degenerate one-item chunks.
 /// `utilization` is clamped to a sane `(0, 1]` band so a mis-typed CLI value
 /// can't zero out (or overflow) the budget.
 pub(crate) fn get_context_budget(model: &OpenAIModel, utilization: f64) -> usize {
-    let utilization = utilization.clamp(0.05, 1.0);
-    (model.config.max_input() as f64 * utilization) as _
+    knowdit_kg_model::context_budget(model.config.max_input(), utilization)
 }
 
 pub(crate) fn sanitize_prompt_prefix(value: &str) -> String {

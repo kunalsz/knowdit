@@ -295,8 +295,10 @@ impl<T> AgentChunkRunner<T> {
             AgentConfig::default().sequential_toolcall(),
         );
 
-        let initial = agent
-            .step_with_user(
+        let mut truncation = crate::agent_retry::TruncationRetry::default();
+        let initial = truncation
+            .first_step_with_user(
+                &mut agent,
                 user_prompt,
                 &llm,
                 options.debug_prefix.as_deref(),
@@ -321,16 +323,33 @@ impl<T> AgentChunkRunner<T> {
                 ));
                 break;
             }
-            step = agent
+            match truncation
                 .step(
+                    &mut agent,
                     &llm,
                     options.debug_prefix.as_deref(),
                     options.llm_settings.clone(),
                 )
                 .await
-                .map_err(|err| {
-                    KgError::other(format!("{label} agent step #{steps} failed: {err}"))
-                })?;
+            {
+                Ok(result) => step = result,
+                // Truncation retries exhausted: end the run gracefully with a
+                // reason, keeping whatever the buffer already collected, rather
+                // than failing the whole phase for one over-long response.
+                Err(err) if crate::agent_retry::is_output_length(&err) => {
+                    early_stop = Some(format!(
+                        "response truncated by the provider output cap {} times in a row at step \
+                         {steps}; raise --llm-max-completion-tokens",
+                        truncation.consecutive_failures()
+                    ));
+                    break;
+                }
+                Err(err) => {
+                    return Err(KgError::other(format!(
+                        "{label} agent step #{steps} failed: {err}"
+                    )));
+                }
+            }
             steps += 1;
         }
 

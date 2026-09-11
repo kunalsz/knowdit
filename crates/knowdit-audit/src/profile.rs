@@ -119,8 +119,10 @@ impl ProjectProfileGenerator {
         let debug_prefix = self.options.debug_prefix.clone();
         let mut agent = Agent::new(system_prompt, tools, cache_key);
 
-        let mut step = agent
-            .step_with_user(
+        let mut truncation = knowdit_kg::agent_retry::TruncationRetry::default();
+        let mut step = truncation
+            .first_step_with_user(
+                &mut agent,
                 user_prompt,
                 llm,
                 debug_prefix.as_deref(),
@@ -144,14 +146,29 @@ impl ProjectProfileGenerator {
                 ));
             }
             steps += 1;
-            step = agent
+            match truncation
                 .step(
+                    &mut agent,
                     llm,
                     debug_prefix.as_deref(),
                     self.options.llm_settings.clone(),
                 )
                 .await
-                .wrap_err_with(|| format!("profile-gen: agent failed at step {steps}"))?;
+            {
+                Ok(result) => step = result,
+                Err(err) if knowdit_kg::agent_retry::is_output_length(&err) => {
+                    return Err(eyre!(
+                        "profile-gen: response truncated by the provider output cap {} times in a \
+                         row at step {steps}; raise --llm-max-completion-tokens or use a model with \
+                         a larger output limit",
+                        truncation.consecutive_failures(),
+                    ));
+                }
+                Err(err) => {
+                    return Err(err)
+                        .wrap_err_with(|| format!("profile-gen: agent failed at step {steps}"));
+                }
+            }
         }
 
         let profile = attempt

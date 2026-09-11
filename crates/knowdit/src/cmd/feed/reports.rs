@@ -179,7 +179,7 @@ impl ReportsArgs {
                 .await?;
         }
 
-        let llm = self.llm.to_llm().await;
+        let llm = crate::llm::provider_compat(self.llm.to_llm().await);
         let batch_size = if self.batch_size == 0 {
             md_files.len()
         } else {

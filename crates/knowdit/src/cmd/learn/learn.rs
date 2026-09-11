@@ -129,7 +129,7 @@ impl LearnArgs {
         self.merge.validate()?;
         self.finding_link.validate()?;
 
-        let llm = self.llm.clone().to_llm().await;
+        let llm = crate::llm::provider_compat(self.llm.clone().to_llm().await);
         let mut all_projects = Vec::new();
 
         for spec in &self.projects {
@@ -160,7 +160,7 @@ impl LearnC4Args {
         self.merge.validate()?;
         self.finding_link.validate()?;
 
-        let llm = self.llm.clone().to_llm().await;
+        let llm = crate::llm::provider_compat(self.llm.clone().to_llm().await);
         let mut all_projects = Vec::new();
 
         let contest_ids: Vec<u32> = if !self.c4_ids.is_empty() {
@@ -219,7 +219,7 @@ impl LearnMovesArgs {
         self.merge.validate()?;
         self.finding_link.validate()?;
 
-        let llm = self.llm.clone().to_llm().await;
+        let llm = crate::llm::provider_compat(self.llm.clone().to_llm().await);
         let platforms: Vec<MovePlatform> = self.platforms.iter().copied().map(Into::into).collect();
         let audit_reports =
             knowdit_kg::project_loader::load_move_audit_reports(&self.moves_dir, &platforms)?;
@@ -333,7 +333,7 @@ impl LearnSherlockArgs {
         self.merge.validate()?;
         self.finding_link.validate()?;
 
-        let llm = self.llm.clone().to_llm().await;
+        let llm = crate::llm::provider_compat(self.llm.clone().to_llm().await);
 
         let mut ids: Vec<u32> = if !self.sherlock_ids.is_empty() {
             self.sherlock_ids.clone()

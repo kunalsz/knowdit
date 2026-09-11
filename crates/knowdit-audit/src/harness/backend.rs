@@ -104,11 +104,13 @@ pub trait HarnessBackend: Send + Sync {
     /// to attach codegen before the atomic `write_full_spec_regen`
     /// commits both the spec row and the codegen row in one
     /// transaction.
+    #[allow(clippy::too_many_arguments)]
     fn codegen_for_in_memory_spec(
         &self,
         repo: &RepoDatabase,
         llm: &LLM,
         extract_id: i32,
+        historical_id: i32,
         finding_id: i32,
         spec: AuditSpecification,
         synthetic_spec_id: i32,

@@ -2893,6 +2893,7 @@ version = "1.0.1"
 dependencies = [
  "color-eyre",
  "knowdit-kg",
+ "knowdit-kg-model",
  "knowdit-repo-model",
  "knowdit-sol",
  "llmy",

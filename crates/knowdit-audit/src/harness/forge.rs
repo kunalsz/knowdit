@@ -45,9 +45,27 @@ fn tail_utf8(s: &str, max_bytes: usize) -> &str {
 
 use color_eyre::eyre::{Result, WrapErr, eyre};
 use tokio::process::Command;
+use tokio::sync::Mutex;
 
 #[cfg(target_os = "linux")]
 use super::cgroup::ScopedCgroup;
+
+/// Process-global serialization of `forge` subprocesses.
+///
+/// Every link's `RunForgeTool` points at the *same* project directory, so
+/// all of them share `out/` and `cache/solidity-files-cache.json`. Foundry
+/// writes that cache non-atomically and without a file lock, so two
+/// concurrent `forge` processes on one project can observe a half-written
+/// cache (a spurious parse/compile error) or clobber each other's entries
+/// (wasted recompiles). Holding this lock for the whole spawn→wait keeps
+/// forge's on-disk build state consistent regardless of how many link
+/// pipelines are in flight.
+///
+/// Only the forge subprocess serializes — the LLM-driven phases
+/// (gen-spec, reflect, regen) still run concurrently, which is where the
+/// wall-clock is actually spent. Forge itself already parallelizes across
+/// cores internally, so running several at once oversubscribes the box.
+static FORGE_LOCK: Mutex<()> = Mutex::const_new(());
 
 /// One forge invocation backend = how to spawn `forge <args>`. The
 /// outer [`ForgeBackend`] owns this plus a probed [`ForgeFeatures`]
@@ -430,7 +448,12 @@ impl ForgeRunner {
     /// Spawn `forge args...` and return [`ForgeOutput`]. Hard-bounded by
     /// `self.timeout` — if exceeded the handle is dropped and the
     /// per-backend cleanup fires (kill child / docker kill / cgroup.kill).
+    ///
+    /// The whole spawn→wait is serialized against every other `ForgeRunner`
+    /// in this process via [`FORGE_LOCK`], because all links share one
+    /// project's `out/` + build cache (see the lock's docs).
     pub async fn run(&self, args: &[String]) -> Result<ForgeOutput> {
+        let _forge_guard = FORGE_LOCK.lock().await;
         let start = Instant::now();
         let handle = self.spawn(args)?;
         let timeout = self.timeout;
