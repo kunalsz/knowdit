@@ -47,7 +47,56 @@ pub struct LinkCandidate {
     pub pre_committed_spec_ids: Vec<i32>,
 }
 
+/// One historical finding inside a pair-mode hint pack. `pack[0]` is the
+/// anchor (strongest edge) and is mirrored into [`LinkInput`]'s top-level
+/// `finding*` fields; the rest are additional topic hints presented to the
+/// same agent run.
+#[derive(Debug, Clone)]
+pub struct PackHint {
+    /// `historical_finding.id` — the attribution target a pair-mode agent
+    /// names in `commit_specification.related_finding_id`.
+    pub finding_id: i32,
+    /// Global-linker strength on the `(historical, finding)` edge.
+    pub link_strength: LinkStrength,
+    pub finding: audit_finding::Model,
+    pub finding_rendered_description: String,
+    pub finding_rendered_patterns: String,
+    pub finding_rendered_exploits: String,
+}
+
+impl PackHint {
+    /// Build one pack hint from the record's linked finding, rendering the
+    /// prompt strings with the same mirror-or-raw fallback as
+    /// [`LinkInput::materialize`].
+    pub fn from_linked(linked: &HistoricalLinkedFinding) -> Self {
+        Self {
+            finding_id: linked.finding.id,
+            link_strength: linked.strength,
+            finding: linked.finding.clone(),
+            finding_rendered_description: rendered_or(
+                &linked.rendered_description,
+                &linked.finding.description,
+            ),
+            finding_rendered_patterns: rendered_or(
+                &linked.rendered_patterns,
+                &linked.finding.patterns,
+            ),
+            finding_rendered_exploits: rendered_or(
+                &linked.rendered_exploits,
+                &linked.finding.exploits,
+            ),
+        }
+    }
+}
+
 /// One expanded `(extract, historical, finding)` link ready to run.
+///
+/// In per-finding granularity (the default) `pack` is empty and the fields
+/// above describe the single link. In pair granularity the unit of work is
+/// one `(extract, historical)` pair: `finding*` carry the **anchor** hint
+/// (pack member 0) so every consumer keyed on the link triple keeps working,
+/// and `pack` carries the full diversified hint pack (anchor included at
+/// index 0) presented to the one agent run.
 #[derive(Debug, Clone)]
 pub struct LinkInput {
     pub extract_id: i32,
@@ -57,9 +106,8 @@ pub struct LinkInput {
     /// pair, copied onto every LinkInput fanned out from that pair. Used by
     /// gen-specs to filter / order candidates by strength.
     pub strength: MatchStrength,
-    /// Global linker-emitted strength on the `(historical, finding)` edge —
-    /// how directly this historical finding instantiates the historical
-    /// semantic. Independent axis from `strength`.
+    /// Global linker-emitted strength on the `(historical, finding)` edge of
+    /// the anchor finding.
     pub link_strength: LinkStrength,
     pub extract: ExtractedSemantic,
     pub historical: semantic_node::Model,
@@ -78,7 +126,20 @@ pub struct LinkInput {
     /// the gen-spec agent and synthesizes an outcome from these ids so the
     /// caller drives fuzz / reflect / regen against them. Populated from
     /// [`crate::RepoDatabase::link_resume_state`].
+    ///
+    /// Pair mode reuses this for the drain-only case (every pack member
+    /// already resumed). A **mixed** pair (some members pending, some
+    /// committed) keeps this non-empty AND `pack` non-empty: the agent runs
+    /// for the pending members, then the runner merges these ids into the
+    /// outcome so the caller drains everything.
     pub pre_committed_spec_ids: Vec<i32>,
+    /// Pair-mode hint pack (anchor at index 0). Empty in per-finding
+    /// granularity.
+    pub pack: Vec<PackHint>,
+    /// Pair mode: summaries of specs already committed for this pair in prior
+    /// runs (capped) — rendered into the anti-duplication prompt section.
+    /// Empty in per-finding granularity and for fresh pairs.
+    pub prior_committed_summaries: Vec<String>,
 }
 
 /// Pick the mirror-rendered value, or fall back to the raw canonical field when
@@ -136,7 +197,43 @@ impl LinkInput {
             historical: record.semantic.clone(),
             finding: finding.clone(),
             pre_committed_spec_ids: Vec::new(),
+            pack: Vec::new(),
+            prior_committed_summaries: Vec::new(),
         }
+    }
+
+    /// Build one pair-mode [`LinkInput`] from an ordered hint pack (`pack[0]`
+    /// is the anchor) plus the already-resolved anchor member. All members
+    /// must belong to the same `(extract, historical)` pair; the top-level
+    /// link fields mirror the anchor so every triple-keyed consumer keeps
+    /// working unchanged.
+    pub fn materialize_pair(
+        extract_id: i32,
+        historical_id: i32,
+        anchor: &HistoricalLinkedFinding,
+        pack: Vec<PackHint>,
+        prior_committed_summaries: Vec<String>,
+        strength: MatchStrength,
+        extract: &ExtractedSemantic,
+        record: &HistoricalSemanticRecord,
+    ) -> Self {
+        debug_assert!(
+            pack.first().is_none_or(|first| first.finding_id == anchor.finding.id),
+            "pair pack must start with the anchor finding"
+        );
+        let mut link = Self::materialize(
+            extract_id,
+            historical_id,
+            anchor.finding.id,
+            strength,
+            anchor.strength,
+            extract,
+            record,
+            anchor,
+        );
+        link.pack = pack;
+        link.prior_committed_summaries = prior_committed_summaries;
+        link
     }
 
     /// Exact materialization for one `(E, H, F)` identity. Locates the linked
@@ -235,9 +332,14 @@ impl fmt::Display for LinkInput {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "Link(id={}, extract={}, historical={}, finding={}, strength={})",
+            "Link(id={}, extract={}, historical={}, finding={}, strength={}",
             self.extract_id, self.extract_id, self.historical_id, self.finding_id, self.strength,
-        )
+        )?;
+        if self.pack.is_empty() {
+            write!(f, ")")
+        } else {
+            write!(f, ", pack={})", self.pack.len())
+        }
     }
 }
 

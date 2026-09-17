@@ -25,6 +25,12 @@ pub enum CodeGenStatus {
     /// The agent itself failed (LLM error, internal panic, etc.).
     #[sea_orm(string_value = "AgentError")]
     AgentError,
+    /// Judged a semantic duplicate of an already-validated spec for the same
+    /// `(extract, historical)` pair by the novelty gate. Recorded as a
+    /// terminal row (no harness, no runs) so resume / fuzz / regen skip the
+    /// spec while the DB keeps the full exploration record.
+    #[sea_orm(string_value = "Duplicate")]
+    Duplicate,
 }
 
 impl CodeGenStatus {
@@ -34,14 +40,17 @@ impl CodeGenStatus {
             Self::Abandoned => "Abandoned",
             Self::StepsExhausted => "StepsExhausted",
             Self::AgentError => "AgentError",
+            Self::Duplicate => "Duplicate",
         }
     }
 
     /// Whether a successful resume should skip a spec with a row in this
-    /// state. Only `Completed` counts as "done" — abandoned/error states
-    /// retry on a future run.
+    /// state. `Completed` means the spec was fully validated; `Duplicate`
+    /// means the novelty gate judged it a semantic repeat of an
+    /// already-validated sibling — either way the spec is terminal and must
+    /// not be re-harnessed. Abandoned/error states retry on a future run.
     pub fn counts_as_resumable_skip(&self) -> bool {
-        matches!(self, Self::Completed)
+        matches!(self, Self::Completed | Self::Duplicate)
     }
 }
 

@@ -14,7 +14,7 @@
 //! from the static-analysis tables). It builds each spec incrementally
 //! through tool calls so failures are easier to attribute.
 
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
@@ -22,7 +22,7 @@ use color_eyre::eyre::{Result, WrapErr};
 use itertools::Itertools;
 use knowdit_kg_model::ExtractedSemantic;
 use knowdit_repo_model::{
-    HistoricalSemanticRecord, LinkCandidate, LinkResumeState, MatchStrength, RepoDatabase,
+    HistoricalSemanticRecord, LinkCandidate, LinkResumeState, MatchStrength, PackHint, RepoDatabase,
     SemanticMatchSet, repo::SpecificationRecord,
 };
 use llmy::agent::{LLMYError, StepResult};
@@ -38,11 +38,17 @@ use crate::types::AuditSpecification;
 
 mod backend;
 mod index;
+mod pack;
 mod prompt;
 mod tools;
+pub mod novelty;
 pub use backend::SpecBackend;
 pub use index::ProjectIndex;
-use prompt::{build_regen_prompt_extension, build_system_prompt, build_user_prompt};
+use prompt::{
+    build_pair_system_prompt, build_pair_user_prompt, build_regen_prompt_extension,
+    build_system_prompt, build_user_prompt,
+};
+pub(crate) use pack::{pack_fingerprint, select_pack, PackMember};
 pub(crate) use tools::{
     LookupCallGraphTool, LookupStateVariableXrefsTool, ReadContractSourceTool,
     ReadFunctionSourceTool,
@@ -119,6 +125,24 @@ pub enum LinkSource {
     External,
 }
 
+/// Work granularity for one Specification Generator pass.
+///
+/// * [`Self::Finding`] (default) — one agent run per
+///   `(extract, historical, finding)` link, the historical behavior.
+/// * [`Self::Pair`] — one agent run per `(extract, historical)` pair. The
+///   agent receives a diversified pack of up to
+///   [`SpecGenOptions::pack_size`] historical findings as parallel topic
+///   hints and attributes every committed spec to one pack member via
+///   `commit_specification.related_finding_id`, so downstream
+///   fuzz / resume / regen / review — all keyed on the
+///   `(extract, historical, finding)` triple — keep working unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SpecGranularity {
+    #[default]
+    Finding,
+    Pair,
+}
+
 /// Tunables for one Specification Generator pass.
 #[derive(Debug, Clone)]
 pub struct SpecGenOptions {
@@ -191,6 +215,21 @@ pub struct SpecGenOptions {
     /// externally-supplied reported findings to validate. Frames the gen-spec
     /// agent's system prompt; see [`LinkSource`].
     pub link_source: LinkSource,
+    /// Work granularity; see [`SpecGranularity`]. Pair mode additionally
+    /// requires [`LinkSource::Mapper`] — an externally reported finding is a
+    /// concrete claim to validate, not a topic hint, and must keep its own
+    /// dedicated run.
+    pub granularity: SpecGranularity,
+    /// Pair mode: maximum number of diversified findings in one pair's hint
+    /// pack. `0` is treated as `1` (degenerates to a single-hint run).
+    pub pack_size: usize,
+    /// Pair mode: soft cap on how many `AuditSpecification`s the one pair
+    /// agent may commit. Replaces `max_specs_per_link` for that run.
+    pub max_specs_per_pair: usize,
+    /// Pair mode: maximum agent steps for the single pair run. The pair agent
+    /// explores the same surface a whole per-finding batch would, so it needs
+    /// a larger budget than `max_agent_steps`.
+    pub pair_max_agent_steps: usize,
 }
 
 impl Default for SpecGenOptions {
@@ -213,6 +252,10 @@ impl Default for SpecGenOptions {
             min_link_strength: knowdit_kg_model::link_strength::LinkStrength::Medium,
             language_prompt_prefix: String::new(),
             link_source: LinkSource::Mapper,
+            granularity: SpecGranularity::Finding,
+            pack_size: 10,
+            max_specs_per_pair: 16,
+            pair_max_agent_steps: 96,
         }
     }
 }
@@ -238,11 +281,25 @@ pub struct LinkSpecOutcome {
     /// Historical semantic id, mirrored into the project DB.
     pub historical_id: i32,
     /// Historical finding id, mirrored into the project DB.
+    ///
+    /// Per-finding mode: the link's own finding. Pair mode: the **anchor**
+    /// pack member. It is the fallback attribution for any committed spec
+    /// that has no entry in [`Self::spec_finding_ids`].
     pub finding_id: i32,
     /// Whether the agent committed at least one spec.
     pub status: LinkSpecStatus,
     /// Specs the agent committed before finalizing.
     pub specifications: Vec<AuditSpecification>,
+    /// Per-spec attribution target (`historical_finding.id`), parallel to
+    /// [`Self::specifications`]. Populated by the pair-mode commit tool
+    /// (`related_finding_id`); shorter than `specifications` (or empty) means
+    /// the missing entries fall back to [`Self::finding_id`]. Always empty in
+    /// per-finding mode.
+    pub spec_finding_ids: Vec<i32>,
+    /// Pair mode: the full hint-pack member ids the run was planned with
+    /// (anchor first). Empty in per-finding mode. Drives the pair-named
+    /// snapshot file and the usage row's pack annotation.
+    pub pack_finding_ids: Vec<i32>,
     /// DB ids of `specifications` after the commit transaction succeeds.
     /// Populated by [`LinkSpecOutcome::commit`]; empty on commit failure or when
     /// `specifications` was empty.
@@ -268,19 +325,26 @@ impl LinkSpecOutcome {
             return;
         }
         let mut payload = Vec::with_capacity(self.specifications.len());
-        for spec in &self.specifications {
+        for (idx, spec) in self.specifications.iter().enumerate() {
+            // Per-spec attribution from the pair-mode commit tool; the link's
+            // own (anchor) finding is the fallback everywhere else.
+            let finding_id = self
+                .spec_finding_ids
+                .get(idx)
+                .copied()
+                .unwrap_or(self.finding_id);
             match serde_json::to_string(spec) {
                 Ok(json) => payload.push(SpecificationRecord {
                     semantic_id: self.extract_id,
                     historical_id: self.historical_id,
-                    finding_id: self.finding_id,
+                    finding_id,
                     specification_json: json,
                 }),
                 Err(err) => {
                     tracing::error!(
                         "failed to JSON-serialize spec for extract={} finding={}: {err:#}",
                         self.extract_id,
-                        self.finding_id
+                        finding_id
                     );
                     return;
                 }
@@ -433,6 +497,18 @@ impl PlannedLinkWork {
         self.link.key()
     }
 
+    /// True when this work item is a pair-mode run (hint pack present).
+    /// Schedulers use it to name snapshots and annotate usage rows.
+    pub fn is_pair(&self) -> bool {
+        !self.link.pack.is_empty()
+    }
+
+    /// The full hint-pack member ids for a pair run (anchor first); empty for
+    /// per-finding runs.
+    pub fn pack_finding_ids(&self) -> Vec<i32> {
+        self.link.pack.iter().map(|hint| hint.finding_id).collect()
+    }
+
     /// Run the claimed link end-to-end and commit any built specs to the
     /// project DB. Returns the populated `LinkSpecOutcome` with
     /// `specification_ids` filled in on success.
@@ -448,7 +524,13 @@ impl PlannedLinkWork {
     /// [`PlannedLinkWork::process`]); a per-link agent failure is folded into an
     /// `Abandoned` outcome so the scheduler keeps going.
     pub async fn run(self, repo: &RepoDatabase, llm: &LLM) -> Result<LinkSpecOutcome> {
-        if !self.link.pre_committed_spec_ids.is_empty() {
+        // Short-circuit when there is nothing for the agent to do: a
+        // per-finding Partial link, or a pair whose members have *all* already
+        // resumed (drain-only pair — empty pack, pre-committed ids to drain).
+        // A mixed pair (pending members + pre-committed ids) still runs the
+        // agent for the pending hints and merges the pre-committed ids below.
+        let pair_mode = !self.link.pack.is_empty();
+        if !self.link.pre_committed_spec_ids.is_empty() && !pair_mode {
             tracing::info!(
                 "Spec generator skipping gen-spec for resumed link={} (total = {}) {} — {} pre-committed spec(s)",
                 self.ordinal,
@@ -464,6 +546,8 @@ impl PlannedLinkWork {
                 status: LinkSpecStatus::Built,
                 specifications: Vec::new(),
                 specification_ids: self.link.pre_committed_spec_ids.clone(),
+                spec_finding_ids: Vec::new(),
+                pack_finding_ids: Vec::new(),
                 abort_reason: None,
                 final_summary: Some(
                     "resumed from existing spec rows; gen-spec agent skipped".to_string(),
@@ -474,6 +558,17 @@ impl PlannedLinkWork {
         }
         let mut outcome = self.process(llm).await?;
         outcome.commit(repo).await;
+        if pair_mode && !self.link.pre_committed_spec_ids.is_empty() {
+            // Mixed pair: the caller's inner cycle must drain the prior run's
+            // committed specs alongside the fresh ones.
+            let mut ids = outcome.specification_ids.clone();
+            for id in &self.link.pre_committed_spec_ids {
+                if !ids.contains(id) {
+                    ids.push(*id);
+                }
+            }
+            outcome.specification_ids = ids;
+        }
         Ok(outcome)
     }
 }
@@ -878,6 +973,47 @@ impl SpecRuntime {
         Some(link)
     }
 
+    /// Materialize one pair candidate into a pair-mode [`LinkInput`]: the
+    /// anchor fields mirror the pair's anchor member and `pack` carries every
+    /// pending member in planned order. Drain-only pairs (empty `members`)
+    /// materialize with an empty pack and pre-committed ids, so the runner
+    /// short-circuits straight to drain. Returns `None` when the pair's
+    /// source rows vanished.
+    fn materialize_pair(&self, candidate: &PairCandidate) -> Option<LinkInput> {
+        let extract = self.extracted_by_id.get(&candidate.extract_id)?;
+        let record = self.historical_by_id.get(&candidate.historical_id)?;
+        let linked = |finding_id: i32| -> Option<&knowdit_repo_model::HistoricalLinkedFinding> {
+            self.linked_finding(candidate.historical_id, finding_id)
+        };
+        // Pack hints follow the planned (selection) order; a member whose
+        // source rows vanished is skipped rather than failing the pair.
+        let mut pack: Vec<PackHint> = Vec::with_capacity(candidate.members.len());
+        for member in &candidate.members {
+            let Some(linked_member) = linked(member.key.finding_id) else {
+                continue;
+            };
+            pack.push(PackHint::from_linked(linked_member));
+        }
+        // Anchor: first pending member, else the pair's identity anchor.
+        let anchor_id = pack
+            .first()
+            .map(|hint| hint.finding_id)
+            .unwrap_or(candidate.anchor_finding_id);
+        let anchor = linked(anchor_id)?;
+        let mut link = LinkInput::materialize_pair(
+            candidate.extract_id,
+            candidate.historical_id,
+            anchor,
+            pack,
+            candidate.prior_summaries.clone(),
+            candidate.match_strength,
+            extract,
+            record,
+        );
+        link.pre_committed_spec_ids = candidate.pre_committed_spec_ids.clone();
+        Some(link)
+    }
+
     /// Resolve a single link by exact `(E, H, F)` identity, **independent of
     /// the generation strength thresholds**. Used by regen: a link that would
     /// be filtered out of a fresh planning pass (e.g. `Low`/`Low`) must still
@@ -927,6 +1063,58 @@ impl SpecRuntime {
     }
 }
 
+/// One pending work item in the plan: a single `(extract, historical,
+/// finding)` link (per-finding granularity) or a whole `(extract,
+/// historical)` pair with a diversified hint pack (pair granularity).
+#[derive(Debug, Clone)]
+pub(crate) enum PendingWork {
+    Finding(LinkCandidate),
+    Pair(PairCandidate),
+}
+
+impl PendingWork {
+    /// Anchor link key: the link itself, or the pair's anchor finding (the
+    /// strongest pending member, falling back to the strongest overall member
+    /// for drain-only pairs). Used for ordering, logging, and snapshots.
+    pub(crate) fn anchor_key(&self) -> LinkKey {
+        match self {
+            PendingWork::Finding(candidate) => candidate.key,
+            PendingWork::Pair(pair) => LinkKey {
+                extract_id: pair.extract_id,
+                historical_id: pair.historical_id,
+                finding_id: pair.anchor_finding_id,
+            },
+        }
+    }
+}
+
+/// Light pair-mode plan unit: one `(extract, historical)` pair, its pending
+/// hint-pack members (post selection, anchor first), and everything needed to
+/// resume / drain already-committed work without re-running the agent.
+#[derive(Debug, Clone)]
+pub(crate) struct PairCandidate {
+    pub extract_id: i32,
+    pub historical_id: i32,
+    pub match_strength: MatchStrength,
+    /// Pending (NotStarted) pack members after selection, in final pack order
+    /// (anchor first). Empty for a drain-only pair (every member already
+    /// resumed with committed spec rows).
+    pub members: Vec<LinkCandidate>,
+    /// Strongest member overall (pending or resumed) — the pair's identity
+    /// for snapshots / usage rows even when no pending member remains.
+    pub anchor_finding_id: i32,
+    /// Max member link rank — the scheduling bucket key, kept stable whether
+    /// or not members already resumed.
+    pub order_link_rank: u8,
+    /// Spec ids committed by Partial members in a prior run. Drained by the
+    /// caller without re-running the agent; a pair with these but no pending
+    /// members short-circuits straight to drain.
+    pub pre_committed_spec_ids: Vec<i32>,
+    /// Summaries of specs already committed for this pair (prior runs, any
+    /// member), capped — anti-duplication context for the agent.
+    pub prior_summaries: Vec<String>,
+}
+
 /// Stateful one-shot link plan. `prepare` performs strength filtering, compact
 /// candidate expansion, resume resolution, quota enforcement, fairness
 /// ordering, and total truncation **once**; [`Self::take_batch`] then only
@@ -937,7 +1125,7 @@ impl SpecRuntime {
 /// `attempted` set is needed.
 pub struct PreparedLinkPlan {
     runtime: SpecRuntime,
-    pending: VecDeque<LinkCandidate>,
+    pending: VecDeque<PendingWork>,
     planned_total: usize,
     matched_extract_count: usize,
     historical_finding_total: usize,
@@ -956,111 +1144,21 @@ impl PreparedLinkPlan {
             None => return Ok(None),
         };
 
-        // 1. Expand compact candidates, deduplicating exact (E, H, F).
-        let mut candidates: Vec<LinkCandidate> = Vec::new();
-        let mut seen: HashSet<LinkKey> = HashSet::new();
-        for (pair, match_strength) in &runtime.match_strength_by_pair {
-            let (extract_id, historical_id) = *pair;
-            let Some(record) = runtime.historical_by_id.get(&historical_id) else {
-                continue;
-            };
-            if !runtime.extracted_by_id.contains_key(&extract_id) {
-                continue;
+        let pending: VecDeque<PendingWork> = match options.granularity {
+            SpecGranularity::Finding => {
+                let candidates = prepare_finding_candidates(repo, &runtime, options).await?;
+                let raw_link_count = candidates.raw_count;
+                select_pending(candidates.items, options, raw_link_count)
+                    .into_iter()
+                    .map(PendingWork::Finding)
+                    .collect()
             }
-            for linked in &record.findings {
-                let key = LinkKey {
-                    extract_id,
-                    historical_id,
-                    finding_id: linked.finding.id,
-                };
-                if !seen.insert(key) {
-                    continue;
-                }
-                candidates.push(LinkCandidate {
-                    key,
-                    match_strength: *match_strength,
-                    link_strength: linked.strength,
-                    pre_committed_spec_ids: Vec::new(),
-                });
+            SpecGranularity::Pair => {
+                let candidates =
+                    prepare_pair_candidates(repo, &runtime, options).await?;
+                select_pending_pairs(candidates, options)
             }
-        }
-        let raw_link_count = candidates.len();
-
-        // 2. Strength thresholds (before any cap, so filtered links never
-        //    consume a quota slot).
-        let min_rank = options.min_strength.rank();
-        let pre_strength = candidates.len();
-        candidates.retain(|c| c.match_strength.rank() >= min_rank);
-        if candidates.len() != pre_strength {
-            tracing::info!(
-                "Specification Generator strength filter (min={}): {} → {} link(s)",
-                options.min_strength,
-                pre_strength,
-                candidates.len(),
-            );
-        }
-        let min_link_rank = options.min_link_strength.rank();
-        let pre_link_strength = candidates.len();
-        candidates.retain(|c| c.link_strength.rank() >= min_link_rank);
-        if candidates.len() != pre_link_strength {
-            tracing::info!(
-                "Specification Generator link-strength filter (min={}): {} → {} link(s)",
-                options.min_link_strength.as_str(),
-                pre_link_strength,
-                candidates.len(),
-            );
-        }
-
-        // 3. Resume resolution in bounded chunks. `--regenerate` clears the
-        //    specification table exactly once here (never in `take_batch`), and
-        //    skips resume loading entirely.
-        if options.regenerate {
-            repo.reset_for_regenerate()
-                .await
-                .wrap_err("failed to reset downstream pipeline before regenerate")?;
-            tracing::info!(
-                "Specification Generator: --regenerate set, reset specs + downstream pipeline"
-            );
-        } else {
-            const RESUME_CHUNK: usize = 2_048;
-            let before = candidates.len();
-            let mut kept: Vec<LinkCandidate> = Vec::with_capacity(before);
-            let mut dropped_built = 0usize;
-            let mut resumed_partial = 0usize;
-            for chunk in candidates.chunks(RESUME_CHUNK) {
-                let keys: Vec<LinkKey> = chunk.iter().map(|c| c.key).collect();
-                let states = repo
-                    .load_link_resume_states(&keys)
-                    .await
-                    .wrap_err("failed to resolve link resume states")?;
-                for candidate in chunk {
-                    match states.get(&candidate.key) {
-                        Some(LinkResumeState::Built) => dropped_built += 1,
-                        Some(LinkResumeState::Partial { spec_ids }) => {
-                            resumed_partial += 1;
-                            let mut candidate = candidate.clone();
-                            candidate.pre_committed_spec_ids = spec_ids.clone();
-                            kept.push(candidate);
-                        }
-                        _ => kept.push(candidate.clone()),
-                    }
-                }
-            }
-            candidates = kept;
-            if dropped_built > 0 || resumed_partial > 0 {
-                tracing::info!(
-                    "Specification Generator resume: {} link(s) dropped (Built), {} link(s) resuming at inner cycle (Partial), {} link(s) remaining; {} → {} link(s) total",
-                    dropped_built,
-                    resumed_partial,
-                    candidates.len(),
-                    before,
-                    candidates.len(),
-                );
-            }
-        }
-
-        // 4-7. Strict strength buckets, fairness, quotas, total cap.
-        let pending = select_pending(candidates, options, raw_link_count);
+        };
 
         if pending.is_empty() {
             tracing::warn!("Specification Generator: no links to process after expansion");
@@ -1095,16 +1193,21 @@ impl PreparedLinkPlan {
     pub fn take_batch(&mut self, batch_links: NonZeroUsize) -> Vec<LinkInput> {
         let mut out = Vec::with_capacity(batch_links.get());
         while out.len() < batch_links.get() {
-            let Some(candidate) = self.pending.pop_front() else {
+            let Some(work) = self.pending.pop_front() else {
                 break;
             };
-            match self.runtime.materialize(&candidate) {
+            let key = work.anchor_key();
+            let materialized = match &work {
+                PendingWork::Finding(candidate) => self.runtime.materialize(candidate),
+                PendingWork::Pair(pair) => self.runtime.materialize_pair(pair),
+            };
+            match materialized {
                 Some(link) => out.push(link),
                 None => tracing::warn!(
                     "Specification Generator: dropping candidate (extract={}, historical={}, finding={}) — source rows missing",
-                    candidate.key.extract_id,
-                    candidate.key.historical_id,
-                    candidate.key.finding_id,
+                    key.extract_id,
+                    key.historical_id,
+                    key.finding_id,
                 ),
             }
         }
@@ -1131,7 +1234,7 @@ impl PreparedLinkPlan {
 
     /// Peek at the next pending candidate's key without materializing it.
     pub fn peek_key(&self) -> Option<LinkKey> {
-        self.pending.front().map(|c| c.key)
+        self.pending.front().map(PendingWork::anchor_key)
     }
 
     pub fn project_index(&self) -> Arc<ProjectIndex> {
@@ -1160,12 +1263,395 @@ impl PreparedLinkPlan {
             .sum();
         Self {
             runtime,
-            pending: candidates.into(),
+            pending: candidates
+                .into_iter()
+                .map(PendingWork::Finding)
+                .collect(),
             planned_total,
             matched_extract_count,
             historical_finding_total,
         }
     }
+}
+
+/// Per-finding candidate pipeline (steps 1–3 of the legacy plan): expand
+/// `(E, H, F)` candidates, apply both strength thresholds, then resolve
+/// resume states in bounded chunks. `--regenerate` resets the downstream
+/// pipeline exactly once here and skips resume loading.
+async fn prepare_finding_candidates(
+    repo: &RepoDatabase,
+    runtime: &SpecRuntime,
+    options: &SpecGenOptions,
+) -> Result<CandidateBundle> {
+    // 1. Expand compact candidates, deduplicating exact (E, H, F).
+    let mut candidates: Vec<LinkCandidate> = Vec::new();
+    let mut seen: HashSet<LinkKey> = HashSet::new();
+    for (pair, match_strength) in &runtime.match_strength_by_pair {
+        let (extract_id, historical_id) = *pair;
+        let Some(record) = runtime.historical_by_id.get(&historical_id) else {
+            continue;
+        };
+        if !runtime.extracted_by_id.contains_key(&extract_id) {
+            continue;
+        }
+        for linked in &record.findings {
+            let key = LinkKey {
+                extract_id,
+                historical_id,
+                finding_id: linked.finding.id,
+            };
+            if !seen.insert(key) {
+                continue;
+            }
+            candidates.push(LinkCandidate {
+                key,
+                match_strength: *match_strength,
+                link_strength: linked.strength,
+                pre_committed_spec_ids: Vec::new(),
+            });
+        }
+    }
+    let raw_link_count = candidates.len();
+
+    // 2. Strength thresholds (before any cap, so filtered links never
+    //    consume a quota slot).
+    let min_rank = options.min_strength.rank();
+    let pre_strength = candidates.len();
+    candidates.retain(|c| c.match_strength.rank() >= min_rank);
+    if candidates.len() != pre_strength {
+        tracing::info!(
+            "Specification Generator strength filter (min={}): {} → {} link(s)",
+            options.min_strength,
+            pre_strength,
+            candidates.len(),
+        );
+    }
+    let min_link_rank = options.min_link_strength.rank();
+    let pre_link_strength = candidates.len();
+    candidates.retain(|c| c.link_strength.rank() >= min_link_rank);
+    if candidates.len() != pre_link_strength {
+        tracing::info!(
+            "Specification Generator link-strength filter (min={}): {} → {} link(s)",
+            options.min_link_strength.as_str(),
+            pre_link_strength,
+            candidates.len(),
+        );
+    }
+
+    // 3. Resume resolution in bounded chunks.
+    let candidates = resolve_link_resume(repo, candidates, options).await?;
+    Ok(CandidateBundle {
+        items: candidates,
+        raw_count: raw_link_count,
+    })
+}
+
+struct CandidateBundle {
+    items: Vec<LinkCandidate>,
+    raw_count: usize,
+}
+
+/// Shared resume resolution for per-finding candidates: drops `Built` links,
+/// tags `Partial` links with their committed spec ids.
+async fn resolve_link_resume(
+    repo: &RepoDatabase,
+    mut candidates: Vec<LinkCandidate>,
+    options: &SpecGenOptions,
+) -> Result<Vec<LinkCandidate>> {
+    if options.regenerate {
+        repo.reset_for_regenerate()
+            .await
+            .wrap_err("failed to reset downstream pipeline before regenerate")?;
+        tracing::info!(
+            "Specification Generator: --regenerate set, reset specs + downstream pipeline"
+        );
+        return Ok(candidates);
+    }
+    const RESUME_CHUNK: usize = 2_048;
+    let before = candidates.len();
+    let mut kept: Vec<LinkCandidate> = Vec::with_capacity(before);
+    let mut dropped_built = 0usize;
+    let mut resumed_partial = 0usize;
+    for chunk in candidates.chunks(RESUME_CHUNK) {
+        let keys: Vec<LinkKey> = chunk.iter().map(|c| c.key).collect();
+        let states = repo
+            .load_link_resume_states(&keys)
+            .await
+            .wrap_err("failed to resolve link resume states")?;
+        for candidate in chunk {
+            match states.get(&candidate.key) {
+                Some(LinkResumeState::Built) => dropped_built += 1,
+                Some(LinkResumeState::Partial { spec_ids }) => {
+                    resumed_partial += 1;
+                    let mut candidate = candidate.clone();
+                    candidate.pre_committed_spec_ids = spec_ids.clone();
+                    kept.push(candidate);
+                }
+                _ => kept.push(candidate.clone()),
+            }
+        }
+    }
+    candidates = kept;
+    if dropped_built > 0 || resumed_partial > 0 {
+        tracing::info!(
+            "Specification Generator resume: {} link(s) dropped (Built), {} link(s) resuming at inner cycle (Partial), {} link(s) remaining; {} → {} link(s) total",
+            dropped_built,
+            resumed_partial,
+            candidates.len(),
+            before,
+            candidates.len(),
+        );
+    }
+    Ok(candidates)
+}
+
+/// Cap on the "already committed for this pair" context entries rendered into
+/// a resumed pair agent's prompt. Prior-run pairs can carry dozens of old
+/// per-link specs; the list is a dedup hint, not a syllabus.
+const PAIR_PRIOR_SUMMARY_CAP: usize = 20;
+
+/// Pair-mode candidate pipeline: group eligible edges per `(extract,
+/// historical)` pair, resolve resume states per member, then select a
+/// diversified hint pack over the still-pending members.
+///
+/// Member resume handling:
+/// * `Built` — dropped from the pack (its specs already have codegens).
+/// * `Partial` — dropped from the pack; its spec ids join the pair's
+///   drain-only `pre_committed_spec_ids`.
+/// * `NotStarted` — eligible for the pack.
+///
+/// A pair whose members are *all* resumed is dropped entirely when nothing
+/// is left to drain; one with only `Partial` members becomes a drain-only
+/// candidate (empty pack — the runner short-circuits the agent).
+async fn prepare_pair_candidates(
+    repo: &RepoDatabase,
+    runtime: &SpecRuntime,
+    options: &SpecGenOptions,
+) -> Result<Vec<PairCandidate>> {
+    if options.regenerate {
+        repo.reset_for_regenerate()
+            .await
+            .wrap_err("failed to reset downstream pipeline before regenerate")?;
+        tracing::info!(
+            "Specification Generator: --regenerate set, reset specs + downstream pipeline"
+        );
+    }
+    let min_rank = options.min_strength.rank();
+    let min_link_rank = options.min_link_strength.rank();
+    let pack_size = options.pack_size.max(1);
+    // Partial members' spec ids per pair, populated by resume resolution and
+    // consumed by candidate construction below.
+    let mut partial_ids: HashMap<(i32, i32), Vec<i32>> = HashMap::new();
+
+    // 1. Group eligible members per pair (strength-filtered, light).
+    let mut drafts: Vec<PairDraft> = Vec::new();
+    let mut raw_member_count = 0usize;
+    let mut raw_pair_count = 0usize;
+    for (&(extract_id, historical_id), &match_strength) in &runtime.match_strength_by_pair {
+        if match_strength.rank() < min_rank {
+            continue;
+        }
+        let Some(record) = runtime.historical_by_id.get(&historical_id) else {
+            continue;
+        };
+        if !runtime.extracted_by_id.contains_key(&extract_id) {
+            continue;
+        }
+        let members: Vec<PackMember> = record
+            .findings
+            .iter()
+            .filter(|linked| linked.strength.rank() >= min_link_rank)
+            .map(|linked| {
+                raw_member_count += 1;
+                PackMember {
+                    finding_id: linked.finding.id,
+                    link_strength: linked.strength,
+                    title: linked.finding.title.clone(),
+                    root_cause: linked.finding.root_cause.clone(),
+                    description: linked.finding.description.clone(),
+                }
+            })
+            .collect();
+        if members.is_empty() {
+            continue;
+        }
+        raw_pair_count += 1;
+        // Strongest member overall (pre-resume) anchors the pair's identity
+        // and scheduling bucket even when every member has already resumed.
+        let strongest = members
+            .iter()
+            .max_by_key(|member| (member.link_strength.rank(), std::cmp::Reverse(member.finding_id)))
+            .expect("members is non-empty")
+            .clone();
+        drafts.push(PairDraft {
+            extract_id,
+            historical_id,
+            match_strength,
+            members,
+            anchor_finding_id: strongest.finding_id,
+            order_link_rank: strongest.link_strength.rank(),
+            prior_summaries: Vec::new(),
+        });
+    }
+    if raw_pair_count > 0 && options.max_findings_per_historical.is_some() {
+        tracing::info!(
+            "Specification Generator pair mode: --gen-specs-max-findings-per-historical is ignored (the {}-finding pack per pair is the cap)",
+            pack_size
+        );
+    }
+
+    // 2. Resume resolution per member, in bounded chunks.
+    if !options.regenerate {
+        let all_keys: Vec<LinkKey> = drafts
+            .iter()
+            .flat_map(|draft| {
+                draft.members.iter().map(|member| LinkKey {
+                    extract_id: draft.extract_id,
+                    historical_id: draft.historical_id,
+                    finding_id: member.finding_id,
+                })
+            })
+            .collect();
+        const RESUME_CHUNK: usize = 2_048;
+        let mut resumed: HashMap<LinkKey, LinkResumeState> = HashMap::new();
+        for chunk in all_keys.chunks(RESUME_CHUNK) {
+            let states = repo
+                .load_link_resume_states(chunk)
+                .await
+                .wrap_err("failed to resolve pair member resume states")?;
+            resumed.extend(states);
+        }
+        let mut resumed_members = 0usize;
+        for draft in &mut drafts {
+            let pair_id = (draft.extract_id, draft.historical_id);
+            draft.members.retain(|member| {
+                match resumed.get(&LinkKey {
+                    extract_id: pair_id.0,
+                    historical_id: pair_id.1,
+                    finding_id: member.finding_id,
+                }) {
+                    Some(LinkResumeState::Built) => {
+                        resumed_members += 1;
+                        false
+                    }
+                    Some(LinkResumeState::Partial { spec_ids }) => {
+                        resumed_members += 1;
+                        partial_ids
+                            .entry(pair_id)
+                            .or_default()
+                            .extend(spec_ids.iter().copied());
+                        false
+                    }
+                    _ => true,
+                }
+            });
+        }
+        // Drop pairs with nothing pending and nothing to drain.
+        drafts.retain(|draft| {
+            !draft.members.is_empty()
+                || partial_ids.contains_key(&(draft.extract_id, draft.historical_id))
+        });
+        if resumed_members > 0 {
+            tracing::info!(
+                "Specification Generator pair resume: {} member link(s) already built or partial — excluded from pack selection",
+                resumed_members
+            );
+        }
+
+        // 3. Anti-duplication context: summaries of specs already committed
+        //    for the pairs that have any resumed history.
+        let pairs_needing_context: Vec<(i32, i32)> = drafts
+            .iter()
+            .filter(|draft| partial_ids.contains_key(&(draft.extract_id, draft.historical_id)))
+            .map(|draft| (draft.extract_id, draft.historical_id))
+            .collect();
+        // A fully-drained (all-Partial) pair also deserves the context.
+        let summaries = repo
+            .load_pair_spec_summaries(&pairs_needing_context)
+            .await
+            .wrap_err("failed to load prior pair spec summaries")?;
+        for draft in &mut drafts {
+            let pair_id = (draft.extract_id, draft.historical_id);
+            let mut rows = summaries.get(&pair_id).cloned().unwrap_or_default();
+            rows.sort_by_key(|(id, _)| *id);
+            draft.prior_summaries = rows
+                .into_iter()
+                .map(|(_, summary)| summary)
+                .filter(|summary| !summary.trim().is_empty())
+                .take(PAIR_PRIOR_SUMMARY_CAP)
+                .collect();
+        }
+    }
+
+    // 4. Pack selection over the pending members of each surviving pair.
+    let mut candidates = Vec::with_capacity(drafts.len());
+    for draft in drafts {
+        let selection = select_pack(&draft.members, pack_size);
+        let by_id: HashMap<i32, &PackMember> = draft
+            .members
+            .iter()
+            .map(|member| (member.finding_id, member))
+            .collect();
+        let members: Vec<LinkCandidate> = selection
+            .members
+            .iter()
+            .filter_map(|finding_id| {
+                let member = by_id.get(finding_id)?;
+                Some(LinkCandidate {
+                    key: LinkKey {
+                        extract_id: draft.extract_id,
+                        historical_id: draft.historical_id,
+                        finding_id: *finding_id,
+                    },
+                    match_strength: draft.match_strength,
+                    link_strength: member.link_strength,
+                    pre_committed_spec_ids: Vec::new(),
+                })
+            })
+            .collect();
+        if !selection.deduped.is_empty() {
+            tracing::debug!(
+                "Specification Generator pair (extract={}, historical={}): {} member(s) dropped as exact-title duplicates",
+                draft.extract_id,
+                draft.historical_id,
+                selection.deduped.len()
+            );
+        }
+        let pair_id = (draft.extract_id, draft.historical_id);
+        let mut pre_committed_spec_ids =
+            partial_ids.get(&pair_id).cloned().unwrap_or_default();
+        pre_committed_spec_ids.sort_unstable();
+        pre_committed_spec_ids.dedup();
+        candidates.push(PairCandidate {
+            extract_id: draft.extract_id,
+            historical_id: draft.historical_id,
+            match_strength: draft.match_strength,
+            members,
+            anchor_finding_id: draft.anchor_finding_id,
+            order_link_rank: draft.order_link_rank,
+            pre_committed_spec_ids,
+            prior_summaries: draft.prior_summaries,
+        });
+    }
+    tracing::info!(
+        "Specification Generator pair plan: {} pair(s) from {} eligible member link(s) (pack size cap {})",
+        candidates.len(),
+        raw_member_count,
+        pack_size
+    );
+    Ok(candidates)
+}
+
+/// Scratch pair during candidate preparation. `members` shrinks to the
+/// still-pending subset after resume resolution.
+struct PairDraft {
+    extract_id: i32,
+    historical_id: i32,
+    match_strength: MatchStrength,
+    members: Vec<PackMember>,
+    anchor_finding_id: i32,
+    order_link_rank: u8,
+    prior_summaries: Vec<String>,
 }
 
 /// Consume `candidates` from strongest to weakest `(match, link)` bucket,
@@ -1279,6 +1765,96 @@ fn select_pending(
         );
     }
 
+    selected
+}
+
+/// Pair-mode twin of [`select_pending`]: same strict strength buckets and
+/// extract round-robin fairness, but the unit is a whole pair.
+///
+/// Buckets key on `(pair match rank, strongest member link rank)`; caps count
+/// **pairs** — `max_links` bounds total pairs this invocation claims and
+/// `max_links_per_extract` bounds pairs per extract. Per-extract fairness
+/// keeps one extract from monopolising the pair budget, mirroring the
+/// per-finding scheduler.
+fn select_pending_pairs(
+    candidates: Vec<PairCandidate>,
+    options: &SpecGenOptions,
+) -> VecDeque<PendingWork> {
+    // Bucket by (match_rank, best_member_link_rank); `.rev()` walks strongest
+    // pair first.
+    let mut buckets: BTreeMap<(u8, u8), BTreeMap<i32, Vec<PairCandidate>>> = BTreeMap::new();
+    for candidate in candidates {
+        buckets
+            .entry((candidate.match_strength.rank(), candidate.order_link_rank))
+            .or_default()
+            .entry(candidate.extract_id)
+            .or_default()
+            .push(candidate);
+    }
+
+    let per_e_cap = options.max_links_per_extract.filter(|n| *n > 0);
+    let max_links = options.max_links.filter(|n| *n > 0);
+
+    let mut selected: VecDeque<PendingWork> = VecDeque::new();
+    let mut per_e: BTreeMap<i32, usize> = BTreeMap::new();
+
+    'buckets: for by_extract in buckets.into_values().rev() {
+        // Deterministic order inside one extract: (historical_id, anchor).
+        let mut queues: BTreeMap<i32, VecDeque<PairCandidate>> = BTreeMap::new();
+        for (extract_id, mut queue) in by_extract {
+            queue.sort_by_key(|pair| (pair.historical_id, pair.anchor_finding_id));
+            queues.insert(extract_id, queue.into());
+        }
+
+        // Round-robin across extracts by ascending id; a candidate over the
+        // per-extract quota is dropped (quotas only grow) and consumes no slot.
+        loop {
+            let extract_ids: Vec<i32> = queues.keys().copied().collect();
+            if extract_ids.is_empty() {
+                break;
+            }
+            for extract_id in extract_ids {
+                let Some(queue) = queues.get_mut(&extract_id) else {
+                    continue;
+                };
+                while let Some(pair) = queue.pop_front() {
+                    if let Some(cap) = per_e_cap {
+                        let count = per_e.get(&extract_id).copied().unwrap_or(0);
+                        if count >= cap {
+                            continue;
+                        }
+                    }
+                    *per_e.entry(extract_id).or_insert(0) += 1;
+                    selected.push_back(PendingWork::Pair(pair));
+                    if let Some(cap) = max_links
+                        && selected.len() >= cap
+                    {
+                        break 'buckets;
+                    }
+                    break;
+                }
+                if queue.is_empty() {
+                    queues.remove(&extract_id);
+                }
+            }
+        }
+    }
+
+    if let Some(per_e_cap) = per_e_cap {
+        tracing::info!(
+            "Specification Generator pair capping at {} pair(s) per extract: {} pair(s) selected",
+            per_e_cap,
+            selected.len()
+        );
+    }
+    if let Some(cap) = max_links
+        && selected.len() >= cap
+    {
+        tracing::info!(
+            "Specification Generator truncated to {} pair(s) for this run",
+            cap
+        );
+    }
     selected
 }
 
@@ -1401,22 +1977,65 @@ impl PlannedLinkWork {
         let project_index = &self.project_index;
         let options = &self.options;
         let link_serial = self.ordinal;
+        let pair_mode = !link.pack.is_empty();
+        let pack_ids: Vec<i32> = link.pack.iter().map(|hint| hint.finding_id).collect();
         let memory = project_index.build_link_memory()?;
         let draft = tools::DraftHandle::new();
-        let tool_box = draft.build_tool_box(project_index, options.max_specs_per_link);
-
-        let cache_key = format!(
-            "{}-link{:04}-e{}-h{}-f{}",
-            options.cache_key, link_serial, link.extract_id, link.historical_id, link.finding_id
+        let max_specs = if pair_mode {
+            options.max_specs_per_pair
+        } else {
+            options.max_specs_per_link
+        };
+        let max_agent_steps = if pair_mode {
+            options.pair_max_agent_steps
+        } else {
+            options.max_agent_steps
+        };
+        let tool_box = draft.build_tool_box(
+            project_index,
+            max_specs,
+            pack_ids.clone(),
+            link.finding_id,
         );
-        let debug_prefix = options.debug_prefix.as_ref().map(|prefix| {
-            format!(
-                "{}-link{:04}-e{}-h{}-f{}",
-                prefix, link_serial, link.extract_id, link.historical_id, link.finding_id
-            )
-        });
 
-        let mut system_prompt = build_system_prompt(link, options.link_source);
+        let (cache_key, debug_prefix) = if pair_mode {
+            // Pair runs key on the pair identity + pack fingerprint: changing
+            // `--gen-specs-pack-size` (or the underlying edges) changes the
+            // fingerprint, so a cached run can never be replayed against a
+            // different prompt.
+            let fingerprint = pack_fingerprint(&pack_ids);
+            (
+                format!(
+                    "{}-pair{:04}-e{}-h{}-fp{}",
+                    options.cache_key, link_serial, link.extract_id, link.historical_id, fingerprint
+                ),
+                options.debug_prefix.as_ref().map(|prefix| {
+                    format!(
+                        "{}-pair{:04}-e{}-h{}-fp{}",
+                        prefix, link_serial, link.extract_id, link.historical_id, fingerprint
+                    )
+                }),
+            )
+        } else {
+            (
+                format!(
+                    "{}-link{:04}-e{}-h{}-f{}",
+                    options.cache_key, link_serial, link.extract_id, link.historical_id, link.finding_id
+                ),
+                options.debug_prefix.as_ref().map(|prefix| {
+                    format!(
+                        "{}-link{:04}-e{}-h{}-f{}",
+                        prefix, link_serial, link.extract_id, link.historical_id, link.finding_id
+                    )
+                }),
+            )
+        };
+
+        let mut system_prompt = if pair_mode {
+            build_pair_system_prompt(link, options.link_source)
+        } else {
+            build_system_prompt(link, options.link_source)
+        };
         if let Some(ext) = prompt_extension {
             system_prompt.push_str("\n\n");
             system_prompt.push_str(ext);
@@ -1463,7 +2082,11 @@ impl PlannedLinkWork {
             ),
         }
 
-        let user_prompt = build_user_prompt(link, project_index);
+        let user_prompt = if pair_mode {
+            build_pair_user_prompt(link, project_index)
+        } else {
+            build_user_prompt(link, project_index)
+        };
         let mut truncation = knowdit_kg::agent_retry::TruncationRetry::default();
         let mut step_result = truncation
             .first_step_with_user(
@@ -1493,13 +2116,18 @@ impl PlannedLinkWork {
                 break;
             }
 
-            if steps >= options.max_agent_steps {
+            if steps >= max_agent_steps {
                 let mut guard = draft.0.lock().await;
                 guard.final_status.get_or_insert(LinkSpecStatus::Abandoned);
                 guard.abort_reason.get_or_insert_with(|| {
                     format!(
-                        "agent exceeded max_agent_steps={} before finalizing",
-                        options.max_agent_steps
+                        "agent exceeded {}={} before finalizing",
+                        if pair_mode {
+                            "--gen-specs-pair-max-agent-steps"
+                        } else {
+                            "--gen-specs-max-agent-steps"
+                        },
+                        max_agent_steps
                     )
                 });
                 break;
@@ -1572,6 +2200,9 @@ impl PlannedLinkWork {
             finding_id: link.finding_id,
             status,
             specifications: snapshot.completed.clone(),
+            // Pair mode: per-spec attribution recorded by the commit tool.
+            spec_finding_ids: snapshot.completed_finding_ids.clone(),
+            pack_finding_ids: pack_ids,
             specification_ids: Vec::new(),
             abort_reason: snapshot.abort_reason.clone(),
             final_summary: snapshot.final_summary.clone(),
@@ -1636,6 +2267,8 @@ impl PlannedLinkWork {
                     finding_id: link.finding_id,
                     status: LinkSpecStatus::Abandoned,
                     specifications: Vec::new(),
+                    spec_finding_ids: Vec::new(),
+                    pack_finding_ids: link.pack.iter().map(|hint| hint.finding_id).collect(),
                     specification_ids: Vec::new(),
                     abort_reason: Some(format!("agent error: {err:#}")),
                     final_summary: None,
@@ -1948,6 +2581,126 @@ mod planner_tests {
             "compact threshold must be far above zero for an unknown model, got {threshold}"
         );
         assert!(knowdit_kg_model::using_fallback_window(model.config.max_input()));
+    }
+}
+
+mod pair_planner_tests {
+    use super::*;
+    use knowdit_kg_model::link_strength::LinkStrength;
+
+    fn pair_cand(
+        extract_id: i32,
+        historical_id: i32,
+        match_strength: MatchStrength,
+        members: Vec<(i32, LinkStrength)>,
+    ) -> PairCandidate {
+        let anchor = members
+            .iter()
+            .max_by_key(|(finding_id, strength)| (strength.rank(), std::cmp::Reverse(*finding_id)))
+            .map(|(finding_id, _)| *finding_id)
+            .expect("pair needs members");
+        let order_link_rank = members
+            .iter()
+            .map(|(_, strength)| strength.rank())
+            .max()
+            .expect("pair needs members");
+        PairCandidate {
+            extract_id,
+            historical_id,
+            match_strength,
+            members: members
+                .iter()
+                .map(|(finding_id, strength)| LinkCandidate {
+                    key: LinkKey {
+                        extract_id,
+                        historical_id,
+                        finding_id: *finding_id,
+                    },
+                    match_strength,
+                    link_strength: *strength,
+                    pre_committed_spec_ids: Vec::new(),
+                })
+                .collect(),
+            anchor_finding_id: anchor,
+            order_link_rank,
+            pre_committed_spec_ids: Vec::new(),
+            prior_summaries: Vec::new(),
+        }
+    }
+
+    fn pair_keys(selected: VecDeque<PendingWork>) -> Vec<(i32, i32)> {
+        selected
+            .into_iter()
+            .map(|work| match work {
+                PendingWork::Pair(pair) => (pair.extract_id, pair.historical_id),
+                PendingWork::Finding(_) => panic!("unexpected finding work in pair scheduler"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn strongest_pair_bucket_first_regardless_of_extract_id() {
+        let options = SpecGenOptions::default();
+        let candidates = vec![
+            pair_cand(1, 10, MatchStrength::Medium, vec![(1, LinkStrength::High)]),
+            pair_cand(2, 20, MatchStrength::High, vec![(2, LinkStrength::High)]),
+        ];
+        assert_eq!(
+            pair_keys(select_pending_pairs(candidates, &options)),
+            vec![(2, 20), (1, 10)],
+        );
+    }
+
+    #[test]
+    fn max_links_counts_pairs_not_members() {
+        let options = SpecGenOptions {
+            max_links: Some(2),
+            ..Default::default()
+        };
+        let candidates = vec![
+            pair_cand(
+                1,
+                10,
+                MatchStrength::High,
+                (1..=5).map(|f| (f, LinkStrength::High)).collect(),
+            ),
+            pair_cand(1, 11, MatchStrength::High, vec![(11, LinkStrength::High)]),
+            pair_cand(1, 12, MatchStrength::High, vec![(12, LinkStrength::High)]),
+        ];
+        assert_eq!(select_pending_pairs(candidates, &options).len(), 2);
+    }
+
+    #[test]
+    fn per_extract_cap_counts_pairs_across_buckets() {
+        let options = SpecGenOptions {
+            max_links_per_extract: Some(1),
+            ..Default::default()
+        };
+        let candidates = vec![
+            pair_cand(1, 10, MatchStrength::High, vec![(1, LinkStrength::High)]),
+            // Weaker bucket, same extract: must still be dropped by the cap.
+            pair_cand(1, 11, MatchStrength::Medium, vec![(2, LinkStrength::High)]),
+            pair_cand(2, 20, MatchStrength::Medium, vec![(3, LinkStrength::High)]),
+        ];
+        assert_eq!(
+            pair_keys(select_pending_pairs(candidates, &options)),
+            vec![(1, 10), (2, 20)],
+        );
+    }
+
+    #[test]
+    fn round_robins_extracts_within_bucket() {
+        let options = SpecGenOptions::default();
+        let candidates = vec![
+            pair_cand(1, 11, MatchStrength::High, vec![(111, LinkStrength::High)]),
+            pair_cand(2, 21, MatchStrength::High, vec![(221, LinkStrength::High)]),
+            pair_cand(1, 12, MatchStrength::High, vec![(112, LinkStrength::High)]),
+            pair_cand(2, 22, MatchStrength::High, vec![(222, LinkStrength::High)]),
+        ];
+        assert_eq!(
+            pair_keys(select_pending_pairs(candidates, &options)),
+            vec![(1, 11), (2, 21), (1, 12), (2, 22)],
+        );
     }
 }
 
@@ -2351,6 +3104,8 @@ mod planner_db_tests {
             finding_id: 1,
             status,
             specifications: specs,
+            spec_finding_ids: Vec::new(),
+            pack_finding_ids: Vec::new(),
             specification_ids: Vec::new(),
             abort_reason: None,
             final_summary: None,
@@ -2692,5 +3447,224 @@ mod planner_db_tests {
                 "RSS grew {growth_mb}MB planning+materializing real data"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn novelty_gate_duplicate_status_is_terminal_and_pair_scoped() {
+        let temp = temp_repo().await;
+        let repo = &temp.repo;
+        seed(
+            repo,
+            &[extract("e1")],
+            vec![historical(1, &[(1, LinkStrength::High)])],
+            vec![(1, 1, MatchStrength::High)],
+        )
+        .await;
+        let ids = mark_partial(repo, 1, 1, 1, 2).await;
+        assert!(
+            !repo
+                .loaded_completed_code_gen_spec_ids()
+                .await
+                .expect("terminal ids")
+                .contains(&ids[0]),
+            "spec rows without codegen are not terminal"
+        );
+
+        // A Duplicate codegen row is terminal: it enters the resume index
+        // (so fuzz/resume skip the spec) even though it has no harness.
+        let duplicate = CodeGenRecord {
+            core: CodeGenCore {
+                spec_id: ids[0],
+                harness_relative_path: String::new(),
+                harness_source: String::new(),
+                status: CodeGenStatus::Duplicate,
+                final_reason: "duplicate of spec 999 — same mechanism".to_string(),
+                agent_steps: 0,
+            },
+            runs: Vec::new(),
+        };
+        repo.write_code_gen_with_runs(&duplicate, &[])
+            .await
+            .expect("write duplicate codegen");
+        let terminal = repo
+            .loaded_completed_code_gen_spec_ids()
+            .await
+            .expect("terminal ids");
+        assert!(terminal.contains(&ids[0]));
+        assert!(!terminal.contains(&ids[1]), "sibling without codegen stays pending");
+
+        // Pair-scoped spec read: only this pair's rows, id-ascending.
+        let pair_specs = repo
+            .load_pair_specifications(1, 1)
+            .await
+            .expect("pair specs");
+        assert_eq!(pair_specs.len(), 2);
+        assert_eq!(pair_specs[0].id, ids[0]);
+        assert_eq!(pair_specs[1].id, ids[1]);
+        assert!(repo
+            .load_pair_specifications(1, 999)
+            .await
+            .expect("other pair")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn pair_plan_excludes_resumed_members_and_packs_the_rest() {
+        let temp = temp_repo().await;
+        let repo = &temp.repo;
+        seed(
+            &repo,
+            &[extract("e1")],
+            vec![historical(
+                1,
+                &[
+                    (1, LinkStrength::High),
+                    (2, LinkStrength::High),
+                    (3, LinkStrength::Medium),
+                    (4, LinkStrength::Medium),
+                ],
+            )],
+            vec![(1, 1, MatchStrength::High)],
+        )
+        .await;
+        // f1 fully built, f2 partial: both must leave the pack; f2's spec ids
+        // become the pair's drain-only pre-committed ids.
+        mark_built(&repo, 1, 1, 1).await;
+        let partial_ids = mark_partial(&repo, 1, 1, 2, 2).await;
+
+        let options = SpecGenOptions {
+            granularity: SpecGranularity::Pair,
+            pack_size: 2,
+            ..Default::default()
+        };
+        let mut plan = PreparedLinkPlan::prepare(&repo, &options)
+            .await
+            .expect("prepare")
+            .expect("pair plan present");
+        assert_eq!(plan.planned_total(), 1, "one pair despite four links");
+
+        let batch = plan.take_batch(NonZeroUsize::new(1).unwrap());
+        assert_eq!(batch.len(), 1);
+        let link = &batch[0];
+        assert_eq!(link.extract_id, 1);
+        assert_eq!(link.historical_id, 1);
+        // Anchor mirrors the strongest pending member (f3, lowest pending id
+        // at equal strength), and the pack carries both pending members.
+        assert_eq!(link.finding_id, 3);
+        let pack_ids: Vec<i32> = link.pack.iter().map(|hint| hint.finding_id).collect();
+        assert_eq!(pack_ids, vec![3, 4]);
+        // Anchor mirrors pack[0] so every triple-keyed consumer stays valid.
+        assert_eq!(link.pack[0].finding_id, link.finding_id);
+        assert_eq!(link.pre_committed_spec_ids, partial_ids);
+        assert_eq!(link.pack[0].finding_rendered_description, "finding 3 description");
+    }
+
+    #[tokio::test]
+    async fn pair_plan_drops_all_built_pairs_and_keeps_drain_only() {
+        let temp = temp_repo().await;
+        let repo = &temp.repo;
+        seed(
+            &repo,
+            &[extract("e1")],
+            vec![
+                historical(1, &[(1, LinkStrength::High), (2, LinkStrength::High)]),
+                historical(2, &[(3, LinkStrength::High)]),
+            ],
+            vec![(1, 1, MatchStrength::High), (1, 2, MatchStrength::High)],
+        )
+        .await;
+        // h1: everything built → pair dropped outright.
+        mark_built(&repo, 1, 1, 1).await;
+        mark_built(&repo, 1, 1, 2).await;
+        // h2: only partial → drain-only pair (empty pack, pre-committed ids).
+        let partial_ids = mark_partial(&repo, 1, 2, 3, 1).await;
+
+        let options = SpecGenOptions {
+            granularity: SpecGranularity::Pair,
+            pack_size: 4,
+            ..Default::default()
+        };
+        let plan = PreparedLinkPlan::prepare(&repo, &options)
+            .await
+            .expect("prepare")
+            .expect("plan present");
+        assert_eq!(plan.planned_total(), 1, "all-built pair dropped");
+        let key = plan.peek_key().expect("one pending pair");
+        assert_eq!(
+            (key.extract_id, key.historical_id, key.finding_id),
+            (1, 2, 3),
+            "drain-only pair anchors on its strongest member"
+        );
+        let mut plan = plan;
+        let batch = plan.take_batch(NonZeroUsize::new(1).unwrap());
+        assert_eq!(batch.len(), 1);
+        let link = &batch[0];
+        assert!(link.pack.is_empty(), "drain-only pair has no pending hints");
+        assert_eq!(link.pre_committed_spec_ids, partial_ids);
+    }
+
+    #[tokio::test]
+    async fn pair_commit_stamps_each_spec_with_its_attributed_triple() {
+        let temp = temp_repo().await;
+        let repo = &temp.repo;
+        seed(
+            &repo,
+            &[extract("e1")],
+            vec![historical(
+                1,
+                &[(1, LinkStrength::High), (2, LinkStrength::High)],
+            )],
+            vec![(1, 1, MatchStrength::High)],
+        )
+        .await;
+
+        let mut specs = Vec::new();
+        let mut spec_finding_ids = Vec::new();
+        for (finding_id, summary) in [(1, "hint-one issue"), (2, "hint-two issue")] {
+            let mut spec = AuditSpecification::default();
+            spec.summary = summary.to_string();
+            specs.push(spec);
+            spec_finding_ids.push(finding_id);
+        }
+        let mut outcome = LinkSpecOutcome {
+            ordinal: 1,
+            extract_id: 1,
+            historical_id: 1,
+            finding_id: 1,
+            status: LinkSpecStatus::Built,
+            specifications: specs,
+            spec_finding_ids,
+            pack_finding_ids: vec![1, 2],
+            specification_ids: Vec::new(),
+            abort_reason: None,
+            final_summary: None,
+            steps: 3,
+            compact_count: 0,
+        };
+        outcome.commit(&repo).await;
+        assert_eq!(outcome.specification_ids.len(), 2);
+
+        let rows = repo.load_specifications().await.expect("load specs");
+        let by_id: HashMap<i32, (i32, i32, i32)> = rows
+            .into_iter()
+            .map(|row| (row.id, (row.semantic_id, row.historical_id, row.finding_id)))
+            .collect();
+        assert_eq!(
+            by_id.get(&outcome.specification_ids[0]),
+            Some(&(1, 1, 1)),
+            "first spec stamped with its attributed finding"
+        );
+        assert_eq!(
+            by_id.get(&outcome.specification_ids[1]),
+            Some(&(1, 1, 2)),
+            "second spec stamped with its attributed finding"
+        );
+
+        // The summaries land in the pair context query, keyed by pair.
+        let summaries = repo
+            .load_pair_spec_summaries(&[(1, 1)])
+            .await
+            .expect("pair summaries");
+        assert_eq!(summaries.get(&(1, 1)).map(Vec::len), Some(2));
     }
 }

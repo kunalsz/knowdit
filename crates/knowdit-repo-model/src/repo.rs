@@ -2528,6 +2528,45 @@ impl RepoDatabase {
             })
             .collect())
     }
+
+    /// Committed-spec summaries per `(extract, historical)` pair, used by the
+    /// pair-mode planner to build the "already committed for this pair"
+    /// anti-duplication context. Returns `(spec_id, summary)` rows per pair;
+    /// pairs with no spec rows are absent from the map. The summary is parsed
+    /// from the spec JSON's `summary` field; rows that fail to parse or carry
+    /// no summary are skipped.
+    pub async fn load_pair_spec_summaries(
+        &self,
+        pairs: &[(i32, i32)],
+    ) -> Result<HashMap<(i32, i32), Vec<(i32, String)>>> {
+        use sea_orm::{ColumnTrait, QueryFilter};
+
+        let mut out: HashMap<(i32, i32), Vec<(i32, String)>> = HashMap::new();
+        for &(extract_id, historical_id) in pairs {
+            let rows = specification_model::Entity::find()
+                .filter(specification_model::Column::SemanticId.eq(extract_id))
+                .filter(specification_model::Column::HistoricalId.eq(historical_id))
+                .order_by_asc(specification_model::Column::Id)
+                .all(&self.db)
+                .await
+                .wrap_err("failed to load pair specification summaries")?;
+            let entry = out.entry((extract_id, historical_id)).or_default();
+            for row in rows {
+                let summary = serde_json::from_str::<serde_json::Value>(&row.specification)
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .get("summary")
+                            .and_then(|summary| summary.as_str())
+                            .map(str::to_string)
+                    });
+                if let Some(summary) = summary {
+                    entry.push((row.id, summary));
+                }
+            }
+        }
+        Ok(out)
+    }
 }
 
 /// Projected `specification` query used by [`RepoDatabase::load_link_resume_states`].
@@ -2735,6 +2774,35 @@ impl RepoDatabase {
             .into_iter()
             .filter(|row| row.status.counts_as_resumable_skip())
             .map(|row| row.spec_id)
+            .collect())
+    }
+
+    /// Specification rows for one `(extract, historical)` pair. The novelty
+    /// gate's comparison-set source: a per-pair projected read instead of a
+    /// whole-table `load_specifications` per link.
+    pub async fn load_pair_specifications(
+        &self,
+        extract_id: i32,
+        historical_id: i32,
+    ) -> Result<Vec<LoadedSpecification>> {
+        use sea_orm::{ColumnTrait, QueryFilter, QueryOrder};
+
+        let rows = specification_model::Entity::find()
+            .filter(specification_model::Column::SemanticId.eq(extract_id))
+            .filter(specification_model::Column::HistoricalId.eq(historical_id))
+            .order_by_asc(specification_model::Column::Id)
+            .all(&self.db)
+            .await
+            .wrap_err("failed to load pair specification rows")?;
+        Ok(rows
+            .into_iter()
+            .map(|row| LoadedSpecification {
+                id: row.id,
+                semantic_id: row.semantic_id,
+                historical_id: row.historical_id,
+                finding_id: row.finding_id,
+                specification_json: row.specification,
+            })
             .collect())
     }
 

@@ -25,3 +25,4 @@ knowdit-kg-model.workspace = true
 knowdit-project.workspace = true
 knowdit-repo-model.workspace = true
 knowdit-sol.workspace = true
+sha2.workspace = true

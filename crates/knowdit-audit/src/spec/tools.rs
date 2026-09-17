@@ -42,6 +42,11 @@ pub struct SpecDraft {
     pub auxiliary_contracts: BTreeMap<String, AuxiliaryContract>,
     /// Specs that have been committed already.
     pub completed: Vec<AuditSpecification>,
+    /// Per-spec attribution target (`historical_finding.id`), parallel to
+    /// `completed`. Populated by `commit_specification`: in pair mode the
+    /// agent's `related_finding_id`; in per-finding mode the link's own
+    /// finding. Drives which triple each spec row is stamped with.
+    pub completed_finding_ids: Vec<i32>,
     /// Set on `finalize`. Until then the agent loop keeps spinning.
     pub final_status: Option<LinkSpecStatus>,
     pub abort_reason: Option<String>,
@@ -138,10 +143,17 @@ impl DraftHandle {
     /// Keeps each tool's fields private to this module; the caller only
     /// gets the `ToolBox` and keeps this `DraftHandle` to read the
     /// committed specs back.
+    ///
+    /// `pack_ids` is empty in per-finding granularity: `commit_specification`
+    /// then attributes every spec to `anchor_finding_id` (the link's own
+    /// finding). In pair granularity it holds the pack's member ids and the
+    /// agent must attribute each spec via `related_finding_id`.
     pub fn build_tool_box(
         &self,
         project_index: &Arc<ProjectIndex>,
         max_specs_per_link: usize,
+        pack_ids: Vec<i32>,
+        anchor_finding_id: i32,
     ) -> ToolBox {
         let mut tools = ToolBox::new();
         tools.add_tool(UpdateStateDescriptionTool {
@@ -169,6 +181,8 @@ impl DraftHandle {
         tools.add_tool(CommitSpecificationTool {
             draft: self.clone(),
             max_specs: max_specs_per_link,
+            pack_ids,
+            anchor_finding_id,
         });
         tools.add_tool(FinalizeTool {
             draft: self.clone(),
@@ -563,6 +577,12 @@ struct CommitSpecificationArgs {
     /// One- or two-sentence summary of the overall vulnerable behavior this
     /// spec captures (what the attacker does and what breaks). Required.
     summary: String,
+    /// Which historical finding from the pack this spec is related to.
+    /// Required in pair mode: pass the `id` of the pack hint this spec
+    /// most closely relates to, or the anchor hint's id when the issue is
+    /// unrelated to any single hint. Ignored outside pair mode.
+    #[serde(default)]
+    related_finding_id: Option<i32>,
 }
 
 #[derive(Debug, Clone)]
@@ -570,11 +590,16 @@ struct CommitSpecificationArgs {
     arguments = CommitSpecificationArgs,
     invoke = invoke,
     name = "commit_specification",
-    description = "Snapshot the current draft as one finalized AuditSpecification and reset the draft for the next one. Requires a non-empty summary, at least one post_attack invariant (state-variable or contract constraint), and at least one call-sequence step.",
+    description = "Snapshot the current draft as one finalized AuditSpecification and reset the draft for the next one. Requires a non-empty summary, at least one post_attack invariant (state-variable or contract constraint), and at least one call-sequence step. In pair mode also requires related_finding_id naming the pack hint this spec relates to.",
 )]
 struct CommitSpecificationTool {
     draft: DraftHandle,
     max_specs: usize,
+    /// Pack member ids the agent may attribute specs to. Empty outside pair
+    /// mode.
+    pack_ids: Vec<i32>,
+    /// Attribution fallback outside pair mode: the link's own finding.
+    anchor_finding_id: i32,
 }
 
 impl CommitSpecificationTool {
@@ -583,13 +608,39 @@ impl CommitSpecificationTool {
         args: CommitSpecificationArgs,
     ) -> std::result::Result<String, llmy::agent::LLMYError> {
         let summary = args.summary.trim().to_string();
+        let pair_mode = !self.pack_ids.is_empty();
         let mut guard = self.draft.0.lock().await;
+        let cap_label = if pair_mode {
+            "max_specs_per_pair"
+        } else {
+            "max_specs_per_link"
+        };
         if guard.completed.len() >= self.max_specs {
             return Ok(format!(
-                "error: max_specs_per_link={} reached; call finalize next",
+                "error: {cap_label}={} reached; call finalize next",
                 self.max_specs
             ));
         }
+        let related_finding_id = if pair_mode {
+            match args.related_finding_id {
+                None => {
+                    return Ok(format!(
+                        "error: related_finding_id is required — name the pack hint this spec relates to (valid ids: {}). Use the anchor hint id for an issue unrelated to any single hint. Draft unchanged.",
+                        self.pack_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(", ")
+                    ));
+                }
+                Some(id) if self.pack_ids.contains(&id) => id,
+                Some(id) => {
+                    return Ok(format!(
+                        "error: related_finding_id={} is not a hint in this pack (valid ids: {}). Draft unchanged.",
+                        id,
+                        self.pack_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(", ")
+                    ));
+                }
+            }
+        } else {
+            self.anchor_finding_id
+        };
         if summary.is_empty() {
             return Ok(
                 "error: summary is required — give a one- or two-sentence description of the overall vulnerable behavior this spec captures. Draft unchanged."
@@ -610,6 +661,7 @@ impl CommitSpecificationTool {
         }
         let spec = guard.build_spec(summary);
         guard.completed.push(spec);
+        guard.completed_finding_ids.push(related_finding_id);
         guard.reset_draft();
         Ok(format!(
             "ok: committed spec #{} for this link. Draft has been reset.",
@@ -1357,11 +1409,14 @@ mod grounding_tests {
         let commit = CommitSpecificationTool {
             draft: draft.clone(),
             max_specs: 4,
+            pack_ids: Vec::new(),
+            anchor_finding_id: 1,
         };
 
         let r = commit
             .invoke(CommitSpecificationArgs {
                 summary: "   ".to_string(),
+                related_finding_id: None,
             })
             .await
             .unwrap();
@@ -1370,6 +1425,7 @@ mod grounding_tests {
         let r = commit
             .invoke(CommitSpecificationArgs {
                 summary: "drain".to_string(),
+                related_finding_id: None,
             })
             .await
             .unwrap();
@@ -1390,6 +1446,7 @@ mod grounding_tests {
         let r = commit
             .invoke(CommitSpecificationArgs {
                 summary: "drain".to_string(),
+                related_finding_id: None,
             })
             .await
             .unwrap();
@@ -1412,6 +1469,7 @@ mod grounding_tests {
         let r = commit
             .invoke(CommitSpecificationArgs {
                 summary: "attacker drains vault".to_string(),
+                related_finding_id: None,
             })
             .await
             .unwrap();
@@ -1422,5 +1480,137 @@ mod grounding_tests {
         // draft reset after commit
         assert!(snap.post_attack.states_variables.is_empty());
         assert!(snap.sequence.is_empty());
+    }
+
+    /// Build a commit tool in pair mode over a draft that already satisfies
+    /// every other commit gate (post_attack invariant + sequence).
+    async fn pair_commit_tool(
+        draft: &DraftHandle,
+        idx: &Arc<ProjectIndex>,
+        pack_ids: Vec<i32>,
+        max_specs: usize,
+    ) -> CommitSpecificationTool {
+        AddStateVariableConstraintTool {
+            draft: draft.clone(),
+            project: idx.clone(),
+        }
+        .invoke(AddStateVariableConstraintArgs {
+            stage: SpecStage::PostAttack,
+            key: "balances".to_string(),
+            constraint: "drained".to_string(),
+        })
+        .await
+        .unwrap();
+        SetCallSequenceTool {
+            draft: draft.clone(),
+            project: idx.clone(),
+        }
+        .invoke(SetCallSequenceArgs {
+            steps: vec![CallStepArg {
+                contract: "Vault".to_string(),
+                function: "withdraw".to_string(),
+                intention: "x".to_string(),
+            }],
+        })
+        .await
+        .unwrap();
+        let anchor_finding_id = pack_ids[0];
+        CommitSpecificationTool {
+            draft: draft.clone(),
+            max_specs,
+            pack_ids,
+            anchor_finding_id,
+        }
+    }
+
+    #[tokio::test]
+    async fn pair_commit_requires_and_grounds_related_finding_id() {
+        let idx = project_index();
+        let draft = DraftHandle::new();
+        let commit = pair_commit_tool(&draft, &idx, vec![7, 9], 4).await;
+
+        // Missing attribution is rejected with the valid-id list.
+        let r = commit
+            .invoke(CommitSpecificationArgs {
+                summary: "drain".to_string(),
+                related_finding_id: None,
+            })
+            .await
+            .unwrap();
+        assert!(r.contains("related_finding_id is required"), "{r}");
+        assert!(r.contains("7, 9"), "{r}");
+
+        // Unknown ids are rejected the same way.
+        let r = commit
+            .invoke(CommitSpecificationArgs {
+                summary: "drain".to_string(),
+                related_finding_id: Some(8),
+            })
+            .await
+            .unwrap();
+        assert!(r.contains("not a hint in this pack"), "{r}");
+        assert!(draft.snapshot().await.completed.is_empty());
+
+        // A valid id commits and is recorded as the spec's attribution.
+        let r = commit
+            .invoke(CommitSpecificationArgs {
+                summary: "drain".to_string(),
+                related_finding_id: Some(9),
+            })
+            .await
+            .unwrap();
+        assert!(r.starts_with("ok:"), "{r}");
+        let snap = draft.snapshot().await;
+        assert_eq!(snap.completed.len(), 1);
+        assert_eq!(snap.completed_finding_ids, vec![9]);
+    }
+
+    #[tokio::test]
+    async fn pair_commit_cap_message_names_per_pair_limit() {
+        let idx = project_index();
+        let draft = DraftHandle::new();
+        let commit = pair_commit_tool(&draft, &idx, vec![7], 1).await;
+        let r = commit
+            .invoke(CommitSpecificationArgs {
+                summary: "first".to_string(),
+                related_finding_id: Some(7),
+            })
+            .await
+            .unwrap();
+        assert!(r.starts_with("ok:"), "{r}");
+        // Second commit hits the pair cap; the draft reset after the first
+        // commit means the gates pass again — the cap check fires first.
+        SetCallSequenceTool {
+            draft: draft.clone(),
+            project: idx.clone(),
+        }
+        .invoke(SetCallSequenceArgs {
+            steps: vec![CallStepArg {
+                contract: "Vault".to_string(),
+                function: "withdraw".to_string(),
+                intention: "x".to_string(),
+            }],
+        })
+        .await
+        .unwrap();
+        AddStateVariableConstraintTool {
+            draft: draft.clone(),
+            project: idx.clone(),
+        }
+        .invoke(AddStateVariableConstraintArgs {
+            stage: SpecStage::PostAttack,
+            key: "balances".to_string(),
+            constraint: "drained".to_string(),
+        })
+        .await
+        .unwrap();
+        let r = commit
+            .invoke(CommitSpecificationArgs {
+                summary: "second".to_string(),
+                related_finding_id: Some(7),
+            })
+            .await
+            .unwrap();
+        assert!(r.contains("max_specs_per_pair=1 reached"), "{r}");
     }
 }

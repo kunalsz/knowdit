@@ -36,16 +36,21 @@ use std::sync::Arc;
 
 use clap::Args;
 use color_eyre::eyre::{Result, WrapErr, eyre};
+use std::collections::HashSet;
+
 use knowdit_audit::harness::HarnessBackend;
 use knowdit_audit::mapper::MapperOutcome;
 use knowdit_audit::spec::{
     BillingExhausted, LinkKey, LinkSource, LinkSpecOutcome, LinkSpecStatus, PlannedLinkWork,
     SpecGenOptions, SpecGenStream, SpecificationGenerator, billing_exhaustion,
 };
+use knowdit_audit::spec::novelty;
 use knowdit_audit::types::AuditSpecification;
 use knowdit_kg::db::HistoricalDatabase;
 use knowdit_project::{ProjectData, SourceLanguage};
-use knowdit_repo_model::{CodeGenStatus, FindingProvenance, LoadedValidFinding, RepoDatabase};
+use knowdit_repo_model::{
+    CodeGenCore, CodeGenRecord, CodeGenStatus, FindingProvenance, LoadedValidFinding, RepoDatabase,
+};
 use llmy::clap::OptOpenAISetup;
 use llmy::client::billing::TokenUsage;
 use llmy::client::client::LLM;
@@ -448,6 +453,7 @@ impl StreamloopArgs {
             concurrency: self.stream_link_concurrency.unwrap_or(1).max(1),
             report_cfg,
             usage_max_link_rows: self.usage_max_link_rows,
+            novelty_gate: self.gen_specs.gen_specs_novelty_gate,
         }
         .run()
         .await?;
@@ -564,6 +570,11 @@ struct LinkContext<B: HarnessBackend + Clone + 'static> {
     /// Reflection threads this into the grader system prompt without
     /// having to round-trip through the backend per call.
     language_prompt_prefix: String,
+    /// Opt-in novelty gate: judge committed specs against the pair's
+    /// already-validated specs before the drain validates them.
+    novelty_gate: bool,
+    /// Cache-key root for the novelty judge (`{project}-knowdit-spec`).
+    novelty_cache_root: String,
 }
 
 impl<B: HarnessBackend + Clone + 'static> LinkContext<B> {
@@ -581,13 +592,20 @@ impl<B: HarnessBackend + Clone + 'static> LinkContext<B> {
         let key = work.link_key();
         let ordinal = work.ordinal();
         let total = work.total_links();
+        let pair_mode = work.is_pair();
+        let pack_finding_ids = work.pack_finding_ids();
 
         let link_started = std::time::Instant::now();
         tracing::info!(
-            "[streamloop link {ordinal:04}/{total}] gen-specs: starting (extract={}, hist={}, find={})",
+            "[streamloop link {ordinal:04}/{total}] gen-specs: starting (extract={}, hist={}, find={}{})",
             key.extract_id,
             key.historical_id,
             key.finding_id,
+            if pair_mode {
+                format!(", pack={} hint(s)", pack_finding_ids.len())
+            } else {
+                String::new()
+            },
         );
         // Per-link billing scopes (llmy 0.16): spec/codegen/regen bill the
         // primary tree, reflect bills the reflect tree; every phase call below
@@ -597,7 +615,7 @@ impl<B: HarnessBackend + Clone + 'static> LinkContext<B> {
         let gen_specs_started = std::time::Instant::now();
         // `?` here only fires on a billing-cap exhaustion (run-fatal); a
         // per-link agent failure comes back as an `Abandoned` outcome.
-        let outcome = work.run(&self.repo, &scopes.spec).await?;
+        let mut outcome = work.run(&self.repo, &scopes.spec).await?;
         tracing::info!(
             "[streamloop link {ordinal:04}/{total}] gen-specs: finished — status={} {} spec(s) usable, {} step(s), {} compaction(s) ({})",
             snapshot_status(outcome.status),
@@ -610,6 +628,18 @@ impl<B: HarnessBackend + Clone + 'static> LinkContext<B> {
         let mut drain = LinkDrainCounts::default();
         let mut code_gen_ids: Vec<i32> = Vec::new();
         let mut cycles_run = 0usize;
+        // Snapshot semantics: every spec the agent committed (the gate only
+        // changes which of them get validated, not how many were committed).
+        let committed_count = outcome.specification_ids.len();
+
+        // Novelty gate (opt-in): judge the committed specs against the pair's
+        // already-validated specs; semantic duplicates are recorded terminal
+        // (`Duplicate` codegen) and skip codegen / fuzz / reflect. Billing
+        // exhaustion propagates; judge errors fail open inside the gate.
+        if self.novelty_gate && !outcome.specification_ids.is_empty() {
+            self.apply_novelty_gate(&key, &mut outcome, &mut drain, &scopes)
+                .await?;
+        }
 
         // Gate on `specification_ids` rather than `specifications`:
         // resumed Partial links arrive with empty parsed specs but
@@ -643,6 +673,9 @@ impl<B: HarnessBackend + Clone + 'static> LinkContext<B> {
             ordinal,
             total,
             &key,
+            pair_mode,
+            &pack_finding_ids,
+            committed_count,
             &outcome,
             &drain,
             &code_gen_ids,
@@ -672,6 +705,131 @@ impl<B: HarnessBackend + Clone + 'static> LinkContext<B> {
                 usage,
             },
         })
+    }
+
+    /// Novelty gate: judge the link's just-committed specs against the specs
+    /// already **validated** (terminal codegen) for the same
+    /// `(extract, historical)` pair. Semantic duplicates are recorded as
+    /// terminal `Duplicate` codegen rows — the exploration record stays
+    /// complete, resume treats the link as built, and the drain validates
+    /// only the novel remainder. Judge errors fail open (all novel); a
+    /// billing-cap exhaustion propagates as run-fatal.
+    async fn apply_novelty_gate(
+        &self,
+        key: &LinkKey,
+        outcome: &mut LinkSpecOutcome,
+        drain: &mut LinkDrainCounts,
+        scopes: &LinkScopes,
+    ) -> Result<()> {
+        let new_specs: Vec<(i32, AuditSpecification)> = outcome
+            .specification_ids
+            .iter()
+            .cloned()
+            .zip(outcome.specifications.iter().cloned())
+            .collect();
+        if new_specs.is_empty() {
+            return Ok(());
+        }
+
+        // Comparison set: the pair's specs with a terminal codegen from
+        // earlier links, excluding the current batch (its mutual duplicates
+        // are judged intra-batch by the same call).
+        let pair_specs = self
+            .repo
+            .load_pair_specifications(key.extract_id, key.historical_id)
+            .await
+            .wrap_err("novelty gate: failed to load pair specifications")?;
+        let terminal = self
+            .repo
+            .loaded_completed_code_gen_spec_ids()
+            .await
+            .wrap_err("novelty gate: failed to load terminal codegen index")?;
+        let new_ids: HashSet<i32> = outcome.specification_ids.iter().copied().collect();
+        let mut prior: Vec<(i32, AuditSpecification)> = pair_specs
+            .into_iter()
+            .filter(|row| terminal.contains(&row.id) && !new_ids.contains(&row.id))
+            .filter_map(|row| {
+                serde_json::from_str::<AuditSpecification>(&row.specification_json)
+                    .ok()
+                    .map(|spec| (row.id, spec))
+            })
+            .collect();
+        // Most recent first: later specs are the pair's best expressions.
+        prior.sort_by_key(|(id, _)| std::cmp::Reverse(*id));
+        prior.truncate(novelty::MAX_PRIOR_SPECS);
+        if prior.is_empty() {
+            // First validated spec of the pair — nothing to duplicate.
+            return Ok(());
+        }
+
+        let cache_key = format!(
+            "{}-novelty-e{}-h{}-f{}",
+            self.novelty_cache_root, key.extract_id, key.historical_id, key.finding_id
+        );
+        let debug_prefix = format!(
+            "novelty-e{}-h{}-f{}",
+            key.extract_id, key.historical_id, key.finding_id
+        );
+        let verdicts =
+            novelty::judge_spec_novelty(
+                &scopes.dedup,
+                Some(&cache_key),
+                Some(&debug_prefix),
+                &new_specs,
+                &prior,
+            )
+            .await?;
+
+        let duplicates: Vec<(i32, &novelty::NoveltyVerdict)> = new_specs
+            .iter()
+            .zip(verdicts.iter())
+            .filter_map(|((id, _), verdict)| {
+                verdict.duplicate_of.map(|_| (*id, verdict))
+            })
+            .collect();
+        if duplicates.is_empty() {
+            tracing::info!(
+                "novelty gate: all {} committed spec(s) novel against {} validated pair sibling(s)",
+                new_specs.len(),
+                prior.len()
+            );
+            return Ok(());
+        }
+        for (spec_id, verdict) in &duplicates {
+            let record = CodeGenRecord {
+                core: CodeGenCore {
+                    spec_id: *spec_id,
+                    harness_relative_path: String::new(),
+                    harness_source: String::new(),
+                    status: CodeGenStatus::Duplicate,
+                    final_reason: format!(
+                        "duplicate of spec {} — {}",
+                        verdict.duplicate_of.unwrap_or(0),
+                        verdict.because
+                    ),
+                    agent_steps: 0,
+                },
+                runs: Vec::new(),
+            };
+            self.repo
+                .write_code_gen_with_runs(&record, &[])
+                .await
+                .wrap_err_with(|| {
+                    format!("novelty gate: failed to record duplicate codegen for spec {spec_id}")
+                })?;
+        }
+        let duplicate_ids: HashSet<i32> = duplicates.iter().map(|(id, _)| *id).collect();
+        outcome
+            .specification_ids
+            .retain(|id| !duplicate_ids.contains(id));
+        drain.dedup_skipped = duplicates.len();
+        tracing::info!(
+            "novelty gate: {}/{} committed spec(s) judged duplicates of validated pair sibling(s) —              skipping their validation, {} novel spec(s) proceed",
+            duplicates.len(),
+            new_specs.len(),
+            outcome.specification_ids.len()
+        );
+        Ok(())
     }
 
     /// Mirror every `valid_finding` row in the DB to disk under
@@ -918,16 +1076,26 @@ impl<B: HarnessBackend + Clone + 'static> LinkContext<B> {
     /// On-disk path for one link's summary file. Content-keyed on
     /// the link's `(extract, historical, finding)` identity so the
     /// same link lands at the same path across runs regardless of
-    /// resume-induced ordinal drift.
+    /// resume-induced ordinal drift. Pair-mode runs use a distinct
+    /// `pair_summary_e{E}_h{H}.json` name so they never overwrite the
+    /// per-link summaries a prior per-finding run wrote for the same pair.
     ///
     /// Streamloop only ever WRITES this file — resume decisions come
     /// from the DB via [`RepoDatabase::link_resume_state`]. The file
     /// is a per-link report for humans, not a resume marker.
-    fn snapshot_path(&self, key: &LinkKey) -> PathBuf {
-        self.output_folder.join("summaries").join(format!(
-            "link_summary_e{}_h{}_f{}.json",
-            key.extract_id, key.historical_id, key.finding_id
-        ))
+    fn snapshot_path(&self, key: &LinkKey, pair_mode: bool) -> PathBuf {
+        let name = if pair_mode {
+            format!(
+                "pair_summary_e{}_h{}.json",
+                key.extract_id, key.historical_id
+            )
+        } else {
+            format!(
+                "link_summary_e{}_h{}_f{}.json",
+                key.extract_id, key.historical_id, key.finding_id
+            )
+        };
+        self.output_folder.join("summaries").join(name)
     }
 
     /// Atomic write: serialize →
@@ -935,11 +1103,15 @@ impl<B: HarnessBackend + Clone + 'static> LinkContext<B> {
     /// `link_summary_NNNN.json`. A crash mid-write leaves at most a
     /// `.tmp` file that the next run ignores; presence of the final
     /// file is the resume marker.
+    #[allow(clippy::too_many_arguments)]
     fn write_snapshot(
         &self,
         ordinal: usize,
         total: usize,
         key: &LinkKey,
+        pair_mode: bool,
+        pack_finding_ids: &[i32],
+        committed_count: usize,
         outcome: &LinkSpecOutcome,
         drain: &LinkDrainCounts,
         code_gen_ids: &[i32],
@@ -954,8 +1126,9 @@ impl<B: HarnessBackend + Clone + 'static> LinkContext<B> {
             extract_id: key.extract_id,
             historical_id: key.historical_id,
             finding_id: key.finding_id,
+            pack_finding_ids: pack_finding_ids.to_vec(),
             status: snapshot_status(outcome.status),
-            committed_spec_count: outcome.specification_ids.len(),
+            committed_spec_count: committed_count,
             specification_ids: outcome.specification_ids.clone(),
             code_gen_ids: code_gen_ids.to_vec(),
             abort_reason: outcome.abort_reason.clone(),
@@ -964,7 +1137,7 @@ impl<B: HarnessBackend + Clone + 'static> LinkContext<B> {
             drain: drain.clone(),
             usage: usage.clone(),
         };
-        let final_path = self.snapshot_path(key);
+        let final_path = self.snapshot_path(key, pair_mode);
         write_json_atomic(&final_path, &snapshot)
     }
 }
@@ -1027,6 +1200,8 @@ pub(crate) struct LinkUsageReport {
     spec: PhaseUsage,
     codegen: PhaseUsage,
     regen: PhaseUsage,
+    /// Novelty-gate judge calls (child of the link scope).
+    dedup: PhaseUsage,
     reflect: PhaseUsage,
 }
 
@@ -1101,6 +1276,7 @@ struct LinkScopes {
     spec: LLM,
     codegen: LLM,
     regen: LLM,
+    dedup: LLM,
     reflect: LLM,
 }
 
@@ -1111,6 +1287,7 @@ impl LinkScopes {
         let spec = link.scope(Some("spec".to_string()), None);
         let codegen = link.scope(Some("codegen".to_string()), None);
         let regen = link.scope(Some("regen".to_string()), None);
+        let dedup = link.scope(Some("dedup".to_string()), None);
         let reflect = link_reflect.scope(Some("reflect".to_string()), None);
         Self {
             link,
@@ -1118,6 +1295,7 @@ impl LinkScopes {
             spec,
             codegen,
             regen,
+            dedup,
             reflect,
         }
     }
@@ -1131,6 +1309,7 @@ impl LinkScopes {
             spec: PhaseUsage::snapshot(&self.spec),
             codegen: PhaseUsage::snapshot(&self.codegen),
             regen: PhaseUsage::snapshot(&self.regen),
+            dedup: PhaseUsage::snapshot(&self.dedup),
             reflect: PhaseUsage::snapshot(&self.reflect),
         }
     }
@@ -1277,6 +1456,9 @@ pub(crate) struct LinkPipelineInputs<B: HarnessBackend + Clone + Send + Sync + '
     pub(crate) report_cfg: Option<review_findings::ReportInlineCfg>,
     /// Cap on retained per-link usage detail rows (`0` = none).
     pub(crate) usage_max_link_rows: usize,
+    /// Opt-in novelty gate (see `--gen-specs-novelty-gate`): judge committed
+    /// specs against the pair's already-validated specs before the drain.
+    pub(crate) novelty_gate: bool,
 }
 
 impl<B: HarnessBackend + Clone + Send + Sync + 'static> LinkPipelineInputs<B> {
@@ -1303,8 +1485,10 @@ impl<B: HarnessBackend + Clone + Send + Sync + 'static> LinkPipelineInputs<B> {
             concurrency,
             report_cfg,
             usage_max_link_rows,
+            novelty_gate,
         } = self;
         let concurrency = concurrency.max(1);
+        let novelty_cache_root = gen_options.cache_key.clone();
 
         tracing::info!("[link pipeline] preparing spec-gen stream");
         let stream = match SpecificationGenerator::new()
@@ -1359,6 +1543,8 @@ impl<B: HarnessBackend + Clone + Send + Sync + 'static> LinkPipelineInputs<B> {
             output_folder,
             max_inner_cycles: max_inner_cycles.max(1),
             language_prompt_prefix,
+            novelty_gate,
+            novelty_cache_root,
         });
         let scheduler = LinkScheduler {
             ctx,
@@ -1446,6 +1632,9 @@ struct LinkTally {
 
 #[derive(Clone, Debug, Default, Serialize)]
 struct LinkDrainCounts {
+    /// Specs the novelty gate judged duplicates of already-validated pair
+    /// siblings — recorded terminal (`Duplicate` codegen), validation skipped.
+    dedup_skipped: usize,
     fuzz_completed: usize,
     fuzz_violated: usize,
     reflect_graded: usize,
@@ -1460,6 +1649,9 @@ struct LinkSnapshot {
     extract_id: i32,
     historical_id: i32,
     finding_id: i32,
+    /// Pair mode: the hint-pack member ids the run was planned with (anchor
+    /// first). Empty for per-finding runs.
+    pack_finding_ids: Vec<i32>,
     status: &'static str,
     committed_spec_count: usize,
     specification_ids: Vec<i32>,

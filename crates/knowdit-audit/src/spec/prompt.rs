@@ -70,7 +70,7 @@ pub(super) fn build_system_prompt(link: &LinkInput, source: LinkSource) -> Strin
             "## Reported finding (validate this specific issue)",
         ),
     };
-    format!(
+    let mut prompt = format!(
         r#"You are the Specification Generator agent for a knowledge-driven Solidity smart-contract auditing pipeline.
 
 ## Your task
@@ -106,7 +106,35 @@ Use these as the primary source of truth for `setup.contracts` keys and `sequenc
 - vulnerability patterns: {finding_patterns}
 - known exploits: {finding_exploits}
 
-# Audit-specification model
+"#,
+        extract_id = link.extract_id,
+        extract_category = extract.category.as_str(),
+        extract_name = extract.name,
+        extract_definition = extract.definition.trim(),
+        extract_description = extract.description.trim(),
+        extract_functions = extract_functions,
+        historical_id = link.historical_id,
+        historical_category = historical.category.as_str(),
+        historical_name = historical.name,
+        historical_definition = historical.definition.trim(),
+        historical_description = link.historical_rendered_description.trim(),
+        finding_id = link.finding_id,
+        finding_title = finding.title,
+        finding_severity = format_severity(finding.severity),
+        finding_root_cause = finding.root_cause.trim(),
+        finding_description = link.finding_rendered_description.trim(),
+        finding_patterns = link.finding_rendered_patterns.trim(),
+        finding_exploits = link.finding_rendered_exploits.trim(),
+    );
+    prompt.push_str(SPEC_MODEL_AND_RULES);
+    prompt
+}
+
+/// Static bulk of the gen-spec system prompt - the audit-specification model,
+/// the `post_attack.description` contract, methodology, abandon criteria, tool
+/// rules, and hard rules. Shared verbatim by the per-finding and pair-mode
+/// variants so an edit lands in both.
+const SPEC_MODEL_AND_RULES: &str = r#"# Audit-specification model
 
 An `AuditSpecification` defines:
 
@@ -200,6 +228,116 @@ The `abort_reason` must cite the specific contracts/functions you inspected and 
 - A contract the PoC has to deploy itself (attacker / callback / mock) is legitimate — but declare it as an auxiliary contract (`add_aux_contract` + `add_aux_contract_state`) instead of pretending it's a project contract. Once declared it can appear in `setup.contracts`, in invariants, and in the `sequence` just like a project contract.
 - In `sequence`, use exact project contract/function names from the function anchors or `lookup_call_graph` results. If the runtime object is a proxy or module-composed wallet, name the concrete module function that actually appears in source, such as `ERC4337v07.executeUserOp`, `Calls.selfExecute`, `Hooks.fallback`, or `Implementation.updateImplementation`.
 - A committed spec must be *defensible*: you can name the project functions in its sequence and the state variables in its invariants. But it does NOT need to be a verbatim reproduction of the historical finding — `related to` is enough.
+"#;
+
+
+/// Per-hint render caps for the pair-mode pack section. Generous enough to
+/// keep every concrete detail a hint carries; tight enough that a 10-hint
+/// pack stays a small fraction of the context window.
+const PACK_HINT_DESCRIPTION_CAP: usize = 1_500;
+const PACK_HINT_PATTERNS_CAP: usize = 800;
+const PACK_HINT_EXPLOITS_CAP: usize = 800;
+
+fn bounded(text: &str, cap: usize) -> String {
+    if text.chars().count() <= cap {
+        text.to_string()
+    } else {
+        let truncated: String = text.chars().take(cap).collect();
+        format!("{truncated}…[truncated]")
+    }
+}
+
+/// Pair-mode system prompt: identical task framing and rule bulk as
+/// [`build_system_prompt`], but the single finding section is replaced by the
+/// whole diversified hint pack plus the pack-working rules (commit each
+/// distinct issue once; attribute every spec via `related_finding_id`).
+///
+/// Only meaningful for [`LinkSource::Mapper`] — the CLI rejects pair
+/// granularity for externally-reported findings.
+pub(super) fn build_pair_system_prompt(link: &LinkInput, source: LinkSource) -> String {
+    let extract = &link.extract;
+    let historical = &link.historical;
+    let extract_functions = render_extracted_functions(&extract.functions);
+    debug_assert!(!link.pack.is_empty(), "pair prompt requires a non-empty pack");
+    let task_paragraph = match source {
+        LinkSource::Mapper => "You are given ONE `(project_semantic, historical_semantic)` pair from the Knowledge Mapper together with a **pack of historical findings** — independent write-ups from other projects that the global linker attached to the same historical semantic. They are *topic hints*, drawn from other projects; they likely will not fit the current project verbatim, and several of them may restate the same underlying mechanism. **Your task is to use the whole pack as starting points to look for every plausibly related issue inside the matched project semantic, and emit `AuditSpecification`(s) describing those issues.** A committed spec only needs to be *related* to the hint that seeded it (same root-cause family, same kind of state corruption, same exploit shape, or any concrete generalization/specialization of its mechanism). It does NOT have to be a verbatim reproduction.",
+        // Externally-reported findings are concrete claims, not hints; pair
+        // granularity is rejected upstream for them. Render the anchor as a
+        // single reported finding if this path is ever hit.
+        LinkSource::External => "The anchor finding below was **reported against this exact project** (e.g. by an external audit). **Your task is to emit `AuditSpecification`(s) that reproduce this specific reported issue on the current code**, encoding its reported impact as the post_attack invariant.",
+    };
+    let mut pack_section = String::new();
+    for (idx, hint) in link.pack.iter().enumerate() {
+        let role = if idx == 0 {
+            " (anchor — also the attribution fallback)"
+        } else {
+            ""
+        };
+        pack_section.push_str(&format!(
+            "### Hint id={}{}\n- title: {}\n- severity: {}\n- root cause: {}\n- description: {}\n- vulnerability patterns: {}\n- known exploits: {}\n\n",
+            hint.finding_id,
+            role,
+            hint.finding.title,
+            format_severity(hint.finding.severity),
+            bounded(hint.finding.root_cause.trim(), PACK_HINT_DESCRIPTION_CAP),
+            bounded(
+                hint.finding_rendered_description.trim(),
+                PACK_HINT_DESCRIPTION_CAP
+            ),
+            bounded(
+                hint.finding_rendered_patterns.trim(),
+                PACK_HINT_PATTERNS_CAP
+            ),
+            bounded(
+                hint.finding_rendered_exploits.trim(),
+                PACK_HINT_EXPLOITS_CAP
+            ),
+        ));
+    }
+    let mut prior_section = String::new();
+    if !link.prior_committed_summaries.is_empty() {
+        prior_section.push_str("## Already committed for this pair (do NOT duplicate)\n\nA prior run committed the following specs for this same pair. Do not re-commit the same issues; look for what they missed instead. If everything worth checking is already covered, finalize without committing new specs.\n\n");
+        for summary in &link.prior_committed_summaries {
+            prior_section.push_str(&format!("- {}\n", bounded(summary.trim(), 300)));
+        }
+        prior_section.push('\n');
+    }
+    let mut prompt = format!(
+        r#"You are the Specification Generator agent for a knowledge-driven Solidity smart-contract auditing pipeline.
+
+## Your task
+
+{task_paragraph}
+
+You operate per-pair: this one run covers the whole `(extract, historical)` pair, and the pack below stays in your system prompt for the entire run.
+
+## Project DeFi semantic (extracted from the current project)
+- id: {extract_id}
+- category: {extract_category}
+- name: {extract_name}
+- definition: {extract_definition}
+- description: {extract_description}
+
+### Project semantic function anchors (real names from this project)
+Use these as the primary source of truth for `setup.contracts` keys and `sequence` contract/function names. They are real extracted project functions, not conceptual labels:
+{extract_functions}
+
+## Historical DeFi semantic (from the knowledge graph; matched as encompassing the project's semantic)
+- id: {historical_id}
+- category: {historical_category}
+- name: {historical_name}
+- definition: {historical_definition}
+- description: {historical_description}
+
+## Historical finding pack (independent write-ups; use as topic hints, not strict templates)
+
+{pack_section}{prior_section}## Working with the hint pack
+
+1. **Commit each DISTINCT issue exactly once.** Several hints often restate the same underlying bug from different projects. If two hints describe the same mechanism, one spec covers both — do not commit paraphrases. A fresh spec is justified by a different root cause, a different violated invariant, or a different impact — not by a different wording of the same idea.
+2. **Attribute every spec.** `commit_specification` requires `related_finding_id`: pass the `id` of the hint this spec most closely relates to. If the issue you found is unrelated to any single hint (you found it while exploring the semantic), attribute it to the anchor hint id — never invent an id.
+3. **The pack is a sample, not the syllabus.** The historical semantic carries more findings than this pack shows. After covering what the hints suggest, continue the normal methodology: explore the semantic's full surface area for related issues the pack never hints at.
+4. **Do not abandon just because one hint doesn't apply.** The pack is judged as a whole: only finalize `abandoned` when NO hint (and no related exploration) yields a plausibly related issue, under the strict criteria below.
+
 "#,
         extract_id = link.extract_id,
         extract_category = extract.category.as_str(),
@@ -212,22 +350,47 @@ The `abort_reason` must cite the specific contracts/functions you inspected and 
         historical_name = historical.name,
         historical_definition = historical.definition.trim(),
         historical_description = link.historical_rendered_description.trim(),
-        finding_id = link.finding_id,
-        finding_title = finding.title,
-        finding_severity = format_severity(finding.severity),
-        finding_root_cause = finding.root_cause.trim(),
-        finding_description = link.finding_rendered_description.trim(),
-        finding_patterns = link.finding_rendered_patterns.trim(),
-        finding_exploits = link.finding_rendered_exploits.trim(),
-    )
+        pack_section = pack_section,
+        prior_section = prior_section,
+    );
+    prompt.push_str(SPEC_MODEL_AND_RULES);
+    prompt
 }
 
-fn format_severity(s: FindingSeverity) -> &'static str {
-    match s {
-        FindingSeverity::High => "High",
-        FindingSeverity::Medium => "Medium",
-        FindingSeverity::Low => "Low",
-    }
+/// Pair-mode user prompt: same tool choreography as [`build_user_prompt`],
+/// with the pack-wide dedup / attribution rules restated where the agent
+/// starts reading.
+pub(super) fn build_pair_user_prompt(link: &LinkInput, project_index: &ProjectIndex) -> String {
+    let contract_count = project_index.call_graph.contracts.len();
+    let interface_count = project_index.call_graph.interfaces.len();
+    let extract_functions = render_extracted_functions(&link.extract.functions);
+    format!(
+        r#"Explore the matched project semantic for every issue *related to* any hint in the pack in your system prompt, then commit AuditSpecification(s) for what you find — one spec per distinct issue, attributed via `related_finding_id`.
+
+Project static-analysis short-term memory: {contract_count} contract entr(ies), {interface_count} interface entr(ies). Titles follow `relative_file_path:Contract:line:col`.
+
+Matched semantic function anchors:
+{extract_functions}
+
+Suggested first moves:
+1. `list_memories` to see what's available.
+2. `read_memory` on the contracts listed in "Matched semantic function anchors" — that is your anchor.
+3. From there, follow `lookup_call_graph` edges and `lookup_state_variable_xrefs` to surface every function in or near the semantic that could share a hint's failure mode (same root-cause family, same kind of state corruption, same exploit class).
+4. `read_function_source(contract, function)` for the bodies you actually need to reason about. Avoid loading the same big file twice — the signature index already tells you what each function calls.
+5. Commit one spec per plausibly-related issue you find. The spec only needs to be *related to* the hint that seeded it, not a verbatim reproduction. If several hints lead to the same issue, commit it once and cite the closest hint id.
+
+Reason briefly out loud, then start issuing tool calls. Keep `finalize` for the very end. Per the system prompt, abandoning requires showing which functions you read and why NO hint (and no related exploration) has a related issue here.
+
+Link summary: extract_id={extract}, historical_id={historical}, anchor finding_id={finding}, pack size={pack}.
+"#,
+        contract_count = contract_count,
+        interface_count = interface_count,
+        extract_functions = extract_functions,
+        extract = link.extract_id,
+        historical = link.historical_id,
+        finding = link.finding_id,
+        pack = link.pack.len(),
+    )
 }
 
 pub(super) fn build_user_prompt(link: &LinkInput, project_index: &ProjectIndex) -> String {
@@ -260,6 +423,14 @@ Link summary: extract_id={extract}, historical_id={historical}, finding_id={find
         historical = link.historical_id,
         finding = link.finding_id,
     )
+}
+
+fn format_severity(s: FindingSeverity) -> &'static str {
+    match s {
+        FindingSeverity::High => "High",
+        FindingSeverity::Medium => "Medium",
+        FindingSeverity::Low => "Low",
+    }
 }
 
 /// Render `link.extract.functions` as the anchor list embedded in the

@@ -11,7 +11,8 @@ use clap::{Args, ValueEnum};
 use color_eyre::eyre::Result;
 use knowdit_audit::harness::solidity::SolidityHarness;
 use knowdit_audit::spec::{
-    LinkSource, LinkSpecSummary, SpecGenOptions, SpecGenOutcome, SpecificationGenerator,
+    LinkSource, LinkSpecSummary, SpecGenOptions, SpecGenOutcome, SpecGranularity,
+    SpecificationGenerator,
 };
 use knowdit_kg_model::link_strength::LinkStrength;
 use knowdit_repo_model::{MatchStrength, RepoDatabase};
@@ -139,6 +140,58 @@ pub struct GenSpecsSharedArgs {
     /// Debug prefix passed to llmy.
     #[arg(long = "gen-specs-debug-prefix")]
     pub gen_specs_debug_prefix: Option<String>,
+
+    /// Work granularity. `finding` (default) runs one agent per
+    /// `(extract, historical, finding)` link; `pair` runs ONE agent per
+    /// `(extract, historical)` pair with a diversified pack of up to
+    /// `--gen-specs-pack-size` findings as parallel topic hints, attributing
+    /// each committed spec back to a pack member. Pair mode requires the
+    /// Mapper link source.
+    #[arg(long = "gen-specs-granularity", value_enum, default_value_t = GranularityArg::Finding)]
+    pub gen_specs_granularity: GranularityArg,
+
+    /// Pair mode: maximum number of diversified findings in one pair's hint
+    /// pack. Selection keeps the strongest edges and prefers distinct
+    /// root-cause mechanisms over paraphrases.
+    #[arg(long = "gen-specs-pack-size", default_value_t = 10)]
+    pub gen_specs_pack_size: usize,
+
+    /// Pair mode: soft cap on how many `AuditSpecification`s the one pair
+    /// agent may commit.
+    #[arg(long = "gen-specs-max-specs-per-pair", default_value_t = 16)]
+    pub gen_specs_max_specs_per_pair: usize,
+
+    /// Pair mode: maximum agent steps for the single pair run. Larger than
+    /// the per-link budget because the pair agent explores the same surface a
+    /// whole per-finding batch would.
+    #[arg(long = "gen-specs-pair-max-agent-steps", default_value_t = 96)]
+    pub gen_specs_pair_max_agent_steps: usize,
+
+    /// Opt-in novelty gate (streamloop drain): before a committed spec enters
+    /// codegen / fuzz / reflect, an LLM judge compares it against the specs
+    /// already validated for the same `(extract, historical)` pair. Semantic
+    /// duplicates get a terminal `Duplicate` codegen row and skip validation,
+    /// while every link still runs its spec-gen agent — exploration breadth
+    /// is preserved and only re-confirmation spend is cut. Fail-open: judge
+    /// errors mark specs novel.
+    #[arg(long = "gen-specs-novelty-gate", default_value_t = false)]
+    pub gen_specs_novelty_gate: bool,
+}
+
+/// CLI-layer mirror of [`SpecGranularity`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum GranularityArg {
+    Finding,
+    Pair,
+}
+
+impl From<GranularityArg> for SpecGranularity {
+    fn from(v: GranularityArg) -> Self {
+        match v {
+            GranularityArg::Finding => SpecGranularity::Finding,
+            GranularityArg::Pair => SpecGranularity::Pair,
+        }
+    }
 }
 
 impl GenSpecsSharedArgs {
@@ -148,6 +201,32 @@ impl GenSpecsSharedArgs {
             return Err(color_eyre::eyre::eyre!(
                 "--gen-specs-batch-links must be > 0 (0 would re-enable unbounded heavy \
                  materialization of every link)"
+            ));
+        }
+        if self.gen_specs_pack_size == 0 {
+            return Err(color_eyre::eyre::eyre!(
+                "--gen-specs-pack-size must be > 0 (a pair run needs at least its anchor hint)"
+            ));
+        }
+        if self.gen_specs_max_specs_per_pair == 0 {
+            return Err(color_eyre::eyre::eyre!(
+                "--gen-specs-max-specs-per-pair must be > 0"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Pair granularity is only meaningful for Mapper topic hints: an
+    /// externally-reported finding is a concrete claim to validate and keeps
+    /// its dedicated per-finding run. Called where the `LinkSource` is known.
+    pub(crate) fn validate_link_source(&self, link_source: LinkSource) -> Result<()> {
+        if self.gen_specs_granularity == GranularityArg::Pair
+            && link_source == LinkSource::External
+        {
+            return Err(color_eyre::eyre::eyre!(
+                "--gen-specs-granularity pair requires Mapper link sources; an externally \
+                 reported finding is a concrete claim to validate, not a topic hint — \
+                 rerun with the default --gen-specs-granularity finding"
             ));
         }
         Ok(())
@@ -186,6 +265,10 @@ impl GenSpecsSharedArgs {
             min_link_strength: self.gen_specs_min_link_strength.into(),
             language_prompt_prefix,
             link_source,
+            granularity: self.gen_specs_granularity.into(),
+            pack_size: self.gen_specs_pack_size,
+            max_specs_per_pair: self.gen_specs_max_specs_per_pair,
+            pair_max_agent_steps: self.gen_specs_pair_max_agent_steps,
         }
     }
 }
@@ -286,6 +369,7 @@ impl GenSpecsArgs {
         // Single choke point for every caller (standalone CLI, autoloop,
         // streamloop): reject unsafe knobs before any DB or LLM work.
         shared.validate()?;
+        shared.validate_link_source(LinkSource::Mapper)?;
         // Profile fetch verifies the upstream pipeline produced one.
         repo.get_project_profile().await?.ok_or_else(|| {
             color_eyre::eyre::eyre!(
@@ -318,6 +402,10 @@ impl GenSpecsArgs {
             min_link_strength: shared.gen_specs_min_link_strength.into(),
             language_prompt_prefix,
             link_source: LinkSource::Mapper,
+            granularity: shared.gen_specs_granularity.into(),
+            pack_size: shared.gen_specs_pack_size,
+            max_specs_per_pair: shared.gen_specs_max_specs_per_pair,
+            pair_max_agent_steps: shared.gen_specs_pair_max_agent_steps,
         };
         SpecificationGenerator::new().run(repo, llm, &options).await
     }
