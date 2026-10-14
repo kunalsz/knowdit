@@ -105,6 +105,55 @@ mod tests {
         );
     }
 
+    /// The default model id shipped in `.env` must resolve in llmy's registry.
+    ///
+    /// `deepseek-ai/DeepSeek-V4.1-Flash` is not an upstream registry key, so
+    /// without the vendored entry it falls through to `custom_model` with
+    /// `max_input_tokens: 0`. Every budget then derives from the 131072-token
+    /// fallback window instead of the real one, which silently shrinks link
+    /// prompts ~10x (`--input-token-budget 262144` is clamped to
+    /// `window × utilization`) and reports zero pricing. The vendored
+    /// `llmy-tokenizer` supplies this key; see `[patch.crates-io]` in the root
+    /// `Cargo.toml`.
+    #[test]
+    fn default_model_id_resolves_in_the_registry() {
+        use std::str::FromStr;
+
+        let mut model = OpenAIModel::from_str("deepseek-ai/DeepSeek-V4.1-Flash")
+            .expect("default model id must parse");
+        let (max_input, _) = model.info();
+        assert_eq!(
+            max_input, 262_144,
+            "registry entry must win over the 131072 fallback window"
+        );
+
+        // With `LLM_FULL_MODEL_NAME=true` (`api_model_name` returns the
+        // canonical id) the request's `model` field is this string verbatim,
+        // so the registry key must match the configured id exactly.
+        model.set_full_id(true);
+        assert_eq!(model.api_model_name(), "deepseek-ai/DeepSeek-V4.1-Flash");
+
+        // A resolved model carries pricing; unresolved ones report zero, which
+        // is why every prior run_usage.json recorded `usd: 0`.
+        assert!(!model.pricing().input.is_zero());
+
+        // Prompt budgets are `window × utilization`, so this resolution is
+        // what actually determines prompt size. Unresolved, the window was the
+        // 131072 fallback and the link default (0.2) yielded 26214 tokens;
+        // resolving to 262144 roughly quadruples it to 52428.
+        let max_input = model.config.max_input();
+        assert_eq!(
+            knowdit_kg_model::context_budget(max_input, 0.2),
+            52_428,
+            "link default budget"
+        );
+        assert_eq!(
+            knowdit_kg_model::context_budget(max_input, 0.4),
+            104_857,
+            "extract/categorize default budget"
+        );
+    }
+
     #[test]
     fn only_openai_hosts_keep_the_cache_key() {
         assert!(endpoint_supports_prompt_cache_key(

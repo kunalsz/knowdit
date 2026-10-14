@@ -73,6 +73,65 @@ pub struct RouterEmbeddingCache {
     pub records: Vec<RouterEmbeddingRecord>,
 }
 
+#[derive(Debug)]
+pub struct IndexedRouterEmbeddingCache {
+    pub cache: RouterEmbeddingCache,
+    vectors: HashMap<(RouterEmbeddingDocumentKind, i32), (Vec<f32>, f64)>,
+}
+
+impl IndexedRouterEmbeddingCache {
+    pub fn new(cache: RouterEmbeddingCache) -> Result<Self> {
+        if cache.schema_version != ROUTER_EMBEDDING_CACHE_VERSION {
+            return Err(KgError::other(format!(
+                "unsupported router embedding cache version {}; expected {}",
+                cache.schema_version, ROUTER_EMBEDDING_CACHE_VERSION
+            )));
+        }
+        if cache.dimensions == 0 {
+            return Err(KgError::other("router embedding cache has zero dimensions"));
+        }
+
+        let mut vectors = HashMap::with_capacity(cache.records.len());
+        for record in &cache.records {
+            if record.vector.len() != cache.dimensions
+                || record.vector.iter().any(|value| !value.is_finite())
+            {
+                return Err(KgError::other(format!(
+                    "invalid embedding vector for {:?} {}",
+                    record.kind, record.id
+                )));
+            }
+            let norm = record
+                .vector
+                .iter()
+                .map(|value| f64::from(*value).powi(2))
+                .sum::<f64>()
+                .sqrt();
+            if vectors
+                .insert((record.kind, record.id), (record.vector.clone(), norm))
+                .is_some()
+            {
+                return Err(KgError::other(format!(
+                    "duplicate embedding record for {:?} {}",
+                    record.kind, record.id
+                )));
+            }
+        }
+
+        Ok(Self { cache, vectors })
+    }
+
+    pub fn vector_and_norm(
+        &self,
+        kind: RouterEmbeddingDocumentKind,
+        id: i32,
+    ) -> Option<(&[f32], f64)> {
+        self.vectors
+            .get(&(kind, id))
+            .map(|(vector, norm)| (vector.as_slice(), *norm))
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct RouterReplayReport {
     pub router: String,

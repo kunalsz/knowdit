@@ -409,9 +409,12 @@ async fn admit_incremental_project(
     agent_options: &knowdit_kg::agent_runner::AgentRunOptions,
     merge_chunking: knowdit_kg::agents::MergeChunkingOptions,
 ) -> Result<()> {
+    let (semantic_merges, finding_merges) = project
+        .prepare_merge(db, llm, extract, agent_options, merge_chunking)
+        .await?;
     let txn = db.begin().await?;
     let new_canonicals = project
-        .merge_and_write_txn(&txn, db, llm, extract, agent_options, merge_chunking)
+        .write_prepared_merge_txn(&txn, db, extract, &semantic_merges, &finding_merges)
         .await?;
     let enqueued = db
         .enqueue_pending_canonical_semantics_txn(&txn, &new_canonicals)

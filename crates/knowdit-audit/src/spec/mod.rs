@@ -2164,19 +2164,19 @@ impl PlannedLinkWork {
                 .await
             {
                 Ok(result) => step_result = result,
-                // Truncation retries exhausted: the model cannot fit a response
-                // in the provider's output cap, so stop spending on this link
-                // but keep everything committed so far.
-                Err(err) if knowdit_kg::agent_retry::is_output_length(&err) => {
+                // Retryable provider errors exhausted: the model cannot fit a
+                // response in the provider's output cap (or the provider kept
+                // returning empty choices), so stop spending on this link but
+                // keep everything committed so far.
+                Err(err) if knowdit_kg::agent_retry::is_retryable(&err) => {
+                    let reason = knowdit_kg::agent_retry::exhaustion_reason(
+                        &err,
+                        truncation.consecutive_failures(),
+                    );
                     let mut guard = draft.0.lock().await;
                     guard.final_status.get_or_insert(LinkSpecStatus::Abandoned);
                     guard.abort_reason.get_or_insert_with(|| {
-                        format!(
-                            "agent response truncated by the provider output cap {} times in a row \
-                             (last at step {steps}); raise --llm-max-completion-tokens or use a \
-                             model with a larger output limit",
-                            truncation.consecutive_failures()
-                        )
+                        format!("{reason} (last at step {steps})")
                     });
                     break;
                 }

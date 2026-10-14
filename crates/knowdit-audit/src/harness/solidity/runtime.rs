@@ -639,10 +639,16 @@ impl AgentLoopState {
             step = match next {
                 Ok(s) => s,
                 Err(e) => {
-                    let hint = if knowdit_kg::agent_retry::is_output_length(&e) {
-                        " (provider output cap; raise --llm-max-completion-tokens)"
+                    let hint = if knowdit_kg::agent_retry::is_retryable(&e) {
+                        format!(
+                            " ({})",
+                            knowdit_kg::agent_retry::exhaustion_reason(
+                                &e,
+                                truncation.consecutive_failures(),
+                            )
+                        )
                     } else {
-                        ""
+                        String::new()
                     };
                     return AttemptOutcome::AgentError(format!(
                         "step {}: {e}{hint}",

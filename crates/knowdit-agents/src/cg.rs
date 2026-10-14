@@ -586,12 +586,14 @@ impl FunctionAgentRunner {
                 .await
             {
                 Ok(result) => step_result = result,
-                Err(err) if knowdit_kg::agent_retry::is_output_length(&err) => {
+                Err(err) if knowdit_kg::agent_retry::is_retryable(&err) => {
                     return Err(color_eyre::eyre::eyre!(
-                        "callgraph agent response truncated by the provider output cap {} times in a \
-                         row at step {steps} for {function_str}; raise --llm-max-completion-tokens \
-                         or use a model with a larger output limit",
-                        truncation.consecutive_failures(),
+                        "callgraph agent {} at step {steps} for {function_str}; raise \
+                         --llm-max-completion-tokens or use a model with a larger output limit",
+                        knowdit_kg::agent_retry::exhaustion_reason(
+                            &err,
+                            truncation.consecutive_failures(),
+                        ),
                     ));
                 }
                 Err(err) => {

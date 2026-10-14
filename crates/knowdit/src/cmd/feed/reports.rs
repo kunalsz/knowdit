@@ -240,16 +240,19 @@ impl ReportsArgs {
             }
 
             tracing::info!(
-                "Processing report batch {}/{}: extraction, merge, database write, and linking",
+                "Processing report batch {}/{}: extraction, merge, and database write (linking deferred to the end of the feed)",
                 batch_index + 1,
                 total_batches
             );
+            // Admission is checkpointed per report. Defer cross-project linking
+            // until every report batch has been admitted so a small loading batch
+            // does not repeatedly rescan and relink the whole knowledge graph.
             run_pipeline(
                 db,
                 &llm,
                 projects,
                 self.concurrency,
-                true,
+                false,
                 true,
                 agent_options.clone(),
                 merge_chunking,
@@ -258,6 +261,12 @@ impl ReportsArgs {
             )
             .await?;
         }
+
+        tracing::info!(
+            "All report batches admitted; running one retro-link and pending-finding link pass"
+        );
+        knowdit_kg::link::retro_link_pending_semantics(db, &llm, link_options.clone()).await?;
+        link_options.link_pending_findings(db, &llm).await?;
 
         let operation_args = serde_json::to_value(ReportsOperationArgs {
             merge: self.merge.clone(),

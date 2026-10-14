@@ -156,12 +156,14 @@ impl ProjectProfileGenerator {
                 .await
             {
                 Ok(result) => step = result,
-                Err(err) if knowdit_kg::agent_retry::is_output_length(&err) => {
+                Err(err) if knowdit_kg::agent_retry::is_retryable(&err) => {
                     return Err(eyre!(
-                        "profile-gen: response truncated by the provider output cap {} times in a \
-                         row at step {steps}; raise --llm-max-completion-tokens or use a model with \
-                         a larger output limit",
-                        truncation.consecutive_failures(),
+                        "profile-gen: {} at step {steps}; raise --llm-max-completion-tokens or use \
+                         a model with a larger output limit",
+                        knowdit_kg::agent_retry::exhaustion_reason(
+                            &err,
+                            truncation.consecutive_failures(),
+                        ),
                     ));
                 }
                 Err(err) => {

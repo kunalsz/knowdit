@@ -203,7 +203,7 @@ pub struct FindingLinkOptions {
     pub compact_semantic_cards: bool,
     /// Optional precomputed finding/semantic vectors for dense retrieval.
     /// BM25 remains the fallback when this is absent or invalid.
-    pub embedding_cache: Option<Arc<crate::router_eval::RouterEmbeddingCache>>,
+    pub embedding_cache: Option<Arc<crate::router_eval::IndexedRouterEmbeddingCache>>,
 }
 
 #[derive(Debug, Clone)]
@@ -542,7 +542,7 @@ struct FindingLinkBudgets {
     raw_child_char_cap: usize,
     max_link_candidates: usize,
     compact_semantic_cards: bool,
-    embedding_cache: Option<Arc<crate::router_eval::RouterEmbeddingCache>>,
+    embedding_cache: Option<Arc<crate::router_eval::IndexedRouterEmbeddingCache>>,
 }
 
 impl FindingLinkBudgets {
@@ -1318,7 +1318,7 @@ fn filter_link_candidates(
     nodes: Vec<knowdit_kg_model::db::semantic_node::Model>,
     findings: &[PendingFindingForLinking],
     limit: usize,
-    embedding_cache: Option<&Arc<crate::router_eval::RouterEmbeddingCache>>,
+    embedding_cache: Option<&Arc<crate::router_eval::IndexedRouterEmbeddingCache>>,
 ) -> Vec<knowdit_kg_model::db::semantic_node::Model> {
     if limit == 0 || nodes.len() <= limit || findings.is_empty() {
         return nodes;
@@ -1350,8 +1350,15 @@ fn filter_link_candidates(
             (score, index)
         })
         .collect::<Vec<_>>();
+    ranked.sort_by(|lhs, rhs| {
+        rhs.0
+            .partial_cmp(&lhs.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| nodes[lhs.1].id.cmp(&nodes[rhs.1].id))
+    });
     // Novel wording with no lexical overlap is unsafe to filter. Preserve
-    // recall by falling back to the exhaustive corpus for that context.
+    // recall by checking the actual best score after ranking, not whichever
+    // semantic happened to be returned first by the database.
     if ranked.first().is_none_or(|(score, _)| *score < 2.0) {
         tracing::warn!(
             findings = findings.len(),
@@ -1360,34 +1367,46 @@ fn filter_link_candidates(
         );
         return nodes;
     }
-    ranked.sort_by(|lhs, rhs| {
-        rhs.0
-            .partial_cmp(&lhs.0)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| nodes[lhs.1].id.cmp(&nodes[rhs.1].id))
-    });
 
     let dense_order = embedding_cache.and_then(|cache| {
-        let finding_vectors = findings.iter().filter_map(|finding| {
-            let vector = cache.records.iter().find(|record| {
-                record.kind == crate::router_eval::RouterEmbeddingDocumentKind::Finding
-                    && record.id == finding.finding_id
-            })?.vector.clone();
-            let norm = vector_norm(&vector);
-            (norm > f64::EPSILON).then_some((vector, norm))
-        }).collect::<Vec<_>>();
-        if finding_vectors.is_empty() { return None; }
-        let mut dense = nodes.iter().enumerate().filter_map(|(index, node)| {
-            let sv = cache.records.iter().find(|record| {
-                record.kind == crate::router_eval::RouterEmbeddingDocumentKind::Semantic
-                    && record.id == node.id
-            })?.vector.clone();
-            let snorm = vector_norm(&sv);
-            if snorm <= f64::EPSILON { return None; }
-            let score = finding_vectors.iter().map(|(fv, fnorm)| dot_vectors(fv, &sv) / fnorm / snorm).fold(f64::NEG_INFINITY, f64::max);
-            Some((score, index))
-        }).collect::<Vec<_>>();
-        dense.sort_by(|lhs, rhs| rhs.0.partial_cmp(&lhs.0).unwrap_or(std::cmp::Ordering::Equal));
+        let finding_vectors = findings
+            .iter()
+            .filter_map(|finding| {
+                let (vector, norm) = cache.vector_and_norm(
+                    crate::router_eval::RouterEmbeddingDocumentKind::Finding,
+                    finding.finding_id,
+                )?;
+                (norm > f64::EPSILON).then_some((vector, norm))
+            })
+            .collect::<Vec<_>>();
+        if finding_vectors.is_empty() {
+            return None;
+        }
+        let mut dense = nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, node)| {
+                let (semantic_vector, semantic_norm) = cache.vector_and_norm(
+                    crate::router_eval::RouterEmbeddingDocumentKind::Semantic,
+                    node.id,
+                )?;
+                if semantic_norm <= f64::EPSILON {
+                    return None;
+                }
+                let score = finding_vectors
+                    .iter()
+                    .map(|(finding_vector, finding_norm)| {
+                        dot_vectors(finding_vector, semantic_vector) / finding_norm / semantic_norm
+                    })
+                    .fold(f64::NEG_INFINITY, f64::max);
+                Some((score, index))
+            })
+            .collect::<Vec<_>>();
+        dense.sort_by(|lhs, rhs| {
+            rhs.0
+                .partial_cmp(&lhs.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         Some(dense)
     });
 
@@ -1431,10 +1450,6 @@ fn link_tokens(text: &str) -> impl Iterator<Item = String> + '_ {
     text.split(|c: char| !c.is_ascii_alphanumeric())
         .filter(|token| token.len() >= 3)
         .map(|token| token.to_ascii_lowercase())
-}
-
-fn vector_norm(vector: &[f32]) -> f64 {
-    vector.iter().map(|value| f64::from(*value).powi(2)).sum::<f64>().sqrt()
 }
 
 fn dot_vectors(lhs: &[f32], rhs: &[f32]) -> f64 {
@@ -2292,7 +2307,7 @@ fn retro_link_checkpoint_hash(
     findings: &[PendingFindingForLinking],
 ) -> Result<String> {
     let manifest = RetroLinkCheckpointManifest {
-        version: "retro-link-v1",
+        version: "retro-link-v2",
         model: model.model_id_str().to_string(),
         max_agent_steps: options.max_agent_steps,
         max_response_attempts: options.max_response_attempts,
@@ -2364,7 +2379,8 @@ pub async fn retro_link_pending_semantics(
     llm: &LLM,
     options: FindingLinkOptions,
 ) -> Result<()> {
-    let pending_semantics = db.list_pending_canonical_semantics().await?;
+    let mut pending_semantics = db.list_pending_canonical_semantics().await?;
+    pending_semantics.sort_by_key(|semantic| semantic.id);
     if pending_semantics.is_empty() {
         // A prior run may have cleared the queue immediately before being
         // interrupted while removing its checkpoints. Clean those rows on the
@@ -2374,7 +2390,8 @@ pub async fn retro_link_pending_semantics(
         tracing::info!("Retro-link: pending_semantic queue is empty, nothing to do");
         return Ok(());
     }
-    let already_linked_findings = db.list_findings_with_link_status().await?;
+    let mut already_linked_findings = db.list_findings_with_link_status().await?;
+    already_linked_findings.sort_by_key(|finding| finding.finding_id);
     if already_linked_findings.is_empty() {
         tracing::info!(
             "Retro-link: no findings in finding_link_status; clearing the {} queued pending semantic(s) without LLM work (bootstrap path)",
@@ -2398,8 +2415,8 @@ pub async fn retro_link_pending_semantics(
     options.warn_param_drift(model);
     let budgets = FindingLinkBudgets::from_options(model, options.clone());
 
-    // Render the (small, bounded) pending semantics as a single candidate
-    // block — they all fit in one prompt.
+    // Render each pending semantic as a candidate entry; they are chunked to
+    // the prompt budget below.
     let candidate_entries: Vec<FindingLinkCandidateEntry> = pending_semantics
         .iter()
         .map(|node| {
@@ -2432,15 +2449,22 @@ pub async fn retro_link_pending_semantics(
         })
         .collect();
 
-    let context_key = FindingLinkContextKey::empty();
-    let context = std::sync::Arc::new(FindingLinkContext::build(
-        model,
-        &context_key,
-        candidate_entries,
-    ));
-    let finding_token_budget = budgets.finding_token_budget(model, context.as_ref())?;
+    // A single feed run can introduce far more new canonicals than fit in one
+    // prompt, so chunk the pending semantics like the regular linker instead of
+    // assuming the whole queue is bounded.
+    let base_context_key = FindingLinkContextKey::empty();
+    let semantic_token_budget =
+        budgets.semantic_token_budget(model, base_context_key.prompt_category())?;
+    let candidate_groups = group_finding_link_candidate_entries(candidate_entries)?;
+    let candidate_chunks = partition_finding_link_candidate_groups(
+        candidate_groups,
+        semantic_token_budget,
+        budgets.max_semantics_per_batch,
+    );
+    let pending_semantic_count = pending_semantics.len();
 
-    // Build per-finding entries.
+    // Build per-finding entries once: every semantic chunk renders the same
+    // finding text and differs only in its candidate prefix.
     let entries: Vec<FindingLinkBatchEntry> = already_linked_findings
         .into_iter()
         .map(|pending| {
@@ -2466,18 +2490,49 @@ pub async fn retro_link_pending_semantics(
             }
         })
         .collect();
-
     let total = entries.len();
-    let batches = partition_finding_link_entries(
-        entries,
-        finding_token_budget,
-        budgets.max_findings_per_batch,
-    );
+
+    // One work unit per (semantic chunk × finding batch). Global indices are
+    // assigned chunk-then-batch, so the contiguous-prefix checkpoint contract
+    // stays a deterministic function of the queue and prompt-affecting options.
+    let mut units: Vec<(Arc<FindingLinkContext>, FindingLinkBatch)> = Vec::new();
+    for (chunk_index, chunk_entries) in candidate_chunks.into_iter().enumerate() {
+        let context_key = base_context_key.with_semantic_chunk(chunk_index);
+        let context = Arc::new(FindingLinkContext::build(
+            model,
+            &context_key,
+            chunk_entries,
+        ));
+        let finding_token_budget = budgets.finding_token_budget(model, context.as_ref())?;
+        for batch_entries in partition_finding_link_entries(
+            entries.clone(),
+            finding_token_budget,
+            budgets.max_findings_per_batch,
+        ) {
+            let finding_token_count = batch_entries.iter().map(|entry| entry.token_count).sum();
+            units.push((
+                context.clone(),
+                FindingLinkBatch {
+                    context_key: context_key.clone(),
+                    entries: batch_entries,
+                    finding_token_count,
+                    finding_token_budget,
+                    input_token_budget: budgets.input_token_budget,
+                },
+            ));
+        }
+    }
+    let chunk_count = units
+        .iter()
+        .map(|(context, _)| context.cache_key.clone())
+        .collect::<BTreeSet<_>>()
+        .len();
     tracing::info!(
-        "Retro-link: {} pending canonical semantic(s) × {} pre-linked finding(s) → {} batch(es)",
-        context.candidate_map.len(),
+        "Retro-link: {} pending canonical semantic(s) × {} pre-linked finding(s) → {} semantic chunk(s), {} work unit(s)",
+        pending_semantic_count,
         total,
-        batches.len()
+        chunk_count,
+        units.len()
     );
 
     // Load completed batch checkpoints after the batch partition is known.
@@ -2502,7 +2557,7 @@ pub async fn retro_link_pending_semantics(
             .await?;
         checkpoint_rows.clear();
     }
-    let checkpoints_valid = checkpoint_rows.len() <= batches.len()
+    let checkpoints_valid = checkpoint_rows.len() <= units.len()
         && checkpoint_rows
             .iter()
             .enumerate()
@@ -2515,77 +2570,129 @@ pub async fn retro_link_pending_semantics(
     }
 
     let mut total_inserted = 0usize;
-    for (idx, batch_entries) in batches.into_iter().enumerate() {
-        if let Some(row) = checkpoint_rows.get(idx) {
-            // The edge write precedes checkpoint persistence, so a checkpoint
-            // is safe to treat as complete. Replaying an edge batch would also
-            // be idempotent, but skipping avoids needless database work.
-            let checkpoint: RetroLinkCheckpointBatch = serde_json::from_str(&row.chunk_json)
-                .map_err(|error| KgError::other(format!("invalid retro-link checkpoint batch {}: {error}", idx + 1)))?;
-            tracing::info!(
-                "Retro-link batch {} checkpoint hit ({} finding result(s)); skipping LLM call",
-                idx + 1,
-                checkpoint.results.len()
-            );
-            total_inserted += checkpoint.inserted;
-            continue;
-        }
-        let finding_token_count = batch_entries.iter().map(|e| e.token_count).sum();
-        let batch = FindingLinkBatch {
-            context_key: context_key.clone(),
-            entries: batch_entries,
-            finding_token_count,
-            finding_token_budget,
-            input_token_budget: budgets.input_token_budget,
-        };
+    for (idx, row) in checkpoint_rows.iter().enumerate() {
+        // The edge write precedes checkpoint persistence, so a checkpoint is
+        // safe to treat as complete. Replaying would also be idempotent.
+        let checkpoint: RetroLinkCheckpointBatch =
+            serde_json::from_str(&row.chunk_json).map_err(|error| {
+                KgError::other(format!(
+                    "invalid retro-link checkpoint batch {}: {error}",
+                    idx + 1
+                ))
+            })?;
         tracing::info!(
-            "Retro-link batch {}: {} finding(s)",
+            "Retro-link batch {} checkpoint hit ({} finding result(s)); skipping LLM call",
             idx + 1,
-            batch.entries.len()
+            checkpoint.results.len()
         );
-        let runner = FindingLinkBatchAgentRunner {
-            phase: "retro-link",
-            llm: llm.clone(),
-            batch: &batch,
-            context: context.as_ref(),
-            agent_options: agent_options.clone(),
-            max_response_attempts,
-            evidence_min_high_medium: options.evidence_min_high_medium,
-            evidence_min_low: options.evidence_min_low,
-            high_quote_min_chars: options.high_quote_min_chars,
-        };
-        let results = runner.run().await?;
+        total_inserted += checkpoint.inserted;
+    }
 
-        // Translate to LinkEdge rows (carrying strength + evidence) and
-        // write directly. Skip writing finding_link_status — these
-        // findings are already there.
-        let mut edges = Vec::new();
-        for result in &results {
-            for link in &result.semantic_links {
-                edges.push(crate::db::LinkEdge {
-                    semantic_node_id: link.semantic_id,
-                    audit_finding_id: result.link_target_finding_id,
-                    strength: link.strength,
-                    evidence: link.evidence.clone(),
-                });
+    let checkpoint_count = checkpoint_rows.len();
+    let total_units = units.len();
+    let mut work = units.into_iter().enumerate().skip(checkpoint_count);
+    let concurrency = options.concurrency.max(1);
+    tracing::info!(
+        concurrency,
+        remaining_units = total_units.saturating_sub(checkpoint_count),
+        "Retro-link starting bounded batch workers"
+    );
+    let mut joins = tokio::task::JoinSet::new();
+    let mut ready = BTreeMap::new();
+    let mut next_commit_idx = checkpoint_count;
+    let model_id = model.model_id_str().to_string();
+
+    loop {
+        while joins.len() + ready.len() < concurrency {
+            let Some((idx, (task_context, batch))) = work.next() else {
+                break;
+            };
+            tracing::info!(
+                "Retro-link unit {}: {} finding(s) against {} candidate(s)",
+                idx + 1,
+                batch.entries.len(),
+                task_context.candidate_map.len()
+            );
+            let task_llm = llm.clone();
+            let task_agent_options = agent_options.clone();
+            let evidence_min_high_medium = options.evidence_min_high_medium;
+            let evidence_min_low = options.evidence_min_low;
+            let high_quote_min_chars = options.high_quote_min_chars;
+            joins.spawn(async move {
+                let runner = FindingLinkBatchAgentRunner {
+                    phase: "retro-link",
+                    llm: task_llm,
+                    batch: &batch,
+                    context: task_context.as_ref(),
+                    agent_options: task_agent_options,
+                    max_response_attempts,
+                    evidence_min_high_medium,
+                    evidence_min_low,
+                    high_quote_min_chars,
+                };
+                Ok::<_, KgError>((idx, runner.run().await?))
+            });
+        }
+
+        if joins.is_empty() {
+            break;
+        }
+        let joined = joins
+            .join_next()
+            .await
+            .expect("retro-link join set reported work but returned none");
+        match joined {
+            Ok(Ok((idx, results))) => {
+                ready.insert(idx, results);
+            }
+            Ok(Err(error)) => {
+                joins.abort_all();
+                while joins.join_next().await.is_some() {}
+                return Err(error);
+            }
+            Err(error) => {
+                joins.abort_all();
+                while joins.join_next().await.is_some() {}
+                return Err(KgError::other(format!("retro-link batch join: {error}")));
             }
         }
-        let inserted = db.append_semantic_finding_links(&edges).await?;
-        total_inserted += inserted;
-        db.save_extraction_chunk(
-            RETRO_LINK_CHECKPOINT_KEY,
-            RETRO_LINK_CHECKPOINT_STAGE,
-            idx as i32,
-            model.model_id_str(),
-            &checkpoint_hash,
-            &serde_json::to_string(&RetroLinkCheckpointBatch { results, inserted })?,
-        )
-        .await?;
-        tracing::info!(
-            "Retro-link batch {} inserted {} new semantic_finding_link row(s)",
-            idx + 1,
-            inserted
-        );
+
+        while let Some(results) = ready.remove(&next_commit_idx) {
+            let mut edges = Vec::new();
+            for result in &results {
+                for link in &result.semantic_links {
+                    edges.push(crate::db::LinkEdge {
+                        semantic_node_id: link.semantic_id,
+                        audit_finding_id: result.link_target_finding_id,
+                        strength: link.strength,
+                        evidence: link.evidence.clone(),
+                    });
+                }
+            }
+            let inserted = db.append_semantic_finding_links(&edges).await?;
+            db.save_extraction_chunk(
+                RETRO_LINK_CHECKPOINT_KEY,
+                RETRO_LINK_CHECKPOINT_STAGE,
+                next_commit_idx as i32,
+                &model_id,
+                &checkpoint_hash,
+                &serde_json::to_string(&RetroLinkCheckpointBatch { results, inserted })?,
+            )
+            .await?;
+            total_inserted += inserted;
+            tracing::info!(
+                "Retro-link batch {} inserted {} new semantic_finding_link row(s)",
+                next_commit_idx + 1,
+                inserted
+            );
+            next_commit_idx += 1;
+        }
+    }
+
+    if !ready.is_empty() {
+        return Err(KgError::other(
+            "retro-link completed with non-contiguous buffered batch results",
+        ));
     }
 
     let cleared = db.clear_pending_semantic_queue().await?;
@@ -2612,7 +2719,12 @@ fn finding_link_batch_entry_span(entries: &[FindingLinkBatchEntry]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::router_eval::{
+        IndexedRouterEmbeddingCache, RouterEmbeddingCache, RouterEmbeddingDocumentKind,
+        RouterEmbeddingRecord,
+    };
     use crate::vulnerability::{FindingSeverity, VulnerabilityCategory};
+    use knowdit_kg_model::db::semantic_node;
 
     fn sample_finding(id: i32) -> PendingFindingForLinking {
         PendingFindingForLinking {
@@ -2652,6 +2764,88 @@ mod tests {
 
     fn sample_context_key(category: DeFiCategory) -> FindingLinkContextKey {
         FindingLinkContextKey::for_category(category)
+    }
+
+    fn sample_semantic_node(id: i32, name: &str, category: DeFiCategory) -> semantic_node::Model {
+        semantic_node::Model {
+            id,
+            name: name.to_string(),
+            definition: format!("Definition for {name}"),
+            description: format!("Description for {name}"),
+            category,
+        }
+    }
+
+    /// A low-ID semantic with no lexical overlap must not veto filtering when a
+    /// higher-ID semantic matches strongly. Before the fix the confidence check
+    /// read `ranked.first()` *before* sorting, so it consulted this node's score
+    /// rather than the best score and fell back to the exhaustive corpus.
+    #[test]
+    fn candidate_filter_ranks_before_confidence_check() {
+        let nodes = vec![
+            sample_semantic_node(1, "unrelated ledger accounting", DeFiCategory::Lending),
+            sample_semantic_node(2, "malformed input trusts", DeFiCategory::Dexes),
+        ];
+        let findings = vec![sample_finding(1)];
+
+        let selected = filter_link_candidates(nodes.clone(), &findings, 1, None);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(
+            selected[0].id, 2,
+            "the strong lexical match must win the single slot"
+        );
+    }
+
+    /// With no lexical overlap at all the router must still preserve recall and
+    /// return the exhaustive corpus.
+    #[test]
+    fn candidate_filter_falls_back_when_no_lexical_overlap() {
+        let nodes = vec![
+            sample_semantic_node(1, "alpha beta gamma", DeFiCategory::Lending),
+            sample_semantic_node(2, "delta epsilon zeta", DeFiCategory::Dexes),
+        ];
+        let findings = vec![sample_finding(1)];
+
+        let selected = filter_link_candidates(nodes, &findings, 1, None);
+        assert_eq!(selected.len(), 2, "low confidence keeps the full corpus");
+    }
+
+    /// A cache that covers only some candidates must not change the lexical
+    /// outcome for the others, and a missing vector must never drop a candidate
+    /// from the safety set.
+    #[test]
+    fn candidate_filter_handles_partial_embedding_coverage() {
+        let nodes = vec![
+            sample_semantic_node(1, "unrelated ledger accounting", DeFiCategory::Lending),
+            sample_semantic_node(2, "malformed input trusts", DeFiCategory::Dexes),
+        ];
+        // Only the finding and semantic 2 have vectors; semantic 1 is absent.
+        let cache = IndexedRouterEmbeddingCache::new(RouterEmbeddingCache {
+            schema_version: crate::router_eval::ROUTER_EMBEDDING_CACHE_VERSION,
+            model: "test".to_string(),
+            dimensions: 2,
+            records: vec![
+                RouterEmbeddingRecord {
+                    kind: RouterEmbeddingDocumentKind::Finding,
+                    id: 1,
+                    fingerprint: "f".to_string(),
+                    vector: vec![1.0, 0.0],
+                },
+                RouterEmbeddingRecord {
+                    kind: RouterEmbeddingDocumentKind::Semantic,
+                    id: 2,
+                    fingerprint: "s".to_string(),
+                    vector: vec![1.0, 0.0],
+                },
+            ],
+        })
+        .expect("valid cache");
+        let cache = Arc::new(cache);
+
+        let findings = vec![sample_finding(1)];
+        let selected = filter_link_candidates(nodes.clone(), &findings, 1, Some(&cache));
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].id, 2);
     }
 
     #[test]

@@ -57,8 +57,11 @@ knowdit-audit = { version = "1.0.1", path = "./crates/knowdit-audit" }
 knowdit-cg-static = { version = "1.0.1", path = "./crates/knowdit-cg-static" }
 knowdit-project = { version = "1.0.1", path = "./crates/knowdit-project" }
 
-# Vendor-patched llmy-tokenizer: adds `deepseek/deepseek-expert` to the model
-# registry (mirrors deepseek-chat's window/pricing). Remove this patch once
-# upstream llmy ships the entry.
+# Vendor-patched llmy-tokenizer: adds `deepseek/deepseek-expert`
+# (mirrors deepseek-chat's window/pricing) and `deepseek-ai/DeepSeek-V4.1-Flash`
+# (maxInputTokens 262144; knowdit's default model id) to the model registry.
+# Without the second entry the default id misses the registry, every prompt
+# budget derives from the 131072-token fallback window, and usage reports zero
+# pricing. Remove this patch once upstream llmy ships both entries.
 [patch.crates-io]
 llmy-tokenizer = { path = "./vendor/llmy-tokenizer" }

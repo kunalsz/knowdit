@@ -64,9 +64,8 @@ use llmy::client::client::LLM;
 /// flattened into the same parse tree (e.g. `workflow learn`).
 #[derive(Args, Clone, Debug)]
 pub struct RetroLinkSharedArgs {
-    /// Number of finding batches to link concurrently. Retro-link
-    /// currently runs serially per batch; this is reserved for
-    /// future fan-out.
+    /// Maximum number of finding batches linked concurrently. Completed
+    /// batches are committed and checkpointed in deterministic index order.
     #[arg(long = "retro-link-concurrency", default_value_t = 1)]
     pub retro_link_concurrency: usize,
 }

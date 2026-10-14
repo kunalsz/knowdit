@@ -132,9 +132,12 @@ impl WorkflowLearnArgs {
             // between the two writes rolls both back. The
             // single-step `merge_and_write` wrapper is reserved for
             // bulk learn paths that don't run retro-link.
+            let (semantic_merges, finding_merges) = project
+                .prepare_merge(&kg, primary_llm, &extract, &agent_options, chunking)
+                .await?;
             let txn = kg.begin().await?;
             let new_canonicals = project
-                .merge_and_write_txn(&txn, &kg, primary_llm, &extract, &agent_options, chunking)
+                .write_prepared_merge_txn(&txn, &kg, &extract, &semantic_merges, &finding_merges)
                 .await?;
             let enqueued = kg
                 .enqueue_pending_canonical_semantics_txn(&txn, &new_canonicals)

@@ -1,7 +1,7 @@
 use clap::Args;
 use color_eyre::eyre::{Result, ensure};
 use knowdit_kg::learn::FindingLinkOptions;
-use knowdit_kg::router_eval::RouterEmbeddingCache;
+use knowdit_kg::router_eval::{IndexedRouterEmbeddingCache, RouterEmbeddingCache};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -202,13 +202,13 @@ impl FindingLinkCliArgs {
         let embedding_cache = self.embedding_cache.as_ref().and_then(|path| {
             let bytes = std::fs::read(path).ok()?;
             match serde_json::from_slice::<RouterEmbeddingCache>(&bytes) {
-                Ok(cache) if cache.schema_version == knowdit_kg::router_eval::ROUTER_EMBEDDING_CACHE_VERSION
-                    && cache.dimensions > 0
-                    && cache.records.iter().all(|record| record.vector.len() == cache.dimensions && record.vector.iter().all(|value| value.is_finite())) => Some(Arc::new(cache)),
-                Ok(_) => {
-                    tracing::warn!(path = %path.display(), "incompatible link embedding cache; using lexical retrieval");
-                    None
-                }
+                Ok(cache) => match IndexedRouterEmbeddingCache::new(cache) {
+                    Ok(cache) => Some(Arc::new(cache)),
+                    Err(error) => {
+                        tracing::warn!(path = %path.display(), %error, "incompatible link embedding cache; using lexical retrieval");
+                        None
+                    }
+                },
                 Err(error) => {
                     tracing::warn!(path = %path.display(), %error, "invalid link embedding cache; using lexical retrieval");
                     None

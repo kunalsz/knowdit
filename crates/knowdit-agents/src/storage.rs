@@ -309,12 +309,14 @@ impl StorageRunner {
                     .await
                 {
                     Ok(result) => step_result = result,
-                    Err(err) if knowdit_kg::agent_retry::is_output_length(&err) => {
+                    Err(err) if knowdit_kg::agent_retry::is_retryable(&err) => {
                         return Err(color_eyre::eyre::eyre!(
-                            "storage agent response truncated by the provider output cap {} times in \
-                             a row at step {steps} for contract {}; raise \
+                            "storage agent {} at step {steps} for contract {}; raise \
                              --llm-max-completion-tokens or use a model with a larger output limit",
-                            truncation.consecutive_failures(),
+                            knowdit_kg::agent_retry::exhaustion_reason(
+                                &err,
+                                truncation.consecutive_failures(),
+                            ),
                             contract.name,
                         ));
                     }

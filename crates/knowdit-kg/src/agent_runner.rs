@@ -333,14 +333,18 @@ impl<T> AgentChunkRunner<T> {
                 .await
             {
                 Ok(result) => step = result,
-                // Truncation retries exhausted: end the run gracefully with a
-                // reason, keeping whatever the buffer already collected, rather
-                // than failing the whole phase for one over-long response.
-                Err(err) if crate::agent_retry::is_output_length(&err) => {
+                // Retryable provider errors exhausted (output-cap truncation or
+                // an empty choice): end the run gracefully with a reason,
+                // keeping whatever the buffer already collected, rather than
+                // failing the whole phase for one bad response. Both errors
+                // leave the context untouched, so the collected items are valid.
+                Err(err) if crate::agent_retry::is_retryable(&err) => {
                     early_stop = Some(format!(
-                        "response truncated by the provider output cap {} times in a row at step \
-                         {steps}; raise --llm-max-completion-tokens",
-                        truncation.consecutive_failures()
+                        "{} at step {steps}; raise --llm-max-completion-tokens or retry",
+                        crate::agent_retry::exhaustion_reason(
+                            &err,
+                            truncation.consecutive_failures()
+                        )
                     ));
                     break;
                 }

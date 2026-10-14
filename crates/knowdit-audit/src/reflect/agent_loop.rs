@@ -253,15 +253,17 @@ pub async fn drive_agent_loop<T: Send + Sync + 'static>(
             .await
         {
             Ok(result) => step = result,
-            // Truncation retries exhausted: surface a reason that names the
-            // output cap, since the caller otherwise reports a bare error and
+            // Retryable provider errors exhausted: surface a reason that names
+            // the failure, since the caller otherwise reports a bare error and
             // the fix (`--llm-max-completion-tokens`) is not obvious.
-            Err(err) if knowdit_kg::agent_retry::is_output_length(&err) => {
+            Err(err) if knowdit_kg::agent_retry::is_retryable(&err) => {
                 return Err(color_eyre::eyre::eyre!(
-                    "reflection agent response truncated by the provider output cap {} times in a \
-                     row at step {steps} (cache_key_suffix={cache_key_suffix}); raise \
-                     --llm-max-completion-tokens or use a model with a larger output limit",
-                    truncation.consecutive_failures(),
+                    "reflection agent {} at step {steps} (cache_key_suffix={cache_key_suffix}); \
+                     raise --llm-max-completion-tokens or use a model with a larger output limit",
+                    knowdit_kg::agent_retry::exhaustion_reason(
+                        &err,
+                        truncation.consecutive_failures(),
+                    ),
                 ));
             }
             Err(err) => {

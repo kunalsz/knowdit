@@ -938,8 +938,11 @@ impl ProjectData {
         agent_options: &AgentRunOptions,
         merge_chunking: MergeChunkingOptions,
     ) -> Result<()> {
+        let (semantic_merges, finding_merges) = self
+            .prepare_merge(db, llm, extract, agent_options, merge_chunking)
+            .await?;
         let txn = db.begin().await?;
-        self.merge_and_write_txn(&txn, db, llm, extract, agent_options, merge_chunking)
+        self.write_prepared_merge_txn(&txn, db, extract, &semantic_merges, &finding_merges)
             .await?;
         txn.commit().await?;
         if let Err(error) = db
@@ -955,16 +958,59 @@ impl ProjectData {
         Ok(())
     }
 
-    /// Transaction-scoped variant of [`Self::merge_and_write`].
-    /// Performs the merge-LLM passes (against the LIVE DB — these
-    /// are reads, not writes, so don't depend on the txn) and then
-    /// writes the resulting rows through
-    /// [`HistoricalDatabase::write_project_completed_txn`] using
-    /// the supplied transaction. Returns the canonical semantic
-    /// ids this project newly introduced, so the caller can chain
-    /// [`HistoricalDatabase::enqueue_pending_canonical_semantics_txn`]
-    /// in the same transaction when needed (incremental
-    /// `workflow learn` flow).
+    /// Compute semantic and finding merge decisions before opening a write
+    /// transaction. Project admission remains serial at the caller, so the live
+    /// candidate corpus cannot change between this method and the following
+    /// short transaction.
+    pub async fn prepare_merge(
+        &self,
+        db: &HistoricalDatabase,
+        llm: &LLM,
+        extract: &ExtractResult,
+        agent_options: &AgentRunOptions,
+        merge_chunking: MergeChunkingOptions,
+    ) -> Result<(Vec<MergeResult>, Vec<FindingMergeResult>)> {
+        if extract.semantics.is_empty() && extract.findings.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let semantic_merges = self
+            .merge_with_existing(db, llm, extract, agent_options, merge_chunking)
+            .await?;
+        let finding_merges = self
+            .merge_findings_with_existing(db, llm, extract, agent_options, merge_chunking)
+            .await?;
+        Ok((semantic_merges, finding_merges))
+    }
+
+    /// Atomically persist precomputed merge decisions. Callers may enqueue the
+    /// returned canonical IDs in the same transaction.
+    pub async fn write_prepared_merge_txn(
+        &self,
+        conn: &sea_orm::DatabaseTransaction,
+        db: &HistoricalDatabase,
+        extract: &ExtractResult,
+        semantic_merge_results: &[MergeResult],
+        finding_merge_results: &[FindingMergeResult],
+    ) -> Result<Vec<i32>> {
+        let new_canonicals = db
+            .write_project_completed_txn_with_source(
+                conn,
+                self.name(),
+                self.platform_id(),
+                &extract.categories,
+                semantic_merge_results,
+                finding_merge_results,
+                &extract.in_project_links,
+                self.feed_source.as_ref(),
+            )
+            .await?;
+        tracing::info!("Project {} fully processed and saved", self.display_id());
+        Ok(new_canonicals)
+    }
+
+    /// Backward-compatible transaction-scoped admission. Prefer
+    /// [`Self::prepare_merge`] followed by [`Self::write_prepared_merge_txn`]
+    /// so network-bound merge work does not hold a database transaction open.
     pub async fn merge_and_write_txn(
         &self,
         conn: &sea_orm::DatabaseTransaction,
@@ -974,47 +1020,11 @@ impl ProjectData {
         agent_options: &AgentRunOptions,
         merge_chunking: MergeChunkingOptions,
     ) -> Result<Vec<i32>> {
-        let pid = self.display_id();
-
-        if extract.semantics.is_empty() && extract.findings.is_empty() {
-            let new_canonicals = db
-                .write_project_completed_txn_with_source(
-                    conn,
-                    self.name(),
-                    self.platform_id(),
-                    &extract.categories,
-                    &[],
-                    &[],
-                    &InProjectLinks::default(),
-                    self.feed_source.as_ref(),
-                )
-                .await?;
-            tracing::info!("Project {} written (no semantics or findings)", pid);
-            return Ok(new_canonicals);
-        }
-
-        let semantic_merge_results = self
-            .merge_with_existing(db, llm, extract, agent_options, merge_chunking)
+        let (semantic_merges, finding_merges) = self
+            .prepare_merge(db, llm, extract, agent_options, merge_chunking)
             .await?;
-        let finding_merge_results = self
-            .merge_findings_with_existing(db, llm, extract, agent_options, merge_chunking)
-            .await?;
-
-        let new_canonicals = db
-            .write_project_completed_txn_with_source(
-                conn,
-                self.name(),
-                self.platform_id(),
-                &extract.categories,
-                &semantic_merge_results,
-                &finding_merge_results,
-                &extract.in_project_links,
-                self.feed_source.as_ref(),
-            )
-            .await?;
-
-        tracing::info!("Project {} fully processed and saved", pid);
-        Ok(new_canonicals)
+        self.write_prepared_merge_txn(conn, db, extract, &semantic_merges, &finding_merges)
+            .await
     }
 
     /// Check if this project is already completed in the DB.
