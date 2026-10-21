@@ -1,0 +1,22 @@
+[package]
+name = "llmy-tokenizer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+readme.workspace = true
+description.workspace = true
+homepage.workspace = true
+repository.workspace = true
+
+[dependencies]
+tiktoken-rs = "0.9"
+rust_decimal = { workspace = true, features = ["macros"] }
+
+[build-dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+base64 = "0.22"
+
+[dev-dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }

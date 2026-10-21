@@ -2556,15 +2556,18 @@ mod planner_tests {
         assert_eq!(options.effective_batch_links(), 10);
     }
 
-    /// Regression: `deepseek-ai/DeepSeek-V4.1-Flash` is not in llmy's registry
-    /// (the entry is `deepseek/deepseek-v4-flash`), so `max_input_tokens` is 0.
-    /// Before the fallback, `max_input() * 0.8 == 0` made the spec generator
-    /// compact on *every* step — agents re-read the same function bodies in a
-    /// loop and burned millions of input tokens for zero specs.
+    /// Regression: an id absent from llmy's registry leaves `max_input_tokens`
+    /// at 0. Before the fallback, `max_input() * 0.8 == 0` made the spec
+    /// generator compact on *every* step — agents re-read the same function
+    /// bodies in a loop and burned millions of input tokens for zero specs.
+    ///
+    /// The default id (`deepseek-ai/DeepSeek-V4.1-Flash`) now resolves via the
+    /// vendored registry entry, so this uses a deliberately unknown id to keep
+    /// exercising the fallback path.
     #[test]
     fn unknown_registry_model_still_yields_a_usable_compact_threshold() {
         use std::str::FromStr;
-        let model = llmy::client::model::OpenAIModel::from_str("deepseek-ai/DeepSeek-V4.1-Flash")
+        let model = llmy::client::model::OpenAIModel::from_str("knowdit/unknown-registry-model")
             .expect("custom model id parses");
         assert_eq!(
             model.config.max_input(),

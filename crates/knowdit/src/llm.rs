@@ -107,8 +107,8 @@ mod tests {
 
     /// The default model id shipped in `.env` must resolve in llmy's registry.
     ///
-    /// `deepseek-ai/DeepSeek-V4.1-Flash` is not an upstream registry key, so
-    /// without the vendored entry it falls through to `custom_model` with
+    /// `deepseek-ai/DeepSeek-V4.1-Flash-1017` is not an upstream registry key,
+    /// so without the vendored entry it falls through to `custom_model` with
     /// `max_input_tokens: 0`. Every budget then derives from the 131072-token
     /// fallback window instead of the real one, which silently shrinks link
     /// prompts ~10x (`--input-token-budget 262144` is clamped to
@@ -119,7 +119,7 @@ mod tests {
     fn default_model_id_resolves_in_the_registry() {
         use std::str::FromStr;
 
-        let mut model = OpenAIModel::from_str("deepseek-ai/DeepSeek-V4.1-Flash")
+        let mut model = OpenAIModel::from_str("deepseek-ai/DeepSeek-V4.1-Flash-1017")
             .expect("default model id must parse");
         let (max_input, _) = model.info();
         assert_eq!(
@@ -131,7 +131,7 @@ mod tests {
         // canonical id) the request's `model` field is this string verbatim,
         // so the registry key must match the configured id exactly.
         model.set_full_id(true);
-        assert_eq!(model.api_model_name(), "deepseek-ai/DeepSeek-V4.1-Flash");
+        assert_eq!(model.api_model_name(), "deepseek-ai/DeepSeek-V4.1-Flash-1017");
 
         // A resolved model carries pricing; unresolved ones report zero, which
         // is why every prior run_usage.json recorded `usd: 0`.

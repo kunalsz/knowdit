@@ -58,7 +58,7 @@ knowdit-cg-static = { version = "1.0.1", path = "./crates/knowdit-cg-static" }
 knowdit-project = { version = "1.0.1", path = "./crates/knowdit-project" }
 
 # Vendor-patched llmy-tokenizer: adds `deepseek/deepseek-expert`
-# (mirrors deepseek-chat's window/pricing) and `deepseek-ai/DeepSeek-V4.1-Flash`
+# (mirrors deepseek-chat's window/pricing) and `deepseek-ai/DeepSeek-V4.1-Flash-1017`
 # (maxInputTokens 262144; knowdit's default model id) to the model registry.
 # Without the second entry the default id misses the registry, every prompt
 # budget derives from the 131072-token fallback window, and usage reports zero

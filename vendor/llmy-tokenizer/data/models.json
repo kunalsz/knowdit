@@ -1,0 +1,3385 @@
+{
+  "mimo/mimo-v2.5-pro": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 5,
+      "perMessage": 4,
+      "toolsExist": 24,
+      "perTool": 6,
+      "perDesc": 2,
+      "perFirstProp": 5,
+      "perAdditionalProp": 3,
+      "perPropDesc": 2,
+      "perEnum": 7,
+      "perNestedObject": -3,
+      "perArrayOfObjects": 1
+    },
+    "name": "MiMo V2.5 Pro",
+    "maxTokens": 131072,
+    "pricing": {
+      "input": 1e-06,
+      "output": 3e-06,
+      "input_cache_read": 2e-07,
+      "input_cache_write": 0
+    },
+    "maxInputTokens": 917504
+  },
+  "mimo/mimo-v2.5": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 5,
+      "perMessage": 4,
+      "toolsExist": 24,
+      "perTool": 6,
+      "perDesc": 2,
+      "perFirstProp": 5,
+      "perAdditionalProp": 3,
+      "perPropDesc": 2,
+      "perEnum": 7,
+      "perNestedObject": -3,
+      "perArrayOfObjects": 1
+    },
+    "name": "MiMo V2.5",
+    "maxTokens": 131072,
+    "pricing": {
+      "input": 4e-07,
+      "output": 2e-06,
+      "input_cache_read": 8e-08,
+      "input_cache_write": 0
+    },
+    "maxInputTokens": 917504
+  },
+  "mimo/mimo-v2.5-tts": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 5,
+      "perMessage": 4,
+      "toolsExist": 24,
+      "perTool": 6,
+      "perDesc": 2,
+      "perFirstProp": 5,
+      "perAdditionalProp": 3,
+      "perPropDesc": 2,
+      "perEnum": 7,
+      "perNestedObject": -3,
+      "perArrayOfObjects": 1
+    },
+    "name": "MiMo V2.5 TTS",
+    "maxTokens": 8192,
+    "pricing": {
+      "input": 0,
+      "output": 0,
+      "input_cache_read": 0,
+      "input_cache_write": 0
+    },
+    "maxInputTokens": 8192
+  },
+  "mimo/mimo-v2.5-tts-voicedesign": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 5,
+      "perMessage": 4,
+      "toolsExist": 24,
+      "perTool": 6,
+      "perDesc": 2,
+      "perFirstProp": 5,
+      "perAdditionalProp": 3,
+      "perPropDesc": 2,
+      "perEnum": 7,
+      "perNestedObject": -3,
+      "perArrayOfObjects": 1
+    },
+    "name": "MiMo V2.5 TTS VoiceDesign",
+    "maxTokens": 8192,
+    "pricing": {
+      "input": 0,
+      "output": 0,
+      "input_cache_read": 0,
+      "input_cache_write": 0
+    },
+    "maxInputTokens": 8192
+  },
+  "mimo/mimo-v2.5-tts-voiceclone": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 5,
+      "perMessage": 4,
+      "toolsExist": 24,
+      "perTool": 6,
+      "perDesc": 2,
+      "perFirstProp": 5,
+      "perAdditionalProp": 3,
+      "perPropDesc": 2,
+      "perEnum": 7,
+      "perNestedObject": -3,
+      "perArrayOfObjects": 1
+    },
+    "name": "MiMo V2.5 TTS VoiceClone",
+    "maxTokens": 8192,
+    "pricing": {
+      "input": 0,
+      "output": 0,
+      "input_cache_read": 0,
+      "input_cache_write": 0
+    },
+    "maxInputTokens": 8192
+  },
+  "mimo/mimo-v2-pro": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 5,
+      "perMessage": 4,
+      "toolsExist": 24,
+      "perTool": 6,
+      "perDesc": 2,
+      "perFirstProp": 5,
+      "perAdditionalProp": 3,
+      "perPropDesc": 2,
+      "perEnum": 7,
+      "perNestedObject": -3,
+      "perArrayOfObjects": 1
+    },
+    "name": "MiMo V2 Pro",
+    "maxTokens": 131072,
+    "pricing": {
+      "input": 1e-06,
+      "output": 3e-06,
+      "input_cache_read": 2e-07,
+      "input_cache_write": 0
+    },
+    "maxInputTokens": 917504
+  },
+  "mimo/mimo-v2-omni": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 5,
+      "perMessage": 4,
+      "toolsExist": 24,
+      "perTool": 6,
+      "perDesc": 2,
+      "perFirstProp": 5,
+      "perAdditionalProp": 3,
+      "perPropDesc": 2,
+      "perEnum": 7,
+      "perNestedObject": -3,
+      "perArrayOfObjects": 1
+    },
+    "name": "MiMo V2 Omni",
+    "maxTokens": 131072,
+    "pricing": {
+      "input": 4e-07,
+      "output": 2e-06,
+      "input_cache_read": 8e-08,
+      "input_cache_write": 0
+    },
+    "maxInputTokens": 131072
+  },
+  "mimo/mimo-v2-tts": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 5,
+      "perMessage": 4,
+      "toolsExist": 24,
+      "perTool": 6,
+      "perDesc": 2,
+      "perFirstProp": 5,
+      "perAdditionalProp": 3,
+      "perPropDesc": 2,
+      "perEnum": 7,
+      "perNestedObject": -3,
+      "perArrayOfObjects": 1
+    },
+    "name": "MiMo V2 TTS",
+    "maxTokens": 8192,
+    "pricing": {
+      "input": 0,
+      "output": 0,
+      "input_cache_read": 0,
+      "input_cache_write": 0
+    },
+    "maxInputTokens": 8192
+  },
+  "mimo/mimo-v2-flash": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 5,
+      "perMessage": 4,
+      "toolsExist": 24,
+      "perTool": 6,
+      "perDesc": 2,
+      "perFirstProp": 5,
+      "perAdditionalProp": 3,
+      "perPropDesc": 2,
+      "perEnum": 7,
+      "perNestedObject": -3,
+      "perArrayOfObjects": 1
+    },
+    "name": "MiMo V2 Flash",
+    "maxTokens": 65536,
+    "pricing": {
+      "input": 1e-07,
+      "output": 3e-07,
+      "input_cache_read": 1e-08,
+      "input_cache_write": 0
+    },
+    "maxInputTokens": 196608
+  },
+  "anthropic/claude-3-haiku": {
+    "encoding": "claude",
+    "tokens": {
+      "contentMultiplier": 1.1,
+      "baseOverhead": 6,
+      "perMessage": 2,
+      "toolsExist": 317,
+      "perTool": 53,
+      "perDesc": 5,
+      "perFirstProp": 13,
+      "perAdditionalProp": 12,
+      "perPropDesc": 5,
+      "perEnum": 9,
+      "perNestedObject": 12,
+      "perArrayOfObjects": 13
+    },
+    "name": "Claude 3 Haiku",
+    "maxTokens": 4096,
+    "pricing": {
+      "input": 2.5e-07,
+      "output": 1.25e-06,
+      "input_cache_read": 3e-08,
+      "input_cache_write": 3e-07
+    },
+    "maxInputTokens": 195904
+  },
+  "anthropic/claude-3-opus": {
+    "encoding": "claude",
+    "tokens": {
+      "contentMultiplier": 1.1,
+      "baseOverhead": 6,
+      "perMessage": 2,
+      "toolsExist": 586,
+      "perTool": 53,
+      "perDesc": 5,
+      "perFirstProp": 13,
+      "perAdditionalProp": 12,
+      "perPropDesc": 5,
+      "perEnum": 9,
+      "perNestedObject": 12,
+      "perArrayOfObjects": 13
+    },
+    "name": "Claude 3 Opus",
+    "maxTokens": 4096,
+    "pricing": {
+      "input": 1.5e-05,
+      "output": 7.5e-05,
+      "input_cache_read": 1.5e-06,
+      "input_cache_write": 1.875e-05
+    },
+    "maxInputTokens": 195904
+  },
+  "anthropic/claude-3.5-haiku": {
+    "encoding": "claude",
+    "tokens": {
+      "contentMultiplier": 1.1,
+      "baseOverhead": 6,
+      "perMessage": 2,
+      "toolsExist": 317,
+      "perTool": 53,
+      "perDesc": 5,
+      "perFirstProp": 13,
+      "perAdditionalProp": 12,
+      "perPropDesc": 5,
+      "perEnum": 9,
+      "perNestedObject": 12,
+      "perArrayOfObjects": 13
+    },
+    "name": "Claude 3.5 Haiku",
+    "maxTokens": 8192,
+    "pricing": {
+      "input": 8e-07,
+      "output": 4e-06,
+      "input_cache_read": 8e-08,
+      "input_cache_write": 1e-06
+    },
+    "maxInputTokens": 191808
+  },
+  "anthropic/claude-3.5-sonnet": {
+    "encoding": "claude",
+    "tokens": {
+      "contentMultiplier": 1.1,
+      "baseOverhead": 6,
+      "perMessage": 2,
+      "toolsExist": 366,
+      "perTool": 53,
+      "perDesc": 5,
+      "perFirstProp": 13,
+      "perAdditionalProp": 12,
+      "perPropDesc": 5,
+      "perEnum": 9,
+      "perNestedObject": 12,
+      "perArrayOfObjects": 13
+    },
+    "name": "Claude 3.5 Sonnet",
+    "maxTokens": 8192,
+    "pricing": {
+      "input": 3e-06,
+      "output": 1.5e-05,
+      "input_cache_read": 3e-07,
+      "input_cache_write": 3.75e-06
+    },
+    "maxInputTokens": 191808
+  },
+  "anthropic/claude-3.5-sonnet-20240620": {
+    "encoding": "claude",
+    "tokens": {
+      "contentMultiplier": 1.1,
+      "baseOverhead": 6,
+      "perMessage": 2,
+      "toolsExist": 347,
+      "perTool": 53,
+      "perDesc": 5,
+      "perFirstProp": 13,
+      "perAdditionalProp": 12,
+      "perPropDesc": 5,
+      "perEnum": 9,
+      "perNestedObject": 12,
+      "perArrayOfObjects": 13
+    },
+    "name": "Claude 3.5 Sonnet (2024-06-20)",
+    "maxTokens": 8192,
+    "pricing": {
+      "input": 3e-06,
+      "output": 1.5e-05
+    },
+    "maxInputTokens": 191808
+  },
+  "anthropic/claude-3.7-sonnet": {
+    "encoding": "claude",
+    "tokens": {
+      "contentMultiplier": 1.1,
+      "baseOverhead": 6,
+      "perMessage": 2,
+      "toolsExist": 366,
+      "perTool": 53,
+      "perDesc": 5,
+      "perFirstProp": 13,
+      "perAdditionalProp": 12,
+      "perPropDesc": 5,
+      "perEnum": 9,
+      "perNestedObject": 12,
+      "perArrayOfObjects": 13
+    },
+    "name": "Claude 3.7 Sonnet",
+    "maxTokens": 64000,
+    "pricing": {
+      "input": 3e-06,
+      "output": 1.5e-05,
+      "input_cache_read": 3e-07,
+      "input_cache_write": 3.75e-06
+    },
+    "maxInputTokens": 136000
+  },
+  "anthropic/claude-opus-4": {
+    "encoding": "claude",
+    "tokens": {
+      "contentMultiplier": 1.1,
+      "baseOverhead": 6,
+      "perMessage": 2,
+      "toolsExist": 366,
+      "perTool": 53,
+      "perDesc": 5,
+      "perFirstProp": 13,
+      "perAdditionalProp": 12,
+      "perPropDesc": 5,
+      "perEnum": 9,
+      "perNestedObject": 12,
+      "perArrayOfObjects": 13
+    },
+    "name": "Claude Opus 4",
+    "maxTokens": 32000,
+    "pricing": {
+      "input": 1.5e-05,
+      "output": 7.5e-05,
+      "input_cache_read": 1.5e-06,
+      "input_cache_write": 1.875e-05
+    },
+    "maxInputTokens": 168000
+  },
+  "anthropic/claude-opus-4.1": {
+    "encoding": "claude",
+    "tokens": {
+      "contentMultiplier": 1.1,
+      "baseOverhead": 6,
+      "perMessage": 2,
+      "toolsExist": 366,
+      "perTool": 53,
+      "perDesc": 5,
+      "perFirstProp": 13,
+      "perAdditionalProp": 12,
+      "perPropDesc": 5,
+      "perEnum": 9,
+      "perNestedObject": 12,
+      "perArrayOfObjects": 13
+    },
+    "name": "Claude Opus 4.1",
+    "maxTokens": 32000,
+    "pricing": {
+      "input": 1.5e-05,
+      "output": 7.5e-05,
+      "input_cache_read": 1.5e-06,
+      "input_cache_write": 1.875e-05
+    },
+    "maxInputTokens": 168000
+  },
+  "anthropic/claude-sonnet-4": {
+    "encoding": "claude",
+    "tokens": {
+      "contentMultiplier": 1.1,
+      "baseOverhead": 6,
+      "perMessage": 2,
+      "toolsExist": 366,
+      "perTool": 53,
+      "perDesc": 5,
+      "perFirstProp": 13,
+      "perAdditionalProp": 12,
+      "perPropDesc": 5,
+      "perEnum": 9,
+      "perNestedObject": 12,
+      "perArrayOfObjects": 13
+    },
+    "name": "Claude Sonnet 4",
+    "maxTokens": 64000,
+    "pricing": {
+      "input": 3e-06,
+      "output": 1.5e-05,
+      "input_cache_read": 3e-07,
+      "input_cache_write": 3.75e-06
+    },
+    "maxInputTokens": 136000
+  },
+  "anthropic/claude-sonnet-4.5": {
+    "encoding": "claude",
+    "tokens": {
+      "contentMultiplier": 1.1,
+      "baseOverhead": 6,
+      "perMessage": 2,
+      "toolsExist": 549,
+      "perTool": 53,
+      "perDesc": 5,
+      "perFirstProp": 13,
+      "perAdditionalProp": 12,
+      "perPropDesc": 5,
+      "perEnum": 9,
+      "perNestedObject": 12,
+      "perArrayOfObjects": 13
+    },
+    "name": "Claude Sonnet 4.5",
+    "maxTokens": 64000,
+    "pricing": {
+      "input": 3e-06,
+      "output": 1.5e-05,
+      "input_cache_read": 3e-07,
+      "input_cache_write": 3.75e-06
+    },
+    "maxInputTokens": 136000
+  },
+  "openai/gpt-4-turbo": {
+    "encoding": "cl100k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 6,
+      "perMessage": 3,
+      "toolsExist": 16,
+      "perTool": 6,
+      "perDesc": 2,
+      "perFirstProp": 5,
+      "perAdditionalProp": 3,
+      "perPropDesc": 3,
+      "perEnum": 7,
+      "perNestedObject": -3,
+      "perArrayOfObjects": 1
+    },
+    "name": "GPT-4 Turbo",
+    "maxTokens": 4096,
+    "pricing": {
+      "input": 1e-05,
+      "output": 3e-05
+    },
+    "maxInputTokens": 123904
+  },
+  "openai/gpt-4.1": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 6,
+      "perMessage": 3,
+      "toolsExist": 16,
+      "perTool": 6,
+      "perDesc": 1,
+      "perFirstProp": 5,
+      "perAdditionalProp": 3,
+      "perPropDesc": 2,
+      "perEnum": 7,
+      "perNestedObject": -3,
+      "perArrayOfObjects": 1
+    },
+    "name": "GPT-4.1",
+    "maxTokens": 32768,
+    "pricing": {
+      "input": 2e-06,
+      "output": 8e-06,
+      "input_cache_read": 5e-07,
+      "input_cache_write": 0
+    },
+    "maxInputTokens": 1014808
+  },
+  "openai/gpt-4.1-mini": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 6,
+      "perMessage": 3,
+      "toolsExist": 16,
+      "perTool": 6,
+      "perDesc": 1,
+      "perFirstProp": 5,
+      "perAdditionalProp": 3,
+      "perPropDesc": 2,
+      "perEnum": 7,
+      "perNestedObject": -3,
+      "perArrayOfObjects": 1
+    },
+    "name": "GPT-4.1 mini",
+    "maxTokens": 32768,
+    "pricing": {
+      "input": 4e-07,
+      "output": 1.6e-06,
+      "input_cache_read": 1e-07,
+      "input_cache_write": 0
+    },
+    "maxInputTokens": 1014808
+  },
+  "openai/gpt-4o": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 6,
+      "perMessage": 3,
+      "toolsExist": 16,
+      "perTool": 6,
+      "perDesc": 1,
+      "perFirstProp": 5,
+      "perAdditionalProp": 3,
+      "perPropDesc": 2,
+      "perEnum": 7,
+      "perNestedObject": -3,
+      "perArrayOfObjects": 1
+    },
+    "name": "GPT-4o",
+    "maxTokens": 16384,
+    "pricing": {
+      "input": 2.5e-06,
+      "output": 1e-05,
+      "input_cache_read": 1.25e-06,
+      "input_cache_write": 0
+    },
+    "maxInputTokens": 111616
+  },
+  "openai/gpt-4o-mini": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 6,
+      "perMessage": 3,
+      "toolsExist": 16,
+      "perTool": 6,
+      "perDesc": 1,
+      "perFirstProp": 5,
+      "perAdditionalProp": 3,
+      "perPropDesc": 2,
+      "perEnum": 7,
+      "perNestedObject": -3,
+      "perArrayOfObjects": 1
+    },
+    "name": "GPT-4o mini",
+    "maxTokens": 16384,
+    "pricing": {
+      "input": 1.5e-07,
+      "output": 6e-07,
+      "input_cache_read": 7.5e-08,
+      "input_cache_write": 0
+    },
+    "maxInputTokens": 111616
+  },
+  "openai/gpt-5": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 5,
+      "perMessage": 4,
+      "toolsExist": 24,
+      "perTool": 6,
+      "perDesc": 2,
+      "perFirstProp": 5,
+      "perAdditionalProp": 3,
+      "perPropDesc": 2,
+      "perEnum": 7,
+      "perNestedObject": -3,
+      "perArrayOfObjects": 1
+    },
+    "name": "GPT-5",
+    "maxTokens": 128000,
+    "pricing": {
+      "input": 1.25e-06,
+      "output": 1e-05,
+      "input_cache_read": 1.3e-07,
+      "input_cache_write": 0
+    },
+    "maxInputTokens": 272000
+  },
+  "openai/gpt-5-mini": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 5,
+      "perMessage": 4,
+      "toolsExist": 21,
+      "perTool": 6,
+      "perDesc": 2,
+      "perFirstProp": 5,
+      "perAdditionalProp": 3,
+      "perPropDesc": 2,
+      "perEnum": 7,
+      "perNestedObject": -3,
+      "perArrayOfObjects": 1
+    },
+    "name": "GPT-5 mini",
+    "maxTokens": 128000,
+    "pricing": {
+      "input": 2.5e-07,
+      "output": 2e-06,
+      "input_cache_read": 3e-08,
+      "input_cache_write": 0
+    },
+    "maxInputTokens": 272000
+  },
+  "openai/gpt-5-nano": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 5,
+      "perMessage": 4,
+      "toolsExist": 21,
+      "perTool": 6,
+      "perDesc": 2,
+      "perFirstProp": 5,
+      "perAdditionalProp": 3,
+      "perPropDesc": 2,
+      "perEnum": 7,
+      "perNestedObject": -3,
+      "perArrayOfObjects": 1
+    },
+    "name": "GPT-5 nano",
+    "maxTokens": 128000,
+    "pricing": {
+      "input": 5e-08,
+      "output": 4e-07,
+      "input_cache_read": 1e-08,
+      "input_cache_write": 0
+    },
+    "maxInputTokens": 272000
+  },
+  "openai/gpt-oss-120b": {
+    "encoding": "p50k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 66,
+      "perMessage": 4,
+      "toolsExist": 40,
+      "perTool": 9,
+      "perDesc": 1,
+      "perFirstProp": 3,
+      "perAdditionalProp": 3,
+      "perPropDesc": 1,
+      "perEnum": 6,
+      "perNestedObject": 11,
+      "perArrayOfObjects": 9
+    },
+    "name": "gpt-oss-120b",
+    "maxTokens": 131072,
+    "pricing": {
+      "input": 1e-07,
+      "output": 5e-07
+    },
+    "maxInputTokens": 0
+  },
+  "openai/gpt-oss-20b": {
+    "encoding": "p50k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 68,
+      "perMessage": 4,
+      "toolsExist": 38,
+      "perTool": 9,
+      "perDesc": -1,
+      "perFirstProp": 3,
+      "perAdditionalProp": 3,
+      "perPropDesc": 1,
+      "perEnum": 6,
+      "perNestedObject": 11,
+      "perArrayOfObjects": 9
+    },
+    "name": "gpt-oss-20b",
+    "maxTokens": 8192,
+    "pricing": {
+      "input": 7e-08,
+      "output": 3e-07
+    },
+    "maxInputTokens": 119808
+  },
+  "openai/o1": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 5,
+      "perMessage": 3,
+      "toolsExist": 19,
+      "perTool": 6,
+      "perDesc": -28,
+      "perFirstProp": 5,
+      "perAdditionalProp": 3,
+      "perPropDesc": 2,
+      "perEnum": 7,
+      "perNestedObject": -3,
+      "perArrayOfObjects": 1
+    },
+    "name": "o1",
+    "maxTokens": 100000,
+    "pricing": {
+      "input": 1.5e-05,
+      "output": 6e-05,
+      "input_cache_read": 7.5e-06,
+      "input_cache_write": 0
+    },
+    "maxInputTokens": 100000
+  },
+  "openai/o3": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 5,
+      "perMessage": 4,
+      "toolsExist": 19,
+      "perTool": 6,
+      "perDesc": 1,
+      "perFirstProp": 5,
+      "perAdditionalProp": 3,
+      "perPropDesc": 2,
+      "perEnum": 7,
+      "perNestedObject": -3,
+      "perArrayOfObjects": 1
+    },
+    "name": "o3",
+    "maxTokens": 100000,
+    "pricing": {
+      "input": 2e-06,
+      "output": 8e-06,
+      "input_cache_read": 5e-07,
+      "input_cache_write": 0
+    },
+    "maxInputTokens": 100000
+  },
+  "openai/o3-mini": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 5,
+      "perMessage": 3,
+      "toolsExist": 19,
+      "perTool": 6,
+      "perDesc": 1,
+      "perFirstProp": 5,
+      "perAdditionalProp": 3,
+      "perPropDesc": 2,
+      "perEnum": 7,
+      "perNestedObject": -3,
+      "perArrayOfObjects": 1
+    },
+    "name": "o3-mini",
+    "maxTokens": 100000,
+    "pricing": {
+      "input": 1.1e-06,
+      "output": 4.4e-06,
+      "input_cache_read": 5.5e-07,
+      "input_cache_write": 0
+    },
+    "maxInputTokens": 100000
+  },
+  "openai/o4-mini": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 5,
+      "perMessage": 4,
+      "toolsExist": 19,
+      "perTool": 6,
+      "perDesc": 1,
+      "perFirstProp": 5,
+      "perAdditionalProp": 3,
+      "perPropDesc": 2,
+      "perEnum": 7,
+      "perNestedObject": -3,
+      "perArrayOfObjects": 1
+    },
+    "name": "o4-mini",
+    "maxTokens": 100000,
+    "pricing": {
+      "input": 1.1e-06,
+      "output": 4.4e-06,
+      "input_cache_read": 2.75e-07,
+      "input_cache_write": 0
+    },
+    "maxInputTokens": 100000
+  },
+  "xai/grok-2": {
+    "encoding": "cl100k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 5,
+      "perMessage": 3,
+      "toolsExist": 107,
+      "perTool": 35,
+      "perDesc": 3,
+      "perFirstProp": 8,
+      "perAdditionalProp": 7,
+      "perPropDesc": 3,
+      "perEnum": 6,
+      "perNestedObject": 9,
+      "perArrayOfObjects": 10
+    },
+    "name": "Grok 2",
+    "maxTokens": 4000,
+    "pricing": {
+      "input": 2e-06,
+      "output": 1e-05
+    },
+    "maxInputTokens": 127072
+  },
+  "xai/grok-2-vision": {
+    "encoding": "cl100k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 5,
+      "perMessage": 3,
+      "toolsExist": 107,
+      "perTool": 35,
+      "perDesc": 3,
+      "perFirstProp": 8,
+      "perAdditionalProp": 7,
+      "perPropDesc": 3,
+      "perEnum": 6,
+      "perNestedObject": 9,
+      "perArrayOfObjects": 10
+    },
+    "name": "Grok 2 Vision",
+    "maxTokens": 32768,
+    "pricing": {
+      "input": 2e-06,
+      "output": 1e-05
+    },
+    "maxInputTokens": 0
+  },
+  "xai/grok-3": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 5,
+      "perMessage": 3,
+      "toolsExist": 240,
+      "perTool": 32,
+      "perDesc": 3,
+      "perFirstProp": 9,
+      "perAdditionalProp": 7,
+      "perPropDesc": 3,
+      "perEnum": 6,
+      "perNestedObject": 7,
+      "perArrayOfObjects": 8
+    },
+    "name": "Grok 3 Beta",
+    "maxTokens": 131072,
+    "pricing": {
+      "input": 3e-06,
+      "output": 1.5e-05
+    },
+    "maxInputTokens": 0
+  },
+  "xai/grok-3-fast": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 5,
+      "perMessage": 3,
+      "toolsExist": 240,
+      "perTool": 32,
+      "perDesc": 3,
+      "perFirstProp": 9,
+      "perAdditionalProp": 7,
+      "perPropDesc": 3,
+      "perEnum": 6,
+      "perNestedObject": 7,
+      "perArrayOfObjects": 8
+    },
+    "name": "Grok 3 Fast Beta",
+    "maxTokens": 131072,
+    "pricing": {
+      "input": 5e-06,
+      "output": 2.5e-05
+    },
+    "maxInputTokens": 0
+  },
+  "xai/grok-3-mini": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 6,
+      "perMessage": 3,
+      "toolsExist": 262,
+      "perTool": 32,
+      "perDesc": 3,
+      "perFirstProp": 9,
+      "perAdditionalProp": 7,
+      "perPropDesc": 3,
+      "perEnum": 6,
+      "perNestedObject": 7,
+      "perArrayOfObjects": 8
+    },
+    "name": "Grok 3 Mini Beta",
+    "maxTokens": 131072,
+    "pricing": {
+      "input": 3e-07,
+      "output": 5e-07
+    },
+    "maxInputTokens": 0
+  },
+  "xai/grok-3-mini-fast": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 6,
+      "perMessage": 3,
+      "toolsExist": 262,
+      "perTool": 32,
+      "perDesc": 3,
+      "perFirstProp": 9,
+      "perAdditionalProp": 7,
+      "perPropDesc": 3,
+      "perEnum": 6,
+      "perNestedObject": 7,
+      "perArrayOfObjects": 8
+    },
+    "name": "Grok 3 Mini Fast Beta",
+    "maxTokens": 131072,
+    "pricing": {
+      "input": 6e-07,
+      "output": 4e-06
+    },
+    "maxInputTokens": 0
+  },
+  "xai/grok-4": {
+    "encoding": "p50k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 683,
+      "perMessage": 3,
+      "toolsExist": 187,
+      "perTool": 32,
+      "perDesc": 3,
+      "perFirstProp": 9,
+      "perAdditionalProp": 7,
+      "perPropDesc": 3,
+      "perEnum": 6,
+      "perNestedObject": 7,
+      "perArrayOfObjects": 8
+    },
+    "name": "Grok 4",
+    "maxTokens": 256000,
+    "pricing": {
+      "input": 3e-06,
+      "output": 1.5e-05
+    },
+    "maxInputTokens": 0
+  },
+  "xai/grok-4-fast-non-reasoning": {
+    "encoding": "p50k_base",
+    "tokens": {
+      "contentMultiplier": 1.99,
+      "baseOverhead": 167,
+      "perMessage": 3,
+      "toolsExist": 185,
+      "perTool": 32,
+      "perDesc": 3,
+      "perFirstProp": 9,
+      "perAdditionalProp": 7,
+      "perPropDesc": 3,
+      "perEnum": 6,
+      "perNestedObject": 7,
+      "perArrayOfObjects": 8
+    },
+    "name": "Grok 4 Fast Non-Reasoning",
+    "maxTokens": 256000,
+    "pricing": {
+      "input": 2e-07,
+      "output": 5e-07,
+      "input_cache_read": 5e-08
+    },
+    "maxInputTokens": 1744000
+  },
+  "xai/grok-4-fast-reasoning": {
+    "encoding": "p50k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 155,
+      "perMessage": 3,
+      "toolsExist": 186,
+      "perTool": 32,
+      "perDesc": 3,
+      "perFirstProp": 9,
+      "perAdditionalProp": 7,
+      "perPropDesc": 3,
+      "perEnum": 6,
+      "perNestedObject": 7,
+      "perArrayOfObjects": 8
+    },
+    "name": "Grok 4 Fast Reasoning",
+    "maxTokens": 256000,
+    "pricing": {
+      "input": 2e-07,
+      "output": 5e-07,
+      "input_cache_read": 5e-08
+    },
+    "maxInputTokens": 1744000
+  },
+  "xai/grok-code-fast-1": {
+    "encoding": "p50k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 203,
+      "perMessage": 61,
+      "toolsExist": 167,
+      "perTool": 37,
+      "perDesc": 3,
+      "perFirstProp": 9,
+      "perAdditionalProp": 7,
+      "perPropDesc": 3,
+      "perEnum": 6,
+      "perNestedObject": 7,
+      "perArrayOfObjects": 8
+    },
+    "name": "Grok Code Fast 1",
+    "maxTokens": 256000,
+    "pricing": {
+      "input": 2e-07,
+      "output": 1.5e-06,
+      "input_cache_read": 2e-08
+    },
+    "maxInputTokens": 0
+  },
+  "alibaba/qwen-3-14b": {
+    "encoding": "cl100k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 7,
+      "perMessage": 4,
+      "toolsExist": 138,
+      "perTool": 56,
+      "perDesc": 0,
+      "perFirstProp": 14,
+      "perAdditionalProp": 11,
+      "perPropDesc": 5,
+      "perEnum": 9,
+      "perNestedObject": 9,
+      "perArrayOfObjects": 11
+    },
+    "name": "Qwen3-14B",
+    "maxTokens": 16384,
+    "pricing": {
+      "input": 6e-08,
+      "output": 2.4e-07
+    },
+    "maxInputTokens": 24576
+  },
+  "alibaba/qwen-3-235b": {
+    "encoding": "cl100k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 7,
+      "perMessage": 4,
+      "toolsExist": 142,
+      "perTool": 60,
+      "perDesc": 0,
+      "perFirstProp": 14,
+      "perAdditionalProp": 11,
+      "perPropDesc": 5,
+      "perEnum": 9,
+      "perNestedObject": 10,
+      "perArrayOfObjects": 11
+    },
+    "name": "Qwen3 235B A22B Instruct 2507",
+    "maxTokens": 16384,
+    "pricing": {
+      "input": 1.3e-07,
+      "output": 6e-07
+    },
+    "maxInputTokens": 24576
+  },
+  "alibaba/qwen-3-30b": {
+    "encoding": "cl100k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 7,
+      "perMessage": 4,
+      "toolsExist": 138,
+      "perTool": 56,
+      "perDesc": 0,
+      "perFirstProp": 14,
+      "perAdditionalProp": 11,
+      "perPropDesc": 5,
+      "perEnum": 9,
+      "perNestedObject": 9,
+      "perArrayOfObjects": 11
+    },
+    "name": "Qwen3-30B-A3B",
+    "maxTokens": 16384,
+    "pricing": {
+      "input": 8e-08,
+      "output": 2.9e-07
+    },
+    "maxInputTokens": 24576
+  },
+  "alibaba/qwen-3-32b": {
+    "encoding": "cl100k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 7,
+      "perMessage": 4,
+      "toolsExist": 137,
+      "perTool": 55,
+      "perDesc": 1,
+      "perFirstProp": 14,
+      "perAdditionalProp": 11,
+      "perPropDesc": 5,
+      "perEnum": 9,
+      "perNestedObject": 10,
+      "perArrayOfObjects": 11
+    },
+    "name": "Qwen 3.32B",
+    "maxTokens": 16384,
+    "pricing": {
+      "input": 1e-07,
+      "output": 3e-07
+    },
+    "maxInputTokens": 24576
+  },
+  "alibaba/qwen3-coder": {
+    "encoding": "cl100k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 7,
+      "perMessage": 4,
+      "toolsExist": 229,
+      "perTool": 24,
+      "perDesc": -1,
+      "perFirstProp": 27,
+      "perAdditionalProp": 22,
+      "perPropDesc": 6,
+      "perEnum": 12,
+      "perNestedObject": -9,
+      "perArrayOfObjects": -16
+    },
+    "name": "Qwen3 Coder 480B A35B Instruct",
+    "maxTokens": 66536,
+    "pricing": {
+      "input": 3.8e-07,
+      "output": 1.53e-06
+    },
+    "maxInputTokens": 195608
+  },
+  "alibaba/qwen3-coder-plus": {
+    "encoding": "cl100k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 7,
+      "perMessage": 4,
+      "toolsExist": 260,
+      "perTool": 52,
+      "perDesc": -1,
+      "perFirstProp": 27,
+      "perAdditionalProp": 22,
+      "perPropDesc": 6,
+      "perEnum": 12,
+      "perNestedObject": -9,
+      "perArrayOfObjects": -15
+    },
+    "name": "Qwen3 Coder Plus",
+    "maxTokens": 65536,
+    "pricing": {
+      "input": 1e-06,
+      "output": 5e-06
+    },
+    "maxInputTokens": 934464
+  },
+  "alibaba/qwen3-max": {
+    "encoding": "cl100k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 7,
+      "perMessage": 4,
+      "toolsExist": 245,
+      "perTool": 56,
+      "perDesc": 0,
+      "perFirstProp": 14,
+      "perAdditionalProp": 11,
+      "perPropDesc": 5,
+      "perEnum": 9,
+      "perNestedObject": 10,
+      "perArrayOfObjects": 11
+    },
+    "name": "Qwen3 Max",
+    "maxTokens": 32768,
+    "pricing": {
+      "input": 1.2e-06,
+      "output": 6e-06,
+      "input_cache_read": 2.4e-07
+    },
+    "maxInputTokens": 229376
+  },
+  "alibaba/qwen3-next-80b-a3b-instruct": {
+    "encoding": "cl100k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 7,
+      "perMessage": 4,
+      "toolsExist": 138,
+      "perTool": 56,
+      "perDesc": 0,
+      "perFirstProp": 14,
+      "perAdditionalProp": 11,
+      "perPropDesc": 5,
+      "perEnum": 9,
+      "perNestedObject": 10,
+      "perArrayOfObjects": 11
+    },
+    "name": "Qwen3 Next 80B A3B Instruct",
+    "maxTokens": 65536,
+    "pricing": {
+      "input": 1.5e-07,
+      "output": 1.5e-06
+    },
+    "maxInputTokens": 0
+  },
+  "alibaba/qwen3-next-80b-a3b-thinking": {
+    "encoding": "cl100k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 9,
+      "perMessage": 4,
+      "toolsExist": 133,
+      "perTool": 51,
+      "perDesc": 0,
+      "perFirstProp": 14,
+      "perAdditionalProp": 11,
+      "perPropDesc": 5,
+      "perEnum": 9,
+      "perNestedObject": 9,
+      "perArrayOfObjects": 11
+    },
+    "name": "Qwen3 Next 80B A3B Thinking",
+    "maxTokens": 65536,
+    "pricing": {
+      "input": 1.5e-07,
+      "output": 1.5e-06
+    },
+    "maxInputTokens": 0
+  },
+  "alibaba/qwen3-vl-instruct": {
+    "encoding": "cl100k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 7,
+      "perMessage": 4,
+      "toolsExist": 137,
+      "perTool": 55,
+      "perDesc": 1,
+      "perFirstProp": 14,
+      "perAdditionalProp": 11,
+      "perPropDesc": 5,
+      "perEnum": 9,
+      "perNestedObject": 10,
+      "perArrayOfObjects": 11
+    },
+    "name": "Qwen3 VL 235B A22B Instruct",
+    "maxTokens": 129024,
+    "pricing": {
+      "input": 7e-07,
+      "output": 2.8e-06
+    },
+    "maxInputTokens": 2048
+  },
+  "amazon/nova-lite": {
+    "encoding": "cl100k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": -1,
+      "perMessage": 2,
+      "toolsExist": 394,
+      "perTool": 41,
+      "perDesc": 5,
+      "perFirstProp": 14,
+      "perAdditionalProp": 11,
+      "perPropDesc": 5,
+      "perEnum": 9,
+      "perNestedObject": 10,
+      "perArrayOfObjects": 11
+    },
+    "name": "Nova Lite",
+    "maxTokens": 8192,
+    "pricing": {
+      "input": 6e-08,
+      "output": 2.4e-07
+    },
+    "maxInputTokens": 291808
+  },
+  "amazon/nova-micro": {
+    "encoding": "cl100k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": -1,
+      "perMessage": 2,
+      "toolsExist": 394,
+      "perTool": 41,
+      "perDesc": 5,
+      "perFirstProp": 14,
+      "perAdditionalProp": 11,
+      "perPropDesc": 5,
+      "perEnum": 9,
+      "perNestedObject": 10,
+      "perArrayOfObjects": 11
+    },
+    "name": "Nova Micro",
+    "maxTokens": 8192,
+    "pricing": {
+      "input": 3.5e-08,
+      "output": 1.4e-07
+    },
+    "maxInputTokens": 119808
+  },
+  "amazon/nova-pro": {
+    "encoding": "cl100k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": -1,
+      "perMessage": 2,
+      "toolsExist": 394,
+      "perTool": 41,
+      "perDesc": 5,
+      "perFirstProp": 14,
+      "perAdditionalProp": 11,
+      "perPropDesc": 5,
+      "perEnum": 9,
+      "perNestedObject": 10,
+      "perArrayOfObjects": 11
+    },
+    "name": "Nova Pro",
+    "maxTokens": 8192,
+    "pricing": {
+      "input": 8e-07,
+      "output": 3.2e-06
+    },
+    "maxInputTokens": 291808
+  },
+  "deepseek/deepseek-v4-flash": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 3,
+      "perMessage": 1,
+      "toolsExist": 142,
+      "perTool": 42,
+      "perDesc": 0,
+      "perFirstProp": 14,
+      "perAdditionalProp": 11,
+      "perPropDesc": 5,
+      "perEnum": 9,
+      "perNestedObject": 9,
+      "perArrayOfObjects": 10
+    },
+    "name": "DeepSeek V4 Flash",
+    "maxTokens": 393216,
+    "pricing": {
+      "input": 1.4e-07,
+      "output": 2.8e-07,
+      "input_cache_read": 2.8e-09
+    },
+    "maxInputTokens": 655360
+  },
+  "deepseek/deepseek-v4-pro": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 3,
+      "perMessage": 1,
+      "toolsExist": 142,
+      "perTool": 42,
+      "perDesc": 0,
+      "perFirstProp": 14,
+      "perAdditionalProp": 11,
+      "perPropDesc": 5,
+      "perEnum": 9,
+      "perNestedObject": 9,
+      "perArrayOfObjects": 10
+    },
+    "name": "DeepSeek V4 Pro",
+    "maxTokens": 393216,
+    "pricing": {
+      "input": 4.35e-07,
+      "output": 8.7e-07,
+      "input_cache_read": 3.625e-09
+    },
+    "maxInputTokens": 655360
+  },
+  "deepseek/deepseek-chat": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 3,
+      "perMessage": 1,
+      "toolsExist": 142,
+      "perTool": 42,
+      "perDesc": 0,
+      "perFirstProp": 14,
+      "perAdditionalProp": 11,
+      "perPropDesc": 5,
+      "perEnum": 9,
+      "perNestedObject": 9,
+      "perArrayOfObjects": 10
+    },
+    "name": "DeepSeek Chat",
+    "maxTokens": 393216,
+    "pricing": {
+      "input": 1.4e-07,
+      "output": 2.8e-07,
+      "input_cache_read": 2.8e-09
+    },
+    "maxInputTokens": 655360
+  },
+  "deepseek/deepseek-expert": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 3,
+      "perMessage": 1,
+      "toolsExist": 142,
+      "perTool": 42,
+      "perDesc": 0,
+      "perFirstProp": 14,
+      "perAdditionalProp": 11,
+      "perPropDesc": 5,
+      "perEnum": 9,
+      "perNestedObject": 9,
+      "perArrayOfObjects": 10
+    },
+    "name": "DeepSeek Expert",
+    "maxTokens": 393216,
+    "pricing": {
+      "input": 1.4e-07,
+      "output": 2.8e-07,
+      "input_cache_read": 2.8e-09
+    },
+    "maxInputTokens": 655360
+  },
+  "deepseek-ai/DeepSeek-V4.1-Flash": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 3,
+      "perMessage": 1,
+      "toolsExist": 142,
+      "perTool": 42,
+      "perDesc": 0,
+      "perFirstProp": 14,
+      "perAdditionalProp": 11,
+      "perPropDesc": 5,
+      "perEnum": 9,
+      "perNestedObject": 9,
+      "perArrayOfObjects": 10
+    },
+    "name": "DeepSeek V4.1 Flash",
+    "maxTokens": 393216,
+    "pricing": {
+      "input": 1.4e-07,
+      "output": 2.8e-07,
+      "input_cache_read": 2.8e-09
+    },
+    "maxInputTokens": 262144
+  },
+  "deepseek-ai/DeepSeek-V4.1-Flash-1017": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 3,
+      "perMessage": 1,
+      "toolsExist": 142,
+      "perTool": 42,
+      "perDesc": 0,
+      "perFirstProp": 14,
+      "perAdditionalProp": 11,
+      "perPropDesc": 5,
+      "perEnum": 9,
+      "perNestedObject": 9,
+      "perArrayOfObjects": 10
+    },
+    "name": "DeepSeek V4.1 Flash",
+    "maxTokens": 393216,
+    "pricing": {
+      "input": 1.4e-07,
+      "output": 2.8e-07,
+      "input_cache_read": 2.8e-09
+    },
+    "maxInputTokens": 262144
+  },
+  "deepseek/deepseek-reasoner": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 3,
+      "perMessage": 1,
+      "toolsExist": 142,
+      "perTool": 42,
+      "perDesc": 0,
+      "perFirstProp": 14,
+      "perAdditionalProp": 11,
+      "perPropDesc": 5,
+      "perEnum": 9,
+      "perNestedObject": 9,
+      "perArrayOfObjects": 10
+    },
+    "name": "DeepSeek Reasoner",
+    "maxTokens": 393216,
+    "pricing": {
+      "input": 1.4e-07,
+      "output": 2.8e-07,
+      "input_cache_read": 2.8e-09
+    },
+    "maxInputTokens": 655360
+  },
+  "deepseek/deepseek-v3": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 5,
+      "perMessage": 1,
+      "toolsExist": 149,
+      "perTool": 71,
+      "perDesc": 0,
+      "perFirstProp": 14,
+      "perAdditionalProp": 11,
+      "perPropDesc": 5,
+      "perEnum": 9,
+      "perNestedObject": 10,
+      "perArrayOfObjects": 11
+    },
+    "name": "DeepSeek V3 0324",
+    "maxTokens": 16384,
+    "pricing": {
+      "input": 7.7e-07,
+      "output": 7.7e-07
+    },
+    "maxInputTokens": 147456
+  },
+  "deepseek/deepseek-v3.1": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 7,
+      "perMessage": 3,
+      "toolsExist": 143,
+      "perTool": 71,
+      "perDesc": 0,
+      "perFirstProp": 14,
+      "perAdditionalProp": 11,
+      "perPropDesc": 5,
+      "perEnum": 9,
+      "perNestedObject": 10,
+      "perArrayOfObjects": 11
+    },
+    "name": "DeepSeek-V3.1",
+    "maxTokens": 128000,
+    "pricing": {
+      "input": 3e-07,
+      "output": 1e-06
+    },
+    "maxInputTokens": 35840
+  },
+  "deepseek/deepseek-v3.1-terminus": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 4,
+      "perMessage": 1,
+      "toolsExist": 144,
+      "perTool": 43,
+      "perDesc": 0,
+      "perFirstProp": 14,
+      "perAdditionalProp": 11,
+      "perPropDesc": 5,
+      "perEnum": 9,
+      "perNestedObject": 10,
+      "perArrayOfObjects": 11
+    },
+    "name": "DeepSeek V3.1 Terminus",
+    "maxTokens": 65536,
+    "pricing": {
+      "input": 2.7e-07,
+      "output": 1e-06
+    },
+    "maxInputTokens": 65536
+  },
+  "deepseek/deepseek-v3.2-exp": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 3,
+      "perMessage": 1,
+      "toolsExist": 142,
+      "perTool": 42,
+      "perDesc": 0,
+      "perFirstProp": 14,
+      "perAdditionalProp": 11,
+      "perPropDesc": 5,
+      "perEnum": 9,
+      "perNestedObject": 9,
+      "perArrayOfObjects": 10
+    },
+    "name": "DeepSeek V3.2 Exp",
+    "maxTokens": 163840,
+    "pricing": {
+      "input": 2.7e-07,
+      "output": 4e-07
+    },
+    "maxInputTokens": 0
+  },
+  "deepseek/deepseek-v3.2-exp-thinking": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 3,
+      "perMessage": 1,
+      "toolsExist": 142,
+      "perTool": 42,
+      "perDesc": 0,
+      "perFirstProp": 14,
+      "perAdditionalProp": 11,
+      "perPropDesc": 5,
+      "perEnum": 9,
+      "perNestedObject": 9,
+      "perArrayOfObjects": 10
+    },
+    "name": "DeepSeek V3.2 Exp Thinking",
+    "maxTokens": 8192,
+    "pricing": {
+      "input": 2.8e-07,
+      "output": 4.2e-07,
+      "input_cache_read": 2.8e-08
+    },
+    "maxInputTokens": 155648
+  },
+  "meituan/longcat-flash-chat": {
+    "encoding": "claude",
+    "tokens": {
+      "contentMultiplier": 1.1,
+      "baseOverhead": 9,
+      "perMessage": 4,
+      "toolsExist": 173,
+      "perTool": 42,
+      "perDesc": -1,
+      "perFirstProp": 8,
+      "perAdditionalProp": 8,
+      "perPropDesc": -59,
+      "perEnum": -3,
+      "perNestedObject": 146,
+      "perArrayOfObjects": 84
+    },
+    "name": "LongCat Flash Chat",
+    "maxTokens": 8192,
+    "pricing": {
+      "input": 0,
+      "output": 0
+    },
+    "maxInputTokens": 119808
+  },
+  "meta/llama-3.1-8b": {
+    "encoding": "cl100k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 14,
+      "perMessage": 4,
+      "toolsExist": 193,
+      "perTool": 47,
+      "perDesc": 1,
+      "perFirstProp": 8,
+      "perAdditionalProp": 7,
+      "perPropDesc": 3,
+      "perEnum": 5,
+      "perNestedObject": 9,
+      "perArrayOfObjects": 10
+    },
+    "name": "Llama 3.1 8B Instruct",
+    "maxTokens": 131000,
+    "pricing": {
+      "input": 5e-08,
+      "output": 8e-08
+    },
+    "maxInputTokens": 0
+  },
+  "meta/llama-4-scout": {
+    "encoding": "claude",
+    "tokens": {
+      "contentMultiplier": 1.1,
+      "baseOverhead": 34,
+      "perMessage": 4,
+      "toolsExist": 532,
+      "perTool": 40,
+      "perDesc": 1,
+      "perFirstProp": 40,
+      "perAdditionalProp": 17,
+      "perPropDesc": 6,
+      "perEnum": 16,
+      "perNestedObject": -9,
+      "perArrayOfObjects": -8
+    },
+    "name": "Llama 4 Scout 17B Instruct",
+    "maxTokens": 8192,
+    "pricing": {
+      "input": 8e-08,
+      "output": 3e-07
+    },
+    "maxInputTokens": 122880
+  },
+  "mistral/codestral": {
+    "encoding": "cl100k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 2,
+      "perMessage": 1,
+      "toolsExist": 60,
+      "perTool": 57,
+      "perDesc": 1,
+      "perFirstProp": 14,
+      "perAdditionalProp": 11,
+      "perPropDesc": 5,
+      "perEnum": 9,
+      "perNestedObject": 9,
+      "perArrayOfObjects": 11
+    },
+    "name": "Mistral Codestral",
+    "maxTokens": 4000,
+    "pricing": {
+      "input": 3e-07,
+      "output": 9e-07
+    },
+    "maxInputTokens": 124000
+  },
+  "mistral/devstral-small": {
+    "encoding": "cl100k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 2,
+      "perMessage": 1,
+      "toolsExist": 60,
+      "perTool": 57,
+      "perDesc": 1,
+      "perFirstProp": 14,
+      "perAdditionalProp": 11,
+      "perPropDesc": 5,
+      "perEnum": 9,
+      "perNestedObject": 9,
+      "perArrayOfObjects": 11
+    },
+    "name": "Devstral Small",
+    "maxTokens": 64000,
+    "pricing": {
+      "input": 1e-07,
+      "output": 3e-07
+    },
+    "maxInputTokens": 64000
+  },
+  "mistral/magistral-medium": {
+    "encoding": "cl100k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 2,
+      "perMessage": 1,
+      "toolsExist": 60,
+      "perTool": 57,
+      "perDesc": 1,
+      "perFirstProp": 14,
+      "perAdditionalProp": 11,
+      "perPropDesc": 5,
+      "perEnum": 9,
+      "perNestedObject": 9,
+      "perArrayOfObjects": 11
+    },
+    "name": "Magistral Medium 2509",
+    "maxTokens": 64000,
+    "pricing": {
+      "input": 2e-06,
+      "output": 5e-06
+    },
+    "maxInputTokens": 64000
+  },
+  "mistral/magistral-small": {
+    "encoding": "cl100k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 2,
+      "perMessage": 1,
+      "toolsExist": 60,
+      "perTool": 57,
+      "perDesc": 1,
+      "perFirstProp": 14,
+      "perAdditionalProp": 11,
+      "perPropDesc": 5,
+      "perEnum": 9,
+      "perNestedObject": 9,
+      "perArrayOfObjects": 11
+    },
+    "name": "Magistral Small 2509",
+    "maxTokens": 64000,
+    "pricing": {
+      "input": 5e-07,
+      "output": 1.5e-06
+    },
+    "maxInputTokens": 64000
+  },
+  "moonshotai/kimi-k2": {
+    "encoding": "claude",
+    "tokens": {
+      "contentMultiplier": 1.1,
+      "baseOverhead": 24,
+      "perMessage": 3,
+      "toolsExist": 67,
+      "perTool": 54,
+      "perDesc": 1,
+      "perFirstProp": 14,
+      "perAdditionalProp": 11,
+      "perPropDesc": 5,
+      "perEnum": 9,
+      "perNestedObject": 10,
+      "perArrayOfObjects": 11
+    },
+    "name": "Kimi K2",
+    "maxTokens": 16384,
+    "pricing": {
+      "input": 5e-07,
+      "output": 2e-06
+    },
+    "maxInputTokens": 114688
+  },
+  "moonshotai/kimi-k2-0905": {
+    "encoding": "claude",
+    "tokens": {
+      "contentMultiplier": 1.1,
+      "baseOverhead": 24,
+      "perMessage": 3,
+      "toolsExist": 67,
+      "perTool": 54,
+      "perDesc": 1,
+      "perFirstProp": 14,
+      "perAdditionalProp": 11,
+      "perPropDesc": 5,
+      "perEnum": 9,
+      "perNestedObject": 10,
+      "perArrayOfObjects": 11
+    },
+    "name": "Kimi K2 0905",
+    "maxTokens": 16384,
+    "pricing": {
+      "input": 6e-07,
+      "output": 2.5e-06
+    },
+    "maxInputTokens": 114688
+  },
+  "moonshotai/kimi-k2-turbo": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 6,
+      "perMessage": 3,
+      "toolsExist": 48,
+      "perTool": 40,
+      "perDesc": 3,
+      "perFirstProp": 8,
+      "perAdditionalProp": 7,
+      "perPropDesc": 3,
+      "perEnum": 5,
+      "perNestedObject": 9,
+      "perArrayOfObjects": 10
+    },
+    "name": "Kimi K2 Turbo",
+    "maxTokens": 16384,
+    "pricing": {
+      "input": 2.4e-06,
+      "output": 1e-05
+    },
+    "maxInputTokens": 239616
+  },
+  "stealth/sonoma-dusk-alpha": {
+    "encoding": "p50k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 167,
+      "perMessage": 3,
+      "toolsExist": 185,
+      "perTool": 32,
+      "perDesc": 3,
+      "perFirstProp": 9,
+      "perAdditionalProp": 7,
+      "perPropDesc": 3,
+      "perEnum": 6,
+      "perNestedObject": 7,
+      "perArrayOfObjects": 8
+    },
+    "name": "Sonoma Dusk Alpha",
+    "maxTokens": 131072,
+    "pricing": {
+      "input": 2e-07,
+      "output": 5e-07,
+      "input_cache_read": 5e-08
+    },
+    "maxInputTokens": 1868928
+  },
+  "stealth/sonoma-sky-alpha": {
+    "encoding": "p50k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 155,
+      "perMessage": 3,
+      "toolsExist": 186,
+      "perTool": 32,
+      "perDesc": 3,
+      "perFirstProp": 9,
+      "perAdditionalProp": 7,
+      "perPropDesc": 3,
+      "perEnum": 6,
+      "perNestedObject": 7,
+      "perArrayOfObjects": 8
+    },
+    "name": "Sonoma Sky Alpha",
+    "maxTokens": 131072,
+    "pricing": {
+      "input": 2e-07,
+      "output": 5e-07,
+      "input_cache_read": 5e-08
+    },
+    "maxInputTokens": 1868928
+  },
+  "vercel/v0-1.0-md": {
+    "encoding": "p50k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 2216,
+      "perMessage": 2,
+      "toolsExist": 351,
+      "perTool": 37,
+      "perDesc": 5,
+      "perFirstProp": 9,
+      "perAdditionalProp": 12,
+      "perPropDesc": 5,
+      "perEnum": 9,
+      "perNestedObject": 16,
+      "perArrayOfObjects": 17
+    },
+    "name": "v0-1.0-md",
+    "maxTokens": 32000,
+    "pricing": {
+      "input": 3e-06,
+      "output": 1.5e-05
+    },
+    "maxInputTokens": 96000
+  },
+  "vercel/v0-1.5-md": {
+    "encoding": "p50k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 2216,
+      "perMessage": 2,
+      "toolsExist": 351,
+      "perTool": 37,
+      "perDesc": 5,
+      "perFirstProp": 9,
+      "perAdditionalProp": 12,
+      "perPropDesc": 5,
+      "perEnum": 9,
+      "perNestedObject": 16,
+      "perArrayOfObjects": 17
+    },
+    "name": "v0-1.5-md",
+    "maxTokens": 32768,
+    "pricing": {
+      "input": 3e-06,
+      "output": 1.5e-05
+    },
+    "maxInputTokens": 95232
+  },
+  "zai/glm-4.5": {
+    "encoding": "cl100k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 9,
+      "perMessage": 3,
+      "toolsExist": 127,
+      "perTool": 28,
+      "perDesc": 1,
+      "perFirstProp": 14,
+      "perAdditionalProp": 11,
+      "perPropDesc": 5,
+      "perEnum": 9,
+      "perNestedObject": 10,
+      "perArrayOfObjects": 11
+    },
+    "name": "GLM-4.5",
+    "maxTokens": 131072,
+    "pricing": {
+      "input": 6e-07,
+      "output": 2.2e-06
+    },
+    "maxInputTokens": 0
+  },
+  "zai/glm-4.5-air": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 4,
+      "perMessage": 3,
+      "toolsExist": 128,
+      "perTool": 28,
+      "perDesc": 1,
+      "perFirstProp": 14,
+      "perAdditionalProp": 11,
+      "perPropDesc": 5,
+      "perEnum": 9,
+      "perNestedObject": 9,
+      "perArrayOfObjects": 11
+    },
+    "name": "GLM 4.5 Air",
+    "maxTokens": 96000,
+    "pricing": {
+      "input": 2e-07,
+      "output": 1.1e-06
+    },
+    "maxInputTokens": 32000
+  },
+  "zai/glm-4.5v": {
+    "encoding": "cl100k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 9,
+      "perMessage": 3,
+      "toolsExist": 133,
+      "perTool": 33,
+      "perDesc": 1,
+      "perFirstProp": 14,
+      "perAdditionalProp": 11,
+      "perPropDesc": 5,
+      "perEnum": 9,
+      "perNestedObject": 10,
+      "perArrayOfObjects": 11
+    },
+    "name": "GLM 4.5V",
+    "maxTokens": 65536,
+    "pricing": {
+      "input": 6e-07,
+      "output": 1.8e-06
+    },
+    "maxInputTokens": 0
+  },
+  "meta/llama-3.3-70b": {
+    "encoding": "claude",
+    "tokens": {
+      "contentMultiplier": 1.1,
+      "baseOverhead": 34,
+      "perMessage": 4,
+      "toolsExist": 173,
+      "perTool": 47,
+      "perDesc": 1,
+      "perFirstProp": 8,
+      "perAdditionalProp": 7,
+      "perPropDesc": 3,
+      "perEnum": 5,
+      "perNestedObject": 9,
+      "perArrayOfObjects": 10
+    },
+    "name": "Llama 3.3 70B Instruct",
+    "maxTokens": 8192,
+    "pricing": {
+      "input": 7.2e-07,
+      "output": 7.2e-07
+    },
+    "maxInputTokens": 119808
+  },
+  "mistral/mistral-large": {
+    "encoding": "cl100k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 2,
+      "perMessage": 1,
+      "toolsExist": 60,
+      "perTool": 57,
+      "perDesc": 1,
+      "perFirstProp": 14,
+      "perAdditionalProp": 11,
+      "perPropDesc": 5,
+      "perEnum": 9,
+      "perNestedObject": 9,
+      "perArrayOfObjects": 11
+    },
+    "name": "Mistral Large",
+    "maxTokens": 4000,
+    "pricing": {
+      "input": 2e-06,
+      "output": 6e-06
+    },
+    "maxInputTokens": 28000
+  },
+  "mistral/mistral-medium": {
+    "encoding": "cl100k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 2,
+      "perMessage": 1,
+      "toolsExist": 60,
+      "perTool": 57,
+      "perDesc": 1,
+      "perFirstProp": 14,
+      "perAdditionalProp": 11,
+      "perPropDesc": 5,
+      "perEnum": 9,
+      "perNestedObject": 9,
+      "perArrayOfObjects": 11
+    },
+    "name": "Mistral Medium 3.1",
+    "maxTokens": 64000,
+    "pricing": {
+      "input": 4e-07,
+      "output": 2e-06
+    },
+    "maxInputTokens": 64000
+  },
+  "mistral/mistral-small": {
+    "encoding": "cl100k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 2,
+      "perMessage": 1,
+      "toolsExist": 60,
+      "perTool": 57,
+      "perDesc": 1,
+      "perFirstProp": 14,
+      "perAdditionalProp": 11,
+      "perPropDesc": 5,
+      "perEnum": 9,
+      "perNestedObject": 9,
+      "perArrayOfObjects": 11
+    },
+    "name": "Mistral Small",
+    "maxTokens": 4000,
+    "pricing": {
+      "input": 1e-07,
+      "output": 3e-07
+    },
+    "maxInputTokens": 28000
+  },
+  "mistral/pixtral-large": {
+    "encoding": "claude",
+    "tokens": {
+      "contentMultiplier": 1.1,
+      "baseOverhead": 2,
+      "perMessage": 1,
+      "toolsExist": 63,
+      "perTool": 60,
+      "perDesc": 1,
+      "perFirstProp": 14,
+      "perAdditionalProp": 11,
+      "perPropDesc": 5,
+      "perEnum": 9,
+      "perNestedObject": 10,
+      "perArrayOfObjects": 11
+    },
+    "name": "Pixtral Large",
+    "maxTokens": 4000,
+    "pricing": {
+      "input": 2e-06,
+      "output": 6e-06
+    },
+    "maxInputTokens": 124000
+  },
+  "openai/gpt-5-codex": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 5,
+      "perMessage": 4,
+      "toolsExist": 24,
+      "perTool": 6,
+      "perDesc": 2,
+      "perFirstProp": 5,
+      "perAdditionalProp": 3,
+      "perPropDesc": 2,
+      "perEnum": 7,
+      "perNestedObject": -3,
+      "perArrayOfObjects": 1
+    },
+    "name": "GPT-5-Codex",
+    "maxTokens": 128000,
+    "pricing": {
+      "input": 1.25e-06,
+      "output": 1e-05,
+      "input_cache_read": 1.3e-07,
+      "input_cache_write": 0
+    },
+    "maxInputTokens": 272000
+  },
+  "openai/gpt-5-pro": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 5,
+      "perMessage": 4,
+      "toolsExist": 24,
+      "perTool": 6,
+      "perDesc": 2,
+      "perFirstProp": 5,
+      "perAdditionalProp": 3,
+      "perPropDesc": 2,
+      "perEnum": 7,
+      "perNestedObject": -3,
+      "perArrayOfObjects": 1
+    },
+    "name": "GPT-5 pro",
+    "maxTokens": 272000,
+    "pricing": {
+      "input": 1.5e-05,
+      "output": 0.00012
+    },
+    "maxInputTokens": 128000
+  },
+  "google/gemini-2.0-flash": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1.08,
+      "baseOverhead": -1,
+      "perMessage": -1,
+      "toolsExist": 0,
+      "perTool": 0,
+      "perDesc": 0,
+      "perFirstProp": 3,
+      "perAdditionalProp": 2,
+      "perPropDesc": 0,
+      "perEnum": 0,
+      "perNestedObject": -1,
+      "perArrayOfObjects": 0
+    },
+    "name": "Gemini 2.0 Flash",
+    "maxTokens": 8192,
+    "pricing": {
+      "input": 1e-07,
+      "output": 4e-07,
+      "input_cache_read": 2.5e-08
+    },
+    "maxInputTokens": 991808
+  },
+  "google/gemini-2.0-flash-lite": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1.08,
+      "baseOverhead": -1,
+      "perMessage": -1,
+      "toolsExist": 0,
+      "perTool": 0,
+      "perDesc": 0,
+      "perFirstProp": 3,
+      "perAdditionalProp": 2,
+      "perPropDesc": 0,
+      "perEnum": 0,
+      "perNestedObject": -1,
+      "perArrayOfObjects": 0
+    },
+    "name": "Gemini 2.0 Flash Lite",
+    "maxTokens": 8192,
+    "pricing": {
+      "input": 7.5e-08,
+      "output": 3e-07
+    },
+    "maxInputTokens": 1040384
+  },
+  "google/gemini-2.5-flash": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1.08,
+      "baseOverhead": -1,
+      "perMessage": -1,
+      "toolsExist": 0,
+      "perTool": 0,
+      "perDesc": 0,
+      "perFirstProp": 3,
+      "perAdditionalProp": 2,
+      "perPropDesc": 0,
+      "perEnum": 0,
+      "perNestedObject": -1,
+      "perArrayOfObjects": 0
+    },
+    "name": "Gemini 2.5 Flash",
+    "maxTokens": 64000,
+    "pricing": {
+      "input": 3e-07,
+      "output": 2.5e-06,
+      "input_cache_read": 3e-08
+    },
+    "maxInputTokens": 936000
+  },
+  "google/gemini-2.5-flash-lite": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1.08,
+      "baseOverhead": -1,
+      "perMessage": -1,
+      "toolsExist": 0,
+      "perTool": 0,
+      "perDesc": 0,
+      "perFirstProp": 3,
+      "perAdditionalProp": 2,
+      "perPropDesc": 0,
+      "perEnum": 0,
+      "perNestedObject": -1,
+      "perArrayOfObjects": 0
+    },
+    "name": "Gemini 2.5 Flash Lite",
+    "maxTokens": 65536,
+    "pricing": {
+      "input": 1e-07,
+      "output": 4e-07,
+      "input_cache_read": 1e-08
+    },
+    "maxInputTokens": 983040
+  },
+  "google/gemini-2.5-flash-lite-preview-09-2025": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1.11,
+      "baseOverhead": 0,
+      "perMessage": 0,
+      "toolsExist": 18,
+      "perTool": 18,
+      "perDesc": 0,
+      "perFirstProp": 10,
+      "perAdditionalProp": 10,
+      "perPropDesc": -1,
+      "perEnum": 5,
+      "perNestedObject": 29,
+      "perArrayOfObjects": 29
+    },
+    "name": "Gemini 2.5 Flash Lite Preview 09-2025",
+    "maxTokens": 65536,
+    "pricing": {
+      "input": 1e-07,
+      "output": 4e-07
+    },
+    "maxInputTokens": 983040
+  },
+  "google/gemini-2.5-flash-preview-09-2025": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1.11,
+      "baseOverhead": 0,
+      "perMessage": 0,
+      "toolsExist": 18,
+      "perTool": 18,
+      "perDesc": 0,
+      "perFirstProp": 10,
+      "perAdditionalProp": 10,
+      "perPropDesc": -1,
+      "perEnum": 5,
+      "perNestedObject": 29,
+      "perArrayOfObjects": 29
+    },
+    "name": "Gemini 2.5 Flash Preview 09-2025",
+    "maxTokens": 65536,
+    "pricing": {
+      "input": 3e-07,
+      "output": 2.5e-06,
+      "input_cache_read": 3e-08
+    },
+    "maxInputTokens": 934464
+  },
+  "google/gemini-2.5-pro": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1.08,
+      "baseOverhead": -1,
+      "perMessage": -1,
+      "toolsExist": 0,
+      "perTool": 0,
+      "perDesc": 0,
+      "perFirstProp": 3,
+      "perAdditionalProp": 2,
+      "perPropDesc": 0,
+      "perEnum": 0,
+      "perNestedObject": -1,
+      "perArrayOfObjects": 0
+    },
+    "name": "Gemini 2.5 Pro",
+    "maxTokens": 65536,
+    "pricing": {
+      "input": 1.25e-06,
+      "output": 1e-05,
+      "input_cache_read": 1.25e-07
+    },
+    "maxInputTokens": 983040
+  },
+  "deepseek/deepseek-r1": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 4,
+      "perMessage": 1,
+      "toolsExist": -3,
+      "perTool": -1,
+      "perDesc": -1,
+      "perFirstProp": -1,
+      "perAdditionalProp": -1,
+      "perPropDesc": -1,
+      "perEnum": -3,
+      "perNestedObject": 0,
+      "perArrayOfObjects": 1
+    },
+    "name": "DeepSeek-R1",
+    "maxTokens": 16384,
+    "pricing": {
+      "input": 5e-07,
+      "output": 2.15e-06,
+      "input_cache_read": 4e-07
+    },
+    "maxInputTokens": 143616
+  },
+  "anthropic/claude-haiku-4.5": {
+    "encoding": "claude",
+    "tokens": {
+      "baseOverhead": 6,
+      "perMessage": 2,
+      "toolsExist": 549,
+      "perTool": 53,
+      "perDesc": 5,
+      "perFirstProp": 13,
+      "perAdditionalProp": 12,
+      "perPropDesc": 5,
+      "perEnum": 9,
+      "perNestedObject": 12,
+      "perArrayOfObjects": 13,
+      "contentMultiplier": 1.1
+    },
+    "name": "Claude Haiku 4.5",
+    "maxTokens": 64000,
+    "pricing": {
+      "input": 1e-06,
+      "output": 5e-06,
+      "input_cache_read": 1e-07,
+      "input_cache_write": 1.25e-06
+    },
+    "maxInputTokens": 136000
+  },
+  "minimax/minimax-m2": {
+    "encoding": "claude",
+    "tokens": {
+      "baseOverhead": 40,
+      "perMessage": 4,
+      "toolsExist": 147,
+      "perTool": 51,
+      "perDesc": 1,
+      "perFirstProp": 14,
+      "perAdditionalProp": 11,
+      "perPropDesc": 5,
+      "perEnum": 9,
+      "perNestedObject": 10,
+      "perArrayOfObjects": 11,
+      "contentMultiplier": 1.1
+    },
+    "name": "MiniMax M2",
+    "maxTokens": 262114,
+    "pricing": {
+      "input": 2.7e-07,
+      "output": 1.15e-06
+    },
+    "maxInputTokens": 0
+  },
+  "moonshotai/kimi-k2-thinking": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "baseOverhead": 6,
+      "perMessage": 4,
+      "toolsExist": 33,
+      "perTool": 17,
+      "perDesc": 2,
+      "perFirstProp": 4,
+      "perAdditionalProp": 4,
+      "perPropDesc": 3,
+      "perEnum": 6,
+      "perNestedObject": 9,
+      "perArrayOfObjects": 11,
+      "contentMultiplier": 1
+    },
+    "name": "Kimi K2 Thinking",
+    "maxTokens": 262114,
+    "pricing": {
+      "input": 6e-07,
+      "output": 2.5e-06
+    },
+    "maxInputTokens": 0
+  },
+  "moonshotai/kimi-k2-thinking-turbo": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "baseOverhead": 6,
+      "perMessage": 4,
+      "toolsExist": 33,
+      "perTool": 17,
+      "perDesc": 2,
+      "perFirstProp": 4,
+      "perAdditionalProp": 4,
+      "perPropDesc": 3,
+      "perEnum": 6,
+      "perNestedObject": 9,
+      "perArrayOfObjects": 11,
+      "contentMultiplier": 1
+    },
+    "name": "Kimi K2 Thinking Turbo",
+    "maxTokens": 262114,
+    "pricing": {
+      "input": 1.15e-06,
+      "output": 8e-06,
+      "input_cache_read": 1.5e-07
+    },
+    "maxInputTokens": 0
+  },
+  "openai/gpt-5-chat": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "baseOverhead": 6,
+      "perMessage": 3,
+      "toolsExist": 16,
+      "perTool": 6,
+      "perDesc": 1,
+      "perFirstProp": 5,
+      "perAdditionalProp": 3,
+      "perPropDesc": 2,
+      "perEnum": 7,
+      "perNestedObject": -3,
+      "perArrayOfObjects": 1,
+      "contentMultiplier": 1
+    },
+    "name": "GPT-5 Chat",
+    "maxTokens": 16384,
+    "pricing": {
+      "input": 1.25e-06,
+      "output": 1e-05,
+      "input_cache_read": 1.25e-07
+    },
+    "maxInputTokens": 111616
+  },
+  "openai/gpt-oss-safeguard-20b": {
+    "encoding": "p50k_base",
+    "tokens": {
+      "baseOverhead": 70,
+      "perMessage": 4,
+      "toolsExist": 42,
+      "perTool": 15,
+      "perDesc": 1,
+      "perFirstProp": 3,
+      "perAdditionalProp": 3,
+      "perPropDesc": 1,
+      "perEnum": 6,
+      "perNestedObject": 19,
+      "perArrayOfObjects": 17,
+      "contentMultiplier": 1
+    },
+    "name": "gpt-oss-safeguard-20b",
+    "maxTokens": 65536,
+    "pricing": {
+      "input": 7.5e-08,
+      "output": 3e-07,
+      "input_cache_read": 3.7e-08
+    },
+    "maxInputTokens": 65536
+  },
+  "alibaba/qwen3-235b-a22b-thinking": {
+    "encoding": "cl100k_base",
+    "tokens": {
+      "baseOverhead": 7,
+      "perMessage": 4,
+      "toolsExist": 138,
+      "perTool": 56,
+      "perDesc": 0,
+      "perFirstProp": 14,
+      "perAdditionalProp": 11,
+      "perPropDesc": 5,
+      "perEnum": 9,
+      "perNestedObject": 9,
+      "perArrayOfObjects": 11,
+      "contentMultiplier": 1
+    },
+    "name": "Qwen3 235B A22B Thinking 2507",
+    "maxTokens": 262114,
+    "pricing": {
+      "input": 3e-07,
+      "output": 2.9e-06
+    },
+    "maxInputTokens": 0
+  },
+  "anthropic/claude-opus-4.5": {
+    "encoding": "claude",
+    "tokens": {
+      "baseOverhead": 6,
+      "perMessage": 2,
+      "toolsExist": 549,
+      "perTool": 53,
+      "perDesc": 5,
+      "perFirstProp": 13,
+      "perAdditionalProp": 12,
+      "perPropDesc": 5,
+      "perEnum": 9,
+      "perNestedObject": 12,
+      "perArrayOfObjects": 13,
+      "contentMultiplier": 1.1
+    },
+    "name": "Claude Opus 4.5",
+    "maxTokens": 64000,
+    "pricing": {
+      "input": 5e-06,
+      "output": 2.5e-05,
+      "input_cache_read": 5e-07,
+      "input_cache_write": 6.25e-06
+    },
+    "maxInputTokens": 136000
+  },
+  "google/gemini-3-pro-preview": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "baseOverhead": -1,
+      "perMessage": -1,
+      "toolsExist": 0,
+      "perTool": 0,
+      "perDesc": 0,
+      "perFirstProp": 3,
+      "perAdditionalProp": 2,
+      "perPropDesc": 0,
+      "perEnum": 0,
+      "perNestedObject": -1,
+      "perArrayOfObjects": 0,
+      "contentMultiplier": 1.08
+    },
+    "name": "Gemini 3 Pro Preview",
+    "maxTokens": 64000,
+    "pricing": {
+      "input": 2e-06,
+      "output": 1.2e-05,
+      "input_cache_read": 2e-07
+    },
+    "maxInputTokens": 936000
+  },
+  "prime-intellect/intellect-3": {
+    "encoding": "cl100k_base",
+    "tokens": {
+      "baseOverhead": 8,
+      "perMessage": 4,
+      "toolsExist": 267,
+      "perTool": 51,
+      "perDesc": -1,
+      "perFirstProp": 27,
+      "perAdditionalProp": 22,
+      "perPropDesc": 6,
+      "perEnum": 12,
+      "perNestedObject": -9,
+      "perArrayOfObjects": -16,
+      "contentMultiplier": 1
+    },
+    "name": "INTELLECT 3",
+    "maxTokens": 131072,
+    "pricing": {
+      "input": 2e-07,
+      "output": 1.1e-06
+    },
+    "maxInputTokens": 0
+  },
+  "xai/grok-4.1-fast-non-reasoning": {
+    "encoding": "p50k_base",
+    "tokens": {
+      "baseOverhead": 167,
+      "perMessage": 3,
+      "toolsExist": 186,
+      "perTool": 32,
+      "perDesc": 3,
+      "perFirstProp": 9,
+      "perAdditionalProp": 7,
+      "perPropDesc": 3,
+      "perEnum": 6,
+      "perNestedObject": 7,
+      "perArrayOfObjects": 8,
+      "contentMultiplier": 1
+    },
+    "name": "Grok 4.1 Fast Non-Reasoning",
+    "maxTokens": 2000000,
+    "pricing": {
+      "input": 2e-07,
+      "output": 5e-07,
+      "input_cache_read": 5e-08
+    },
+    "maxInputTokens": 0
+  },
+  "xai/grok-4.1-fast-reasoning": {
+    "encoding": "p50k_base",
+    "tokens": {
+      "baseOverhead": 155,
+      "perMessage": 3,
+      "toolsExist": 186,
+      "perTool": 32,
+      "perDesc": 3,
+      "perFirstProp": 9,
+      "perAdditionalProp": 7,
+      "perPropDesc": 3,
+      "perEnum": 6,
+      "perNestedObject": 7,
+      "perArrayOfObjects": 8,
+      "contentMultiplier": 1
+    },
+    "name": "Grok 4.1 Fast Reasoning",
+    "maxTokens": 2000000,
+    "pricing": {
+      "input": 2e-07,
+      "output": 5e-07,
+      "input_cache_read": 5e-08
+    },
+    "maxInputTokens": 0
+  },
+  "openai/gpt-5.1-codex": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "baseOverhead": 5,
+      "perMessage": 4,
+      "toolsExist": 103,
+      "perTool": 6,
+      "perDesc": 2,
+      "perFirstProp": 5,
+      "perAdditionalProp": 3,
+      "perPropDesc": 2,
+      "perEnum": 7,
+      "perNestedObject": -3,
+      "perArrayOfObjects": 1,
+      "contentMultiplier": 1
+    },
+    "name": "GPT-5.1-Codex",
+    "maxTokens": 128000,
+    "pricing": {
+      "input": 1.25e-06,
+      "output": 1e-05,
+      "input_cache_read": 1.25e-07
+    },
+    "maxInputTokens": 272000
+  },
+  "openai/gpt-5.1-instant": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "baseOverhead": 5,
+      "perMessage": 4,
+      "toolsExist": 103,
+      "perTool": 6,
+      "perDesc": 2,
+      "perFirstProp": 5,
+      "perAdditionalProp": 3,
+      "perPropDesc": 2,
+      "perEnum": 7,
+      "perNestedObject": -3,
+      "perArrayOfObjects": 1,
+      "contentMultiplier": 1
+    },
+    "name": "GPT-5.1 Instant",
+    "maxTokens": 16384,
+    "pricing": {
+      "input": 1.25e-06,
+      "output": 1e-05,
+      "input_cache_read": 1.25e-07
+    },
+    "maxInputTokens": 111616
+  },
+  "openai/gpt-5.1-thinking": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "baseOverhead": 5,
+      "perMessage": 4,
+      "toolsExist": 103,
+      "perTool": 6,
+      "perDesc": 2,
+      "perFirstProp": 5,
+      "perAdditionalProp": 3,
+      "perPropDesc": 2,
+      "perEnum": 7,
+      "perNestedObject": -3,
+      "perArrayOfObjects": 1,
+      "contentMultiplier": 1
+    },
+    "name": "GPT 5.1 Thinking",
+    "maxTokens": 128000,
+    "pricing": {
+      "input": 1.25e-06,
+      "output": 1e-05,
+      "input_cache_read": 1.25e-07
+    },
+    "maxInputTokens": 272000
+  },
+  "openai/gpt-5.1-codex-mini": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "baseOverhead": 5,
+      "perMessage": 4,
+      "toolsExist": 21,
+      "perTool": 6,
+      "perDesc": 2,
+      "perFirstProp": 5,
+      "perAdditionalProp": 3,
+      "perPropDesc": 2,
+      "perEnum": 7,
+      "perNestedObject": -3,
+      "perArrayOfObjects": 1,
+      "contentMultiplier": 1
+    },
+    "name": "GPT-5.1 Codex mini",
+    "maxTokens": 128000,
+    "pricing": {
+      "input": 2.5e-07,
+      "output": 2e-06,
+      "input_cache_read": 2.5e-08
+    },
+    "maxInputTokens": 272000
+  },
+  "openai/gpt-4": {
+    "encoding": "cl100k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 6,
+      "perMessage": 3,
+      "toolsExist": 16,
+      "perTool": 6,
+      "perDesc": 2,
+      "perFirstProp": 5,
+      "perAdditionalProp": 3,
+      "perPropDesc": 3,
+      "perEnum": 7,
+      "perNestedObject": -3,
+      "perArrayOfObjects": 1
+    },
+    "name": "GPT-4",
+    "maxTokens": 8192,
+    "pricing": {
+      "input": 3e-05,
+      "output": 6e-05
+    },
+    "maxInputTokens": 0
+  },
+  "openai/gpt-3.5-turbo": {
+    "encoding": "cl100k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 6,
+      "perMessage": 3,
+      "toolsExist": 16,
+      "perTool": 6,
+      "perDesc": 2,
+      "perFirstProp": 5,
+      "perAdditionalProp": 3,
+      "perPropDesc": 3,
+      "perEnum": 7,
+      "perNestedObject": -3,
+      "perArrayOfObjects": 1
+    },
+    "name": "GPT-3.5 Turbo",
+    "maxTokens": 4096,
+    "pricing": {
+      "input": 5e-07,
+      "output": 1.5e-06
+    },
+    "maxInputTokens": 12289
+  },
+  "openai/o1-mini": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 5,
+      "perMessage": 3,
+      "toolsExist": 19,
+      "perTool": 6,
+      "perDesc": -28,
+      "perFirstProp": 5,
+      "perAdditionalProp": 3,
+      "perPropDesc": 2,
+      "perEnum": 7,
+      "perNestedObject": -3,
+      "perArrayOfObjects": 1
+    },
+    "name": "o1-mini",
+    "maxTokens": 65536,
+    "pricing": {
+      "input": 1.1e-06,
+      "output": 4.4e-06,
+      "input_cache_read": 5.5e-07,
+      "input_cache_write": 0
+    },
+    "maxInputTokens": 62464
+  },
+  "openai/o3-pro": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 5,
+      "perMessage": 4,
+      "toolsExist": 19,
+      "perTool": 6,
+      "perDesc": 1,
+      "perFirstProp": 5,
+      "perAdditionalProp": 3,
+      "perPropDesc": 2,
+      "perEnum": 7,
+      "perNestedObject": -3,
+      "perArrayOfObjects": 1
+    },
+    "name": "o3-pro",
+    "maxTokens": 100000,
+    "pricing": {
+      "input": 2e-05,
+      "output": 8e-05
+    },
+    "maxInputTokens": 100000
+  },
+  "openai/gpt-4.1-nano": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 6,
+      "perMessage": 3,
+      "toolsExist": 16,
+      "perTool": 6,
+      "perDesc": 1,
+      "perFirstProp": 5,
+      "perAdditionalProp": 3,
+      "perPropDesc": 2,
+      "perEnum": 7,
+      "perNestedObject": -3,
+      "perArrayOfObjects": 1
+    },
+    "name": "GPT-4.1 nano",
+    "maxTokens": 32768,
+    "pricing": {
+      "input": 1e-07,
+      "output": 4e-07,
+      "input_cache_read": 2.5e-08,
+      "input_cache_write": 0
+    },
+    "maxInputTokens": 1014808
+  },
+  "openai/gpt-5.1": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 5,
+      "perMessage": 4,
+      "toolsExist": 24,
+      "perTool": 6,
+      "perDesc": 2,
+      "perFirstProp": 5,
+      "perAdditionalProp": 3,
+      "perPropDesc": 2,
+      "perEnum": 7,
+      "perNestedObject": -3,
+      "perArrayOfObjects": 1
+    },
+    "name": "GPT-5.1",
+    "maxTokens": 128000,
+    "pricing": {
+      "input": 1.25e-06,
+      "output": 1e-05,
+      "input_cache_read": 1.25e-07,
+      "input_cache_write": 0
+    },
+    "maxInputTokens": 272000
+  },
+  "openai/gpt-5.2": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 5,
+      "perMessage": 4,
+      "toolsExist": 24,
+      "perTool": 6,
+      "perDesc": 2,
+      "perFirstProp": 5,
+      "perAdditionalProp": 3,
+      "perPropDesc": 2,
+      "perEnum": 7,
+      "perNestedObject": -3,
+      "perArrayOfObjects": 1
+    },
+    "name": "GPT-5.2",
+    "maxTokens": 128000,
+    "pricing": {
+      "input": 1.75e-06,
+      "output": 1.4e-05,
+      "input_cache_read": 1.75e-07,
+      "input_cache_write": 0
+    },
+    "maxInputTokens": 272000
+  },
+  "openai/gpt-5.4": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 5,
+      "perMessage": 4,
+      "toolsExist": 24,
+      "perTool": 6,
+      "perDesc": 2,
+      "perFirstProp": 5,
+      "perAdditionalProp": 3,
+      "perPropDesc": 2,
+      "perEnum": 7,
+      "perNestedObject": -3,
+      "perArrayOfObjects": 1
+    },
+    "name": "GPT-5.4",
+    "maxTokens": 128000,
+    "pricing": {
+      "input": 2.5e-06,
+      "output": 1.5e-05,
+      "input_cache_read": 2.5e-07,
+      "input_cache_write": 0
+    },
+    "maxInputTokens": 922000
+  },
+  "openai/gpt-5.4-mini": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 5,
+      "perMessage": 4,
+      "toolsExist": 24,
+      "perTool": 6,
+      "perDesc": 2,
+      "perFirstProp": 5,
+      "perAdditionalProp": 3,
+      "perPropDesc": 2,
+      "perEnum": 7,
+      "perNestedObject": -3,
+      "perArrayOfObjects": 1
+    },
+    "name": "GPT-5.4 mini",
+    "maxTokens": 128000,
+    "pricing": {
+      "input": 7.5e-07,
+      "output": 4.5e-06,
+      "input_cache_read": 7.5e-08,
+      "input_cache_write": 0
+    },
+    "maxInputTokens": 272000
+  },
+  "openai/gpt-5.4-nano": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 5,
+      "perMessage": 4,
+      "toolsExist": 24,
+      "perTool": 6,
+      "perDesc": 2,
+      "perFirstProp": 5,
+      "perAdditionalProp": 3,
+      "perPropDesc": 2,
+      "perEnum": 7,
+      "perNestedObject": -3,
+      "perArrayOfObjects": 1
+    },
+    "name": "GPT-5.4 nano",
+    "maxTokens": 128000,
+    "pricing": {
+      "input": 2e-07,
+      "output": 1.25e-06,
+      "input_cache_read": 2e-08,
+      "input_cache_write": 0
+    },
+    "maxInputTokens": 272000
+  },
+  "openai/gpt-5.4-pro": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 5,
+      "perMessage": 4,
+      "toolsExist": 24,
+      "perTool": 6,
+      "perDesc": 2,
+      "perFirstProp": 5,
+      "perAdditionalProp": 3,
+      "perPropDesc": 2,
+      "perEnum": 7,
+      "perNestedObject": -3,
+      "perArrayOfObjects": 1
+    },
+    "name": "GPT-5.4 pro",
+    "maxTokens": 128000,
+    "pricing": {
+      "input": 3e-05,
+      "output": 0.00018
+    },
+    "maxInputTokens": 922000
+  },
+  "openai/gpt-5.5": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 5,
+      "perMessage": 4,
+      "toolsExist": 24,
+      "perTool": 6,
+      "perDesc": 2,
+      "perFirstProp": 5,
+      "perAdditionalProp": 3,
+      "perPropDesc": 2,
+      "perEnum": 7,
+      "perNestedObject": -3,
+      "perArrayOfObjects": 1
+    },
+    "name": "GPT-5.5",
+    "maxTokens": 128000,
+    "pricing": {
+      "input": 5e-06,
+      "output": 3e-05,
+      "input_cache_read": 5e-07,
+      "input_cache_write": 0
+    },
+    "maxInputTokens": 922000
+  },
+  "openai/gpt-5.5-pro": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 5,
+      "perMessage": 4,
+      "toolsExist": 24,
+      "perTool": 6,
+      "perDesc": 2,
+      "perFirstProp": 5,
+      "perAdditionalProp": 3,
+      "perPropDesc": 2,
+      "perEnum": 7,
+      "perNestedObject": -3,
+      "perArrayOfObjects": 1
+    },
+    "name": "GPT-5.5 pro",
+    "maxTokens": 128000,
+    "pricing": {
+      "input": 3e-05,
+      "output": 0.00018
+    },
+    "maxInputTokens": 922000
+  },
+  "openai/gpt-5.6-sol": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 5,
+      "perMessage": 4,
+      "toolsExist": 24,
+      "perTool": 6,
+      "perDesc": 2,
+      "perFirstProp": 5,
+      "perAdditionalProp": 3,
+      "perPropDesc": 2,
+      "perEnum": 7,
+      "perNestedObject": -3,
+      "perArrayOfObjects": 1
+    },
+    "name": "GPT-5.6 Sol",
+    "maxTokens": 128000,
+    "pricing": {
+      "input": 5e-06,
+      "output": 3e-05,
+      "input_cache_read": 5e-07,
+      "input_cache_write": 0
+    },
+    "maxInputTokens": 922000
+  },
+  "openai/gpt-5.6-terra": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 5,
+      "perMessage": 4,
+      "toolsExist": 24,
+      "perTool": 6,
+      "perDesc": 2,
+      "perFirstProp": 5,
+      "perAdditionalProp": 3,
+      "perPropDesc": 2,
+      "perEnum": 7,
+      "perNestedObject": -3,
+      "perArrayOfObjects": 1
+    },
+    "name": "GPT-5.6 Terra",
+    "maxTokens": 128000,
+    "pricing": {
+      "input": 2.5e-06,
+      "output": 1.5e-05,
+      "input_cache_read": 2.5e-07,
+      "input_cache_write": 0
+    },
+    "maxInputTokens": 922000
+  },
+  "openai/gpt-5.6-luna": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 5,
+      "perMessage": 4,
+      "toolsExist": 24,
+      "perTool": 6,
+      "perDesc": 2,
+      "perFirstProp": 5,
+      "perAdditionalProp": 3,
+      "perPropDesc": 2,
+      "perEnum": 7,
+      "perNestedObject": -3,
+      "perArrayOfObjects": 1
+    },
+    "name": "GPT-5.6 Luna",
+    "maxTokens": 128000,
+    "pricing": {
+      "input": 1e-06,
+      "output": 6e-06,
+      "input_cache_read": 1e-07,
+      "input_cache_write": 0
+    },
+    "maxInputTokens": 922000
+  },
+  "google/gemini-3-flash-preview": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1.08,
+      "baseOverhead": -1,
+      "perMessage": -1,
+      "toolsExist": 0,
+      "perTool": 0,
+      "perDesc": 0,
+      "perFirstProp": 3,
+      "perAdditionalProp": 2,
+      "perPropDesc": 0,
+      "perEnum": 0,
+      "perNestedObject": -1,
+      "perArrayOfObjects": 0
+    },
+    "name": "Gemini 3 Flash Preview",
+    "maxTokens": 65536,
+    "pricing": {
+      "input": 5e-07,
+      "output": 3e-06
+    },
+    "maxInputTokens": 983040
+  },
+  "google/gemini-3.1-pro-preview": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1.08,
+      "baseOverhead": -1,
+      "perMessage": -1,
+      "toolsExist": 0,
+      "perTool": 0,
+      "perDesc": 0,
+      "perFirstProp": 3,
+      "perAdditionalProp": 2,
+      "perPropDesc": 0,
+      "perEnum": 0,
+      "perNestedObject": -1,
+      "perArrayOfObjects": 0
+    },
+    "name": "Gemini 3.1 Pro Preview",
+    "maxTokens": 65536,
+    "pricing": {
+      "input": 2e-06,
+      "output": 1.2e-05,
+      "input_cache_read": 2e-07
+    },
+    "maxInputTokens": 983040
+  },
+  "google/gemini-3.1-flash-lite": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1.08,
+      "baseOverhead": -1,
+      "perMessage": -1,
+      "toolsExist": 0,
+      "perTool": 0,
+      "perDesc": 0,
+      "perFirstProp": 3,
+      "perAdditionalProp": 2,
+      "perPropDesc": 0,
+      "perEnum": 0,
+      "perNestedObject": -1,
+      "perArrayOfObjects": 0
+    },
+    "name": "Gemini 3.1 Flash Lite",
+    "maxTokens": 65536,
+    "pricing": {
+      "input": 2.5e-07,
+      "output": 1.5e-06,
+      "input_cache_read": 2.5e-08
+    },
+    "maxInputTokens": 983040
+  },
+  "google/gemini-3.1-flash-lite-preview": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1.08,
+      "baseOverhead": -1,
+      "perMessage": -1,
+      "toolsExist": 0,
+      "perTool": 0,
+      "perDesc": 0,
+      "perFirstProp": 3,
+      "perAdditionalProp": 2,
+      "perPropDesc": 0,
+      "perEnum": 0,
+      "perNestedObject": -1,
+      "perArrayOfObjects": 0
+    },
+    "name": "Gemini 3.1 Flash Lite Preview",
+    "maxTokens": 65536,
+    "pricing": {
+      "input": 2.5e-07,
+      "output": 1.5e-06,
+      "input_cache_read": 2.5e-08
+    },
+    "maxInputTokens": 983040
+  }
+}
