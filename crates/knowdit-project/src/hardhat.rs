@@ -162,10 +162,19 @@ impl HardhatProject {
 /// time, so unknown future versions fail loudly with the offending
 /// string in the error message rather than mid-parse on a renamed
 /// field. Add a new variant the day Hardhat ships a v2.
+///
+/// Hardhat 3 splits what Hardhat 2 kept in a single file: the input
+/// (settings + source contents) stays in `<id>.json` while the solc
+/// output moves to `<id>.output.json`. Both halves are modelled here;
+/// [`BuildInfoCollection::from_dir`] merges sibling files by `id`.
 #[derive(Debug, Deserialize)]
 enum BuildInfoFormat {
     #[serde(rename = "hh-sol-build-info-1")]
     HhSolBuildInfo1,
+    #[serde(rename = "hh3-sol-build-info-1")]
+    Hh3SolBuildInfo1,
+    #[serde(rename = "hh3-sol-build-info-output-1")]
+    Hh3SolBuildInfoOutput1,
 }
 
 #[derive(Debug, Deserialize)]
@@ -268,7 +277,46 @@ impl BuildInfoCollection {
             "no build-info JSON files in {}",
             dir.display()
         );
+        Self::merge_split_build_info(&mut files);
         Ok(Self { files })
+    }
+
+    /// Hardhat 3 writes a build-info as two sibling files: `<id>.json`
+    /// carries the input (source contents + settings) and
+    /// `<id>.output.json` carries the solc output. Fold the output of
+    /// each `.output.json` back into its input sibling so the rest of
+    /// this module can treat every file as a self-contained
+    /// Hardhat 2-shaped record. Files without a sibling (Hardhat 2, or
+    /// a partially cleaned dir) are left untouched.
+    fn merge_split_build_info(files: &mut [BuildInfoFile]) {
+        // id -> index of the input halves (`<id>.json`, which carry `input`
+        // but no `output`).
+        let mut input_index: BTreeMap<String, usize> = BTreeMap::new();
+        for (i, f) in files.iter().enumerate() {
+            if !f.info.id.is_empty() && f.info.output.sources.is_empty() {
+                input_index.insert(f.info.id.clone(), i);
+            }
+        }
+
+        for i in 0..files.len() {
+            // Only the output halves (`.output.json`) need re-homing.
+            if files[i].info.output.sources.is_empty() {
+                continue;
+            }
+            // Already self-contained (Hardhat 2 wrote input+output together).
+            if !files[i].info.input.sources.is_empty() {
+                continue;
+            }
+            let id = files[i].info.id.clone();
+            if id.is_empty() {
+                continue;
+            }
+            let Some(&target) = input_index.get(&id) else {
+                continue;
+            };
+            let output = std::mem::take(&mut files[i].info.output);
+            files[target].info.output = output;
+        }
     }
 
     /// Fold every build-info file into `(rel_path -> winning ast + content)`,
