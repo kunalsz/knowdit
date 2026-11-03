@@ -78,75 +78,34 @@ impl FuzzRuntime {
         options: &FuzzOptions,
         backend: &ForgeBackend,
     ) -> Result<Self> {
-        let call_graph = repo
-            .load_call_graph()
-            .await
-            .wrap_err("failed to load project call graph")?;
-        let storage_graph = repo
-            .load_storage_graph()
-            .await
-            .wrap_err("failed to load project storage graph")?;
-        let inheritance_graph = repo
-            .load_inheritance_graph()
-            .await
-            .wrap_err("failed to load project inheritance graph")?;
-        let project_index = Arc::new(ProjectIndex::build(
-            call_graph,
-            storage_graph,
-            inheritance_graph,
-        ));
-
-        let extracted = repo
-            .load_project_semantics()
-            .await
-            .wrap_err("failed to load extracted project semantics")?;
-        let extracted_by_id: BTreeMap<i32, ExtractedSemantic> = extracted
-            .into_iter()
-            .enumerate()
-            .map(|(i, sem)| ((i as i32) + 1, sem))
-            .collect();
         let match_set: SemanticMatchSet = repo
             .load_semantic_match_results()
             .await
             .wrap_err("failed to load Knowledge Mapper output")?;
-        // Move historicals into the index (no clone); build the (E, H) strength
-        // index for exact materialization.
-        let SemanticMatchSet { historicals, matches } = match_set;
-        let historical_by_id: BTreeMap<i32, HistoricalSemanticRecord> = historicals
-            .into_iter()
-            .map(|record| (record.semantic.id, record))
-            .collect();
-        let match_strength_by_pair: BTreeMap<(i32, i32), MatchStrength> = matches
-            .iter()
-            .map(|m| ((m.extract_id, m.historical_id), m.strength))
-            .collect();
+        match_set_for(repo, options, backend, match_set, None).await
+    }
 
-        let harness_dir = options.resolve_harness_dir();
-        tokio::fs::create_dir_all(&harness_dir)
+    /// Build a runtime scoped to a **single** `(extract, historical)` pair.
+    ///
+    /// The single-spec entries only ever call [`Self::materialize_link`] for
+    /// one identity, but [`Self::new`] loads the entire mapper output — every
+    /// historical, every finding, every link and the whole `semantic_matched`
+    /// table — and re-renders each description into a fresh `String`. On a
+    /// large project that is hundreds of MiB per invocation, repeated once per
+    /// link in a long streamloop, which is what drove the process into
+    /// repeated OOM kills. This path reads only the two rows the link needs.
+    pub(super) async fn new_for_link(
+        repo: &RepoDatabase,
+        options: &FuzzOptions,
+        backend: &ForgeBackend,
+        extract_id: i32,
+        historical_id: i32,
+    ) -> Result<Self> {
+        let match_set = repo
+            .load_semantic_match_results_for_link(extract_id, historical_id)
             .await
-            .wrap_err_with(|| format!("failed to create harness_dir {}", harness_dir.display()))?;
-        let harness_dir = std::fs::canonicalize(&harness_dir).unwrap_or(harness_dir);
-        let forge_work_dir = if options.repo_root.join("foundry.toml").exists() {
-            options.repo_root.clone()
-        } else {
-            harness_dir.clone()
-        };
-        let forge_runner = ForgeRunner::new(
-            backend.clone(),
-            forge_work_dir,
-            Duration::from_secs(options.forge_timeout_secs),
-        );
-        let project_conventions = Arc::new(ProjectConventions::load(&options.repo_root).await);
-
-        Ok(Self {
-            project_index,
-            extracted_by_id,
-            historical_by_id,
-            match_strength_by_pair,
-            harness_dir,
-            forge_runner,
-            project_conventions,
-        })
+            .wrap_err("failed to load Knowledge Mapper output for one link")?;
+        match_set_for(repo, options, backend, match_set, Some(extract_id)).await
     }
 
     /// Materialize exactly one `(extract, historical, finding)` link from the
@@ -174,6 +133,91 @@ impl FuzzRuntime {
             record,
         )
     }
+}
+
+/// Shared body of [`FuzzRuntime::new`] and [`FuzzRuntime::new_for_link`].
+///
+/// Both entry points differ only in *which* mapper output they load; the
+/// project index, extract list, harness dir, forge runner and conventions are
+/// identical. `only_extract` trims the extract index to a single id for the
+/// per-link path so a single-link runtime cannot accidentally materialize a
+/// different extract's link.
+async fn match_set_for(
+    repo: &RepoDatabase,
+    options: &FuzzOptions,
+    backend: &ForgeBackend,
+    match_set: SemanticMatchSet,
+    only_extract: Option<i32>,
+) -> Result<FuzzRuntime> {
+    let call_graph = repo
+        .load_call_graph()
+        .await
+        .wrap_err("failed to load project call graph")?;
+    let storage_graph = repo
+        .load_storage_graph()
+        .await
+        .wrap_err("failed to load project storage graph")?;
+    let inheritance_graph = repo
+        .load_inheritance_graph()
+        .await
+        .wrap_err("failed to load project inheritance graph")?;
+    let project_index = Arc::new(ProjectIndex::build(
+        call_graph,
+        storage_graph,
+        inheritance_graph,
+    ));
+
+    let extracted = repo
+        .load_project_semantics()
+        .await
+        .wrap_err("failed to load extracted project semantics")?;
+    let mut extracted_by_id: BTreeMap<i32, ExtractedSemantic> = extracted
+        .into_iter()
+        .enumerate()
+        .map(|(i, sem)| ((i as i32) + 1, sem))
+        .collect();
+    if let Some(keep) = only_extract {
+        extracted_by_id.retain(|id, _| *id == keep);
+    }
+
+    // Move historicals into the index (no clone); build the (E, H) strength
+    // index for exact materialization.
+    let SemanticMatchSet { historicals, matches } = match_set;
+    let historical_by_id: BTreeMap<i32, HistoricalSemanticRecord> = historicals
+        .into_iter()
+        .map(|record| (record.semantic.id, record))
+        .collect();
+    let match_strength_by_pair: BTreeMap<(i32, i32), MatchStrength> = matches
+        .iter()
+        .map(|m| ((m.extract_id, m.historical_id), m.strength))
+        .collect();
+
+    let harness_dir = options.resolve_harness_dir();
+    tokio::fs::create_dir_all(&harness_dir)
+        .await
+        .wrap_err_with(|| format!("failed to create harness_dir {}", harness_dir.display()))?;
+    let harness_dir = std::fs::canonicalize(&harness_dir).unwrap_or(harness_dir);
+    let forge_work_dir = if options.repo_root.join("foundry.toml").exists() {
+        options.repo_root.clone()
+    } else {
+        harness_dir.clone()
+    };
+    let forge_runner = ForgeRunner::new(
+        backend.clone(),
+        forge_work_dir,
+        Duration::from_secs(options.forge_timeout_secs),
+    );
+    let project_conventions = Arc::new(ProjectConventions::load(&options.repo_root).await);
+
+    Ok(FuzzRuntime {
+        project_index,
+        extracted_by_id,
+        historical_by_id,
+        match_strength_by_pair,
+        harness_dir,
+        forge_runner,
+        project_conventions,
+    })
 }
 
 /// Per-spec scratch directory bundle: the unique dir on disk where the
@@ -1089,7 +1133,14 @@ impl SolidityHarnessGenerator {
         synthetic_spec_id: i32,
         prior_feedback: String,
     ) -> Result<CodegenRegenInMemory> {
-        let runtime = FuzzRuntime::new(&self.repo, &self.options, &self.backend).await?;
+        let runtime = FuzzRuntime::new_for_link(
+            &self.repo,
+            &self.options,
+            &self.backend,
+            extract_id,
+            historical_id,
+        )
+        .await?;
         let link = runtime
             .materialize_link(extract_id, historical_id, finding_id)
             .ok_or_else(|| {
@@ -1127,7 +1178,9 @@ impl SolidityHarnessGenerator {
         &self,
         spec_id: i32,
     ) -> Result<(LinkInput, AuditSpecification, FuzzRuntime)> {
-        let runtime = FuzzRuntime::new(&self.repo, &self.options, &self.backend).await?;
+        // Resolve the spec row first so the runtime can be scoped to this one
+        // link — loading the entire mapper output here was the per-link OOM
+        // driver.
         let specs = self
             .repo
             .load_specifications()
@@ -1136,6 +1189,14 @@ impl SolidityHarnessGenerator {
         let spec_row = specs.into_iter().find(|s| s.id == spec_id).ok_or_else(|| {
             color_eyre::eyre::eyre!("spec_id={spec_id} not in specification table")
         })?;
+        let runtime = FuzzRuntime::new_for_link(
+            &self.repo,
+            &self.options,
+            &self.backend,
+            spec_row.semantic_id,
+            spec_row.historical_id,
+        )
+        .await?;
         let link = runtime
             .materialize_link(
                 spec_row.semantic_id,

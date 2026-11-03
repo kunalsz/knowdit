@@ -170,3 +170,28 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+mod added_model_tests {
+    use super::*;
+
+    /// The provider-facing id added to the vendored registry. Without a
+    /// registry entry llmy falls back to `custom_model` with
+    /// `max_input_tokens: 0` and zero pricing, which silently collapses
+    /// prompt budgets to the 131072-token window.
+    #[test]
+    fn provider_prefixed_flash_id_serves_a_1m_context() {
+        use std::str::FromStr;
+
+        let alias = OpenAIModel::from_str("deepseek/deepseek-v4.1-flash-1017")
+            .expect("alias must parse");
+        let canonical =
+            OpenAIModel::from_str("deepseek-ai/DeepSeek-V4.1-Flash-1017").expect("canonical");
+
+        let (alias_max, _) = alias.info();
+        assert_eq!(alias_max, 1_000_000, "this model serves a 1M-token context");
+        assert!(!alias.pricing().output.is_zero(), "alias needs real pricing");
+        // The canonical id keeps its own (smaller) window.
+        assert_eq!(canonical.info().0, 262_144);
+    }
+}

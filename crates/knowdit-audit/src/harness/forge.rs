@@ -67,6 +67,11 @@ use super::cgroup::ScopedCgroup;
 /// cores internally, so running several at once oversubscribes the box.
 static FORGE_LOCK: Mutex<()> = Mutex::const_new(());
 
+/// Extra time a caller will wait for [`FORGE_LOCK`] beyond its own forge
+/// timeout. A well-behaved holder releases within its timeout, so this only
+/// trips when the holder is genuinely wedged.
+const FORGE_LOCK_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// One forge invocation backend = how to spawn `forge <args>`. The
 /// outer [`ForgeBackend`] owns this plus a probed [`ForgeFeatures`]
 /// table so callers can branch on optional flags (currently:
@@ -354,6 +359,10 @@ pub struct ForgeRunner {
     /// subdirectory and its dependency closure. Lets us isolate concurrent
     /// per-spec harnesses from each other's compile errors.
     test_dir_override: Option<PathBuf>,
+    /// Override for the extra time a caller waits on [`FORGE_LOCK`].
+    /// `None` uses [`FORGE_LOCK_GRACE`]; tests shrink it so the bounded-wait
+    /// behaviour is assertable without sleeping a minute.
+    lock_grace: Option<Duration>,
 }
 
 impl ForgeRunner {
@@ -384,6 +393,7 @@ impl ForgeRunner {
             work_dir,
             timeout,
             test_dir_override: None,
+            lock_grace: None,
         }
     }
 
@@ -453,7 +463,28 @@ impl ForgeRunner {
     /// in this process via [`FORGE_LOCK`], because all links share one
     /// project's `out/` + build cache (see the lock's docs).
     pub async fn run(&self, args: &[String]) -> Result<ForgeOutput> {
-        let _forge_guard = FORGE_LOCK.lock().await;
+        // Waiting for the lock is itself bounded. Without this, a holder that
+        // never releases (a forge child OOM-killed mid-run leaves its waiter
+        // parked on a pipe that will never close, or a task that panicked
+        // while holding the guard) wedges every other link forever: the
+        // process sits at zero CPU with nothing to report, which is exactly
+        // the "run looks alive but is doing nothing" failure. Failing this
+        // invocation lets the pipeline mark the spec and move on.
+        let grace = self
+            .lock_grace
+            .unwrap_or(FORGE_LOCK_GRACE);
+        let lock_timeout = self.timeout.saturating_add(grace);
+        let _forge_guard = match tokio::time::timeout(lock_timeout, FORGE_LOCK.lock()).await {
+            Ok(guard) => guard,
+            Err(_) => {
+                return Err(eyre!(
+                    "timed out after {}s waiting for the shared forge lock; another forge \
+                     invocation is wedged (killed child / panicked holder). Failing this \
+                     invocation so the remaining links can proceed.",
+                    lock_timeout.as_secs()
+                ));
+            }
+        };
         let start = Instant::now();
         let handle = self.spawn(args)?;
         let timeout = self.timeout;
@@ -468,16 +499,26 @@ impl ForgeRunner {
                 timed_out: false,
             }),
             Ok(Err(io_err)) => Err(io_err).wrap_err("forge wait_with_output failed"),
-            Err(_elapsed) => Ok(ForgeOutput {
-                exit_code: -1,
-                stdout: String::new(),
-                stderr: format!(
-                    "knowdit: forge timed out after {} seconds",
-                    timeout.as_secs()
-                ),
-                duration_ms,
-                timed_out: true,
-            }),
+            Err(_elapsed) => {
+                // The child is killed by `kill_on_drop` when `handle` drops at
+                // the end of this arm. Say so in the output, because a timed-out
+                // forge is often the machine's OOM killer taking the child (and
+                // its solc) rather than forge genuinely running long — the
+                // caller reading this line cannot tell otherwise.
+                Ok(ForgeOutput {
+                    exit_code: -1,
+                    stdout: String::new(),
+                    stderr: format!(
+                        "knowdit: forge timed out after {} seconds and was killed. This is \
+                         usually a very slow `via_ir` compile, or the OOM killer taking forge / \
+                         solc. Check `dmesg` for 'Killed process' and consider a smaller \
+                         --forge-test-runs or dropping `via_ir` in foundry.toml.",
+                        timeout.as_secs()
+                    ),
+                    duration_ms,
+                    timed_out: true,
+                })
+            }
         }
     }
 
@@ -578,6 +619,31 @@ contract KnowditPreflight is Test {
                 "preflight: forge environment OK"
             );
             return Ok(());
+        }
+
+        // A timeout is not the same failure as a broken environment: the
+        // smoke test never got to report either way, and the usual cause is
+        // a cold or via_ir compile outrunning the budget rather than a
+        // misconfigured project. Saying "environment is broken" here sends
+        // people to reinstall forge-std for a problem that raising
+        // --forge-timeout-secs fixes.
+        if out.timed_out {
+            return Err(eyre!(
+                "preflight: forge did not finish within {}s — the smoke test was killed before it \
+                 could report. Its output is truncated or empty because of the kill. Most often the \
+                 compile itself is the cost, not a broken project: `via_ir = true` in foundry.toml, \
+                 a large dependency tree, or a cold solc/docker cache can take minutes inside solc \
+                 before the test runs. Raise `--forge-timeout-secs` (the preflight uses it as its \
+                 budget, 60s floor) and re-run, or warm the cache once with `forge build` at the \
+                 work_dir.\n\
+                 forge exit_code={} timed_out={} duration_ms={}\n\
+                 --- forge output captured before the kill (last ~4K of stdout + stderr) ---\n{}",
+                self.timeout.as_secs(),
+                out.exit_code,
+                out.timed_out,
+                out.duration_ms,
+                combined_tail,
+            ));
         }
 
         Err(eyre!(
@@ -799,4 +865,56 @@ pub struct ForgeOutput {
     pub stderr: String,
     pub duration_ms: i64,
     pub timed_out: bool,
+}
+
+#[cfg(test)]
+mod lock_timeout_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn local_runner(work_dir: std::path::PathBuf, timeout: Duration) -> ForgeRunner {
+        let mut runner = ForgeRunner::new(
+            ForgeBackend {
+                kind: ForgeBackendKind::LocalDirect {
+                    binary: std::path::PathBuf::from("/bin/true"),
+                },
+                features: ForgeFeatures::default(),
+            },
+            work_dir,
+            timeout,
+        );
+        runner.lock_grace = Some(Duration::from_millis(100));
+        runner
+    }
+
+    /// A wedged holder must not park every other link forever. Before this was
+    /// bounded, a forge child killed mid-run (OOM, for instance) left its
+    /// waiter asleep on a pipe that never closed, and the whole streamloop sat
+    /// at zero CPU indefinitely.
+    #[tokio::test]
+    async fn waiting_for_a_wedged_lock_times_out() {
+        let dir = std::env::temp_dir();
+        let runner = local_runner(dir, Duration::from_millis(50));
+
+        // Simulate a wedged holder by taking the lock ourselves.
+        let _held = FORGE_LOCK.lock().await;
+
+        let started = Instant::now();
+        let err = runner
+            .run(&["--version".to_string()])
+            .await
+            .expect_err("must not hang, and must not succeed without the lock");
+        let waited = started.elapsed();
+
+        assert!(
+            err.to_string().contains("waiting for the shared forge lock"),
+            "unexpected error: {err}"
+        );
+        // timeout (50ms) + grace (60s) is the ceiling; it must return well
+        // before any unbounded wait would.
+        assert!(
+            waited < Duration::from_secs(65),
+            "lock wait was not bounded: {waited:?}"
+        );
+    }
 }

@@ -1886,6 +1886,175 @@ impl RepoDatabase {
         })
     }
 
+    /// Narrow counterpart to [`Self::load_semantic_match_results`] for the
+    /// single-link paths (`fuzz_one_existing_spec`, `regen_one_spec`,
+    /// `regen_codegen_with_explicit_spec`).
+    ///
+    /// Those paths only ever ask for one `(extract, historical, finding)`
+    /// triple via `FuzzRuntime::materialize_link`, but the wide loader pulls
+    /// every historical, every finding, every link and the whole
+    /// `semantic_matched` table — hundreds of MiB on a large project — then
+    /// re-renders each description into a fresh `String`. Called once per
+    /// link in a long streamloop, that repeated O(all rows) work is what
+    /// drove RSS into the tens of GiB.
+    ///
+    /// Returns the same records the wide loader would produce for that one
+    /// pair, including merged-variant rendering, so the materialized
+    /// `LinkInput` is byte-identical.
+    pub async fn load_semantic_match_results_for_link(
+        &self,
+        extract_id: i32,
+        historical_id: i32,
+    ) -> Result<SemanticMatchSet> {
+        use knowdit_kg_model::render::render_with_variants;
+        use sea_orm::{ColumnTrait, QueryFilter};
+
+        let variant_render_cap = self.variant_render_cap;
+
+        let matched = semantic_matched_model::Entity::find()
+            .filter(semantic_matched_model::Column::ExtractId.eq(extract_id))
+            .filter(semantic_matched_model::Column::HistoricalId.eq(historical_id))
+            .one(&self.db)
+            .await
+            .wrap_err_with(|| {
+                format!(
+                    "failed to load semantic_matched row for (extract={extract_id}, \
+                     historical={historical_id})"
+                )
+            })?;
+        let Some(matched) = matched else {
+            return Ok(SemanticMatchSet::default());
+        };
+
+        let Some(semantic_row) = historical_semantic_model::Entity::find_by_id(historical_id)
+            .one(&self.db)
+            .await
+            .wrap_err_with(|| format!("failed to load historical_semantic {historical_id}"))?
+        else {
+            return Ok(SemanticMatchSet::default());
+        };
+
+        // Variant notes: only this canonical's merged children matter.
+        let sem_notes: Vec<String> = historical_semantic_merge_model::Entity::find()
+            .filter(
+                historical_semantic_merge_model::Column::ToSemanticId.eq(historical_id),
+            )
+            .all(&self.db)
+            .await
+            .wrap_err("failed to load historical_semantic_merge rows")?
+            .into_iter()
+            .map(|e| e.appended_description.trim().to_string())
+            .filter(|note| !note.is_empty())
+            .collect();
+
+        // Findings linked to this historical, with their own merge notes.
+        let link_rows = historical_semantic_finding_link_model::Entity::find()
+            .filter(
+                historical_semantic_finding_link_model::Column::HistoricalSemanticId
+                    .eq(historical_id),
+            )
+            .all(&self.db)
+            .await
+            .wrap_err("failed to load historical_semantic_finding_link rows")?;
+        let finding_ids: Vec<i32> = link_rows.iter().map(|l| l.historical_finding_id).collect();
+
+        let finding_rows = if finding_ids.is_empty() {
+            Vec::new()
+        } else {
+            historical_finding_model::Entity::find()
+                .filter(historical_finding_model::Column::Id.is_in(finding_ids.clone()))
+                .all(&self.db)
+                .await
+                .wrap_err("failed to load historical_finding rows")?
+        };
+        let findings_by_id: std::collections::BTreeMap<
+            i32,
+            knowdit_kg_model::db::audit_finding::Model,
+        > = finding_rows
+            .into_iter()
+            .map(|row| (row.id, row.into()))
+            .collect();
+
+        let mut finding_notes: std::collections::BTreeMap<
+            i32,
+            (Vec<String>, Vec<String>, Vec<String>),
+        > = std::collections::BTreeMap::new();
+        if !finding_ids.is_empty() {
+            for e in historical_finding_merge_model::Entity::find()
+                .filter(historical_finding_merge_model::Column::ToFindingId.is_in(finding_ids))
+                .all(&self.db)
+                .await
+                .wrap_err("failed to load historical_finding_merge rows")?
+            {
+                let entry = finding_notes.entry(e.to_finding_id).or_default();
+                let d = e.appended_description.trim();
+                if !d.is_empty() {
+                    entry.0.push(d.to_string());
+                }
+                let p = e.appended_patterns.trim();
+                if !p.is_empty() {
+                    entry.1.push(p.to_string());
+                }
+                let x = e.appended_exploits.trim();
+                if !x.is_empty() {
+                    entry.2.push(x.to_string());
+                }
+            }
+        }
+
+        let semantic: knowdit_kg_model::db::semantic_node::Model = semantic_row.into();
+        let rendered_description =
+            render_with_variants(&semantic.description, &sem_notes, variant_render_cap);
+
+        let no_notes: (Vec<String>, Vec<String>, Vec<String>) = Default::default();
+        let findings = link_rows
+            .into_iter()
+            .filter_map(|link| {
+                findings_by_id.get(&link.historical_finding_id).cloned().map(|finding| {
+                    let (dn, pn, xn) = finding_notes
+                        .get(&finding.id)
+                        .unwrap_or(&no_notes);
+                    HistoricalLinkedFinding {
+                        rendered_description: render_with_variants(
+                            &finding.description,
+                            dn,
+                            variant_render_cap,
+                        ),
+                        rendered_patterns: render_with_variants(
+                            &finding.patterns,
+                            pn,
+                            variant_render_cap,
+                        ),
+                        rendered_exploits: render_with_variants(
+                            &finding.exploits,
+                            xn,
+                            variant_render_cap,
+                        ),
+                        raw_children: Vec::new(),
+                        finding,
+                        strength: link.strength,
+                        evidence: link.evidence,
+                    }
+                })
+            })
+            .collect();
+
+        Ok(SemanticMatchSet {
+            historicals: vec![HistoricalSemanticRecord {
+                semantic,
+                findings,
+                raw_children: Vec::new(),
+                rendered_description,
+            }],
+            matches: vec![SemanticMatch {
+                extract_id: matched.extract_id,
+                historical_id: matched.historical_id,
+                strength: matched.strength,
+                evidence: matched.evidence,
+            }],
+        })
+    }
+
     // -----------------------------------------------------------------
     // project_metadata: generic per-DB KV store. ProjectProfile lives
     // here under `key = METADATA_KEY_PROFILE`; future per-DB metadata

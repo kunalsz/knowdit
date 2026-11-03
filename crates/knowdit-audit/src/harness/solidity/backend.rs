@@ -133,13 +133,16 @@ impl HarnessBackend for SolidityHarness {
         } else {
             harness_dir.clone()
         };
-        // Preflight is one trivial test; 60s is generous even on slow
-        // docker pulls. Independent of the user's `forge_timeout_secs`,
-        // which the per-spec agent uses for real fuzz runs.
+        // Preflight is a single trivial test, but the compile it triggers is
+        // not trivial: projects with `via_ir = true`, large dependency trees
+        // or a cold solc cache can spend minutes inside solc before the test
+        // ever runs. Budget against the same per-invocation timeout the agent
+        // gets, with 60s as the floor so the default profile stays fast.
+        let preflight_timeout = Duration::from_secs(self.options.forge_timeout_secs.max(60));
         let runner = ForgeRunner::new(
             self.forge_backend.clone(),
             forge_work_dir,
-            Duration::from_secs(60),
+            preflight_timeout,
         );
         runner.preflight(&harness_dir).await
     }

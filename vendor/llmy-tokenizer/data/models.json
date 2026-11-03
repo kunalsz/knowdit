@@ -1555,6 +1555,31 @@
     },
     "maxInputTokens": 262144
   },
+  "deepseek/deepseek-v4.1-flash-1017": {
+    "encoding": "o200k_base",
+    "tokens": {
+      "contentMultiplier": 1,
+      "baseOverhead": 3,
+      "perMessage": 1,
+      "toolsExist": 142,
+      "perTool": 42,
+      "perDesc": 0,
+      "perFirstProp": 14,
+      "perAdditionalProp": 11,
+      "perPropDesc": 5,
+      "perEnum": 9,
+      "perNestedObject": 9,
+      "perArrayOfObjects": 10
+    },
+    "name": "DeepSeek V4.1 Flash",
+    "maxTokens": 393216,
+    "pricing": {
+      "input": 1.4e-07,
+      "output": 2.8e-07,
+      "input_cache_read": 2.8e-09
+    },
+    "maxInputTokens": 1000000
+  },
   "deepseek/deepseek-reasoner": {
     "encoding": "o200k_base",
     "tokens": {

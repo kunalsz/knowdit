@@ -334,13 +334,42 @@ impl FoundryProject {
         let no_walk = repo_root.join(".knowdit-no-walk");
         builder = builder.tests(&no_walk).scripts(&no_walk);
 
-        let lib_dirs: Vec<PathBuf> = ["lib", "node_modules"]
-            .into_iter()
-            .map(|d| repo_root.join(d))
+        // Lib dirs: the profile's own `libs = [...]` plus the conventional
+        // `lib` / `node_modules`. Workspace setups point these *outside* the
+        // project root (`packages/<x>/foundry.toml` with
+        // `libs = ["../../lib", "../shared"]`), so the entries must be
+        // resolved against `repo_root` and canonicalized.
+        let mut lib_dirs: Vec<PathBuf> = profile
+            .libs
+            .iter()
+            .map(|raw| {
+                let p = PathBuf::from(raw);
+                if p.is_absolute() {
+                    p
+                } else {
+                    repo_root.join(p)
+                }
+            })
+            .chain(
+                ["lib", "node_modules"]
+                    .into_iter()
+                    .map(|d| repo_root.join(d)),
+            )
             .filter(|p| p.is_dir())
+            .filter_map(|p| fs::canonicalize(&p).ok())
             .collect();
+        lib_dirs.sort();
+        lib_dirs.dedup();
         if !lib_dirs.is_empty() {
-            builder = builder.libs(lib_dirs.iter().cloned());
+            // solc refuses to read outside `--allow-paths` and only the
+            // project root is allowed by default, so every lib dir that
+            // lives outside the root (the normal case for workspaces) must
+            // be declared explicitly. Without this, imports that resolve to
+            // a sibling `lib/` fail with "File outside of allowed
+            // directories".
+            builder = builder
+                .allowed_paths(lib_dirs.iter().cloned())
+                .libs(lib_dirs.iter().cloned());
         }
 
         // Project-path names that lib remappings are not allowed to
@@ -365,7 +394,8 @@ impl FoundryProject {
         // then remappings.txt -----
         let mut user_remappings: Vec<Remapping> = Vec::new();
         for raw in foundry.remappings_for_profile(&options.profile) {
-            if let Some(r) = parse_remapping_line(&raw, "foundry.toml", None) {
+            if let Some(mut r) = parse_remapping_line(&raw, "foundry.toml", None) {
+                r.path = absolutize_remapping_path(repo_root, &r.path);
                 user_remappings.push(r);
             }
         }
@@ -378,9 +408,10 @@ impl FoundryProject {
                 )
             })?;
             for (idx, raw) in text.lines().enumerate() {
-                if let Some(r) =
+                if let Some(mut r) =
                     parse_remapping_line(raw, &remappings_txt.display().to_string(), Some(idx + 1))
                 {
+                    r.path = absolutize_remapping_path(repo_root, &r.path);
                     user_remappings.push(r);
                 }
             }
@@ -633,16 +664,21 @@ fn collect_nested_remappings(sub_abs: &Path) -> Result<Vec<Remapping>> {
     Ok(out)
 }
 
-/// Resolve a remapping `path` (as written in a sub-project's config) to
-/// an absolute path. Relative paths are joined against the sub-project
-/// root; absolute paths are kept verbatim. The result always ends with
-/// a trailing `/` so foundry-compilers treats it as a directory prefix.
+/// Resolve a remapping `path` (as written in a config) to an absolute
+/// path. Relative paths are joined against the base; absolute paths are
+/// kept. The result is canonicalized when it exists, because solc
+/// compares the resolved import path against its normalized
+/// `--allow-paths` entries — an unnormalized
+/// `<root>/packages/perps/../../lib/...` is rejected as "File outside of
+/// allowed directories". Always ends with a trailing `/` so
+/// foundry-compilers treats it as a directory prefix.
 fn absolutize_remapping_path(base: &Path, raw: &str) -> String {
     let pb = if Path::new(raw).is_absolute() {
         PathBuf::from(raw)
     } else {
         base.join(raw)
     };
+    let pb = fs::canonicalize(&pb).unwrap_or(pb);
     let mut s = pb.to_string_lossy().into_owned();
     if !s.ends_with('/') {
         s.push('/');
@@ -681,8 +717,9 @@ pub struct FoundryToml {
 pub struct FoundryProfile {
     /// `src = "src"` — the contracts root.
     pub src: Option<String>,
-    /// `libs = ["lib"]` — vendored dep dirs.
-    #[allow(dead_code)]
+    /// `libs = ["lib"]` — vendored dep dirs. Relative entries resolve
+    /// against the project root, so workspace configs may point outside
+    /// it (`["../../lib", "../shared"]`).
     pub libs: Vec<String>,
     /// `remappings = ["@oz/=lib/openzeppelin-contracts/contracts/", ...]`.
     pub remappings: Vec<String>,
@@ -884,5 +921,65 @@ remappings = ["@silo-core/=silo-core/contracts/"]
         );
         // Unknown profile name falls back to `[default]` (empty here).
         assert!(parsed.select("does-not-exist").src.is_none());
+    }
+
+    /// Workspace layout: `packages/<x>/foundry.toml` pointing its `libs`
+    /// at sibling directories outside the project root. Both must be
+    /// registered as lib dirs *and* allowed paths, and the user
+    /// remappings that reach into them must be absolutized — otherwise
+    /// solc rejects the resolved source with "File outside of allowed
+    /// directories".
+    #[test]
+    fn workspace_libs_outside_root_are_allowed_and_remapped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_root = tmp.path().join("repo");
+        let proj = repo_root.join("packages/perps");
+        let lib = repo_root.join("lib");
+        let shared = repo_root.join("packages/shared");
+
+        fs::create_dir_all(proj.join("src")).unwrap();
+        fs::create_dir_all(lib.join("openzeppelin-contracts/contracts")).unwrap();
+        fs::create_dir_all(shared.join("src")).unwrap();
+        fs::write(
+            proj.join("src/Thing.sol"),
+            "pragma solidity ^0.8.0;\ncontract Thing {}\n",
+        )
+        .unwrap();
+
+        let text = r#"
+[profile.default]
+src = "src"
+libs = ["../../lib", "../shared"]
+remappings = [
+    "@openzeppelin/contracts/=../../lib/openzeppelin-contracts/contracts/",
+    "@plether/shared/=../shared/src/",
+]
+"#;
+        let parsed: FoundryToml = toml::from_str(text).unwrap();
+        let paths = FoundryProject::build_project_paths(
+            &proj,
+            &FoundryOptions::default(),
+            &parsed,
+        )
+        .unwrap();
+
+        let canonical_lib = fs::canonicalize(&lib).unwrap();
+        let canonical_shared = fs::canonicalize(&shared).unwrap();
+        assert!(paths.libraries.contains(&canonical_lib));
+        assert!(paths.libraries.contains(&canonical_shared));
+        assert!(paths.allowed_paths.contains(&canonical_lib));
+        assert!(paths.allowed_paths.contains(&canonical_shared));
+
+        let oz = paths
+            .remappings
+            .iter()
+            .find(|r| r.name == "@openzeppelin/contracts/")
+            .expect("oz remapping must survive");
+        assert!(
+            Path::new(&oz.path).is_absolute(),
+            "remapping target must be absolute so solc can read it, got {}",
+            oz.path
+        );
+        assert!(oz.path.starts_with(&canonical_lib.to_string_lossy().to_string()));
     }
 }

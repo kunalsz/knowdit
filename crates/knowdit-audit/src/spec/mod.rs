@@ -808,7 +808,10 @@ impl SpecificationGenerator {
         options: &SpecGenOptions,
         request: SpecRegenRequest,
     ) -> Result<SpecRegenInMemory> {
-        let runtime = SpecRuntime::load(repo)
+        // Scope the runtime to the requested link: this path resolves exactly
+        // one identity, so loading the whole mapper output here (as `load`
+        // does for planning) was pure per-link waste.
+        let runtime = SpecRuntime::load_for_link(repo, request.extract_id, request.historical_id)
             .await?
             .ok_or_else(|| color_eyre::eyre::eyre!("project DB has no extracts/matches"))?;
         let link = runtime.resolve_link(
@@ -916,6 +919,84 @@ impl SpecRuntime {
         // materializing a candidate is O(log n) rather than a linear scan of a
         // historical's findings. Compact metadata; scales with matches, not
         // with cloned heavy payloads.
+        let mut runtime = Self {
+            project_index,
+            extracted_by_id,
+            historical_by_id,
+            match_strength_by_pair,
+            findings_index: BTreeMap::new(),
+        };
+        runtime.rebuild_findings_index();
+        Ok(Some(runtime))
+    }
+
+    /// Narrow counterpart to [`Self::load`] for [`Self::regen_one_link`],
+    /// which resolves exactly one `(extract, historical, finding)` identity.
+    ///
+    /// `load` reads the project's whole mapper output and re-renders every
+    /// historical and finding description. That is correct for planning (the
+    /// planner enumerates all candidates) but wasteful for a single regen, and
+    /// in a long streamloop — where regen runs per link — it was a major
+    /// contributor to the process being OOM-killed. This reads only the two
+    /// rows the requested identity needs.
+    async fn load_for_link(
+        repo: &RepoDatabase,
+        extract_id: i32,
+        historical_id: i32,
+    ) -> Result<Option<Self>> {
+        // `load` derives extract ids from the enumerating position of an
+        // id-ordered list; reuse that exact rule rather than assuming
+        // `project_semantic.id == position + 1` (ids need not be contiguous).
+        let extracted = repo
+            .load_project_semantics()
+            .await
+            .wrap_err("failed to load extracted project semantics")?;
+        let Some(extract) = extracted
+            .into_iter()
+            .enumerate()
+            .find(|(i, _)| (*i as i32) + 1 == extract_id)
+            .map(|(_, sem)| sem)
+        else {
+            return Ok(None);
+        };
+        let match_set = repo
+            .load_semantic_match_results_for_link(extract_id, historical_id)
+            .await
+            .wrap_err("failed to load Knowledge Mapper output for one link")?;
+        if match_set.matches.is_empty() || match_set.historicals.is_empty() {
+            return Ok(None);
+        }
+
+        let call_graph = repo
+            .load_call_graph()
+            .await
+            .wrap_err("failed to load project call graph")?;
+        let storage_graph = repo
+            .load_storage_graph()
+            .await
+            .wrap_err("failed to load project storage graph")?;
+        let inheritance_graph = repo
+            .load_inheritance_graph()
+            .await
+            .wrap_err("failed to load project inheritance graph")?;
+        let project_index = Arc::new(ProjectIndex::build(
+            call_graph,
+            storage_graph,
+            inheritance_graph,
+        ));
+
+        let SemanticMatchSet { historicals, matches } = match_set;
+        let historical_by_id: BTreeMap<i32, HistoricalSemanticRecord> = historicals
+            .into_iter()
+            .map(|record| (record.semantic.id, record))
+            .collect();
+        let match_strength_by_pair: BTreeMap<(i32, i32), MatchStrength> = matches
+            .into_iter()
+            .map(|m| ((m.extract_id, m.historical_id), m.strength))
+            .collect();
+        let extracted_by_id: BTreeMap<i32, ExtractedSemantic> =
+            std::iter::once((extract_id, extract)).collect();
+
         let mut runtime = Self {
             project_index,
             extracted_by_id,

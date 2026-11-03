@@ -8,5 +8,6 @@ mod findings;
 mod link;
 mod link_resume;
 mod move_lang;
+mod narrow_match_load;
 mod regenerate;
 mod repo;

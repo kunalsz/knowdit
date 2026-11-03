@@ -57,6 +57,64 @@ const DEFAULT_MAX_RENDERED_RAW_CHILDREN: usize = 5;
 const MIN_EVIDENCE_LEN_HIGH_MEDIUM: usize = 40;
 const MIN_EVIDENCE_LEN_LOW: usize = 15;
 
+/// Extra attempts around one mapper LLM call when the failure is a
+/// transport problem (connection refused, DNS, reset) rather than a
+/// response the server actually produced.
+const NETWORK_RETRY_ATTEMPTS: u32 = 6;
+/// First backoff delay; doubles each attempt, capped by the `min(4)`
+/// shift — roughly 2s, 4s, 8s, 16s, 32s.
+const NETWORK_RETRY_BASE_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+/// Backoff for gateway timeouts (524), which already consumed ~100s of
+/// proxy time before failing — 10s, 20s, 40s, 80s, 160s.
+const GATEWAY_TIMEOUT_BASE_DELAY: std::time::Duration = std::time::Duration::from_secs(10);
+/// Responses longer than this that yield no entries are dumped to disk —
+/// a 14-char `{"matches":[]}` needs no investigation, a 180K-char one does.
+const UNUSABLE_DUMP_MAX_CHARS: usize = 10_000;
+
+/// Substrings that mark a failure as worth replaying: the request never
+/// produced a verdict (refused/reset/DNS) or an edge proxy gave up on an
+/// over-long upstream call (524 and friends).
+const TRANSIENT_ERROR_NEEDLES: [&str; 14] = [
+    "connection refused",
+    "tcp connect error",
+    "error sending request",
+    "connection reset",
+    "timed out",
+    "dns error",
+    "broken pipe",
+    "error code: 524",
+    "error code 524",
+    "gateway time-out",
+    "502 bad gateway",
+    "503 service",
+    "504 gateway",
+    "upstream request timeout",
+];
+
+/// True when `err` looks like the request never reached the server, so
+/// replaying it after a delay is safe and likely to succeed.
+fn is_transient_transport_error(err: &llmy::agent::LLMYError) -> bool {
+    use llmy::agent::LLMYError;
+    let text = err.to_string().to_lowercase();
+    match err {
+        LLMYError::IO(_) => true,
+        // A billing cap, filtered response or bad tool call is
+        // deterministic — retrying only wastes budget.
+        LLMYError::Billing { .. }
+        | LLMYError::Filtered(_)
+        | LLMYError::IncorrectToolCall(..)
+        | LLMYError::OutputLength => false,
+        _ => {
+            // Gateways front these endpoints with a ~100s proxy timeout and
+            // return the failure as a bare `error code 524` (Cloudflare).
+            // That is the edge giving up, not a verdict on the request: the
+            // upstream completion may well be fine on a retry, and it is the
+            // dominant failure for prompts that ask for 1,200+ JSON entries.
+            TRANSIENT_ERROR_NEEDLES.iter().any(|n| text.contains(n))
+        }
+    }
+}
+
 /// Tunables for one Knowledge Mapper pass.
 #[derive(Debug, Clone)]
 pub struct MapperOptions {
@@ -432,7 +490,6 @@ async fn batch_match(
     let concurrency = options.concurrency.max(1);
     let max_rendered_raw_children = options.max_rendered_raw_children;
     let total_batches = historicals.len().div_ceil(batch_size);
-
     // Shared, read-only inputs every worker needs. Wrapped in `Arc`
     // once so each spawned worker holds a cheap clone — `JoinSet`
     // tasks must be `'static`, so nothing can be borrowed across the
@@ -559,9 +616,7 @@ async fn run_one_batch(
         secondary_categories,
     );
 
-    let response: MatchResponse = llm
-        .prompt_json_with_retry(system_prompt, &user_prompt, None, cache_key, None)
-        .await?;
+    let response: MatchResponse = prompt_match_response(llm, system_prompt, &user_prompt, cache_key, label).await?;
 
     let valid_historical_ids: BTreeSet<i32> = batch.iter().map(|c| c.canonical.id).collect();
 
@@ -593,16 +648,33 @@ async fn run_one_batch(
             );
             continue;
         }
-        let Some(strength) = MatchStrength::parse(&record.strength) else {
+        // `strength` / `evidence` are `Value` so one malformed field cannot
+        // fail the batch; require an actual string here.
+        let Some(strength_raw) = record.strength.as_str() else {
             tracing::warn!(
-                "{label}: dropping (extract={}, historical={}): unparseable strength '{}'",
+                "{label}: dropping (extract={}, historical={}): strength is not a string: {}",
                 record.extract_id,
                 record.historical_id,
                 record.strength
             );
             continue;
         };
-        let evidence = record.evidence.trim().to_string();
+        let Some(strength) = MatchStrength::parse(strength_raw) else {
+            tracing::warn!(
+                "{label}: dropping (extract={}, historical={}): unparseable strength '{}'",
+                record.extract_id,
+                record.historical_id,
+                strength_raw
+            );
+            continue;
+        };
+        let evidence = record
+            .evidence
+            .as_ref()
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
         let floor = match strength {
             MatchStrength::High | MatchStrength::Medium => MIN_EVIDENCE_LEN_HIGH_MEDIUM,
             MatchStrength::Low => MIN_EVIDENCE_LEN_LOW,
@@ -639,6 +711,390 @@ async fn run_one_batch(
     }
 
     Ok(matches)
+}
+
+/// Ask the mapper LLM for a [`MatchResponse`], repairing the two
+/// single-character JSON corruptions the model reliably produces on
+/// long responses.
+///
+/// Mapper replies run to ~160K characters (16 historicals × up to 87
+/// extracts forces an entry per pair), and at that length the model
+/// typos a key roughly one call in three — `"historical_id=45` for
+/// `"historical_id":45`, or `"historical_id:15` with the closing quote
+/// dropped. `llmy`'s typed retry only re-issues the whole call, so a
+/// single dropped character costs a full 30s+ regeneration and still
+/// fails if the next sample typos too. Since the corruption is
+/// mechanical and unambiguous, repair it locally first and only fall
+/// back to a retry when the response is genuinely unusable.
+async fn prompt_match_response(
+    llm: &LLM,
+    system_prompt: &str,
+    user_prompt: &str,
+    cache_key: Option<&str>,
+    label: &str,
+) -> Result<MatchResponse> {
+    // Fetch the reply as text rather than through `prompt_json_with_retry`:
+    // that path deserializes inside llmy, so a key typo is rejected before
+    // this code ever sees the characters it needs to repair, and each
+    // rejection costs a full regenerations of a ~160K-char response.
+    //
+    // One retry loop covers both transport failures (connection refused,
+    // reset, DNS) and degenerate responses (empty array, no content):
+    // llmy retries transport errors without backoff, so its attempts are
+    // all spent before a brief network blip clears, and a stressed
+    // provider occasionally returns a valid-but-empty completion that
+    // yields no entries at all. Both are worth one more cheap try — the
+    // prompt is ~97% prompt-cache hits — before giving up on the batch.
+    let mut last_err: Option<String> = None;
+    for attempt in 0..NETWORK_RETRY_ATTEMPTS {
+        if attempt > 0 {
+            // A gateway timeout already burned its full proxy window, so
+            // back off further than for an instantly-refused connection.
+            let base = if last_err
+                .as_deref()
+                .is_some_and(|e| e.to_lowercase().contains("524"))
+            {
+                GATEWAY_TIMEOUT_BASE_DELAY
+            } else {
+                NETWORK_RETRY_BASE_DELAY
+            };
+            let delay = base * (1 << (attempt - 1).min(4));
+            tracing::warn!(
+                "{label}: mapper attempt {attempt}/{NETWORK_RETRY_ATTEMPTS} unusable \
+                 ({}); retrying in {delay:?}",
+                last_err.as_deref().unwrap_or("unknown")
+            );
+            tokio::time::sleep(delay).await;
+        }
+
+        let resp = match llm
+            .prompt_once_with_retry(system_prompt, user_prompt, None, cache_key, None)
+            .await
+        {
+            Ok(r) => r,
+            Err(err) => {
+                if !is_transient_transport_error(&err) {
+                    return Err(err.into());
+                }
+                last_err = Some(err.to_string());
+                continue;
+            }
+        };
+
+        let Some(body) = resp
+            .choices
+            .first()
+            .and_then(|c| c.inner.message.content.as_deref())
+            .map(|s| s.to_string())
+        else {
+            last_err = Some("response had no content".to_string());
+            continue;
+        };
+
+        // The model sometimes wraps the object in a ```json fence even
+        // though the prompt asks for bare JSON.
+        let body = llmy::client::filters::strip_markdown_fence(&body)
+            .unwrap_or_else(|| body.clone());
+        let entries = salvage_match_entries(&repair_match_json(&body));
+
+        if entries.is_empty() {
+            // `{"matches":[]}` is a legitimate reply shape (a stressed
+            // provider can shorten a completion to nothing), so it is a
+            // candidate for one retry — but if the model insists on
+            // returning nothing, the right outcome is an empty match set
+            // plus a loud warning, not aborting a multi-hour pass.
+            last_err = Some(format!("response yielded no match entries ({} chars)", body.len()));
+            if body.len() > UNUSABLE_DUMP_MAX_CHARS {
+                let dump = std::env::temp_dir().join(format!(
+                    "knowdit-mapper-unparseable-{}.txt",
+                    std::process::id()
+                ));
+                let _ = std::fs::write(&dump, &body);
+                tracing::warn!(
+                    "{label}: large response yielded no entries; body written to {}",
+                    dump.display()
+                );
+            }
+            continue;
+        }
+
+        let mut matches = Vec::with_capacity(entries.len());
+        let mut skipped = 0usize;
+        for entry in entries {
+            match serde_json::from_value::<MatchEntry>(entry) {
+                Ok(entry) => matches.push(entry),
+                Err(_) => skipped += 1,
+            }
+        }
+        if skipped > 0 {
+            tracing::warn!(
+                "{label}: skipped {skipped} malformed match entr{} of {} (missing or ill-typed field)",
+                if skipped == 1 { "y" } else { "ies" },
+                matches.len() + skipped
+            );
+        }
+        return Ok(MatchResponse { matches });
+    }
+
+    // Exhausted. An empty-but-valid response is not a failure — it is a
+    // batch with nothing to say, which downstream "omitted pair" logging
+    // already surfaces. Only a persistent transport error aborts.
+    if let Some(err) = &last_err
+        && err.contains("no match entries")
+    {
+        tracing::error!(
+            "{label}: model returned no match entries on {NETWORK_RETRY_ATTEMPTS} \
+             consecutive attempts; continuing with an empty match set"
+        );
+        return Ok(MatchResponse { matches: Vec::new() });
+    }
+    Err(color_eyre::eyre::eyre!(
+        "mapper request failed after {NETWORK_RETRY_ATTEMPTS} attempts: {}",
+        last_err.unwrap_or_else(|| "unknown error".to_string())
+    ))
+}
+
+/// Pull every well-formed object out of the `matches` array, ignoring
+/// anything that is not a JSON object.
+///
+/// The model reliably produces *some* valid entries even when it mangles
+/// one, so parsing entry-by-entry means a single bad record costs one
+/// pair rather than the whole batch. Falls back to parsing the whole
+/// document when the array itself cannot be scanned.
+fn salvage_match_entries(body: &str) -> Vec<serde_json::Value> {
+    let array = find_matches_array(body);
+    let Some(array) = array else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut start = None;
+
+    for (idx, ch) in array.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' => {
+                if depth == 0 {
+                    start = Some(idx);
+                }
+                depth += 1;
+            }
+            '}' => {
+                if depth == 0 {
+                    continue;
+                }
+                depth -= 1;
+                if depth == 0
+                    && let Some(s) = start.take()
+                    && let Ok(value) = serde_json::from_str::<serde_json::Value>(&array[s..=idx])
+                {
+                    out.push(value);
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The contents between the `[` that opens the `matches` array and the
+/// last `]` in the body.
+///
+/// A response cut off by the completion cap never closes the array, so
+/// the upper bound falls back to the end of the body — the entries that
+/// did arrive are still worth keeping.
+fn find_matches_array(body: &str) -> Option<&str> {
+    let key = body.find("\"matches\"")?;
+    let after_key = &body[key..];
+    let open = key + after_key.find('[')? + 1;
+    let close = body.rfind(']').unwrap_or(body.len());
+    (close > open).then(|| &body[open..close])
+}
+
+/// Repair the key corruptions the mapper model emits in long JSON
+/// arrays, without touching text inside string values:
+///
+/// * `"historical_id=45` — `=` where `:` belongs, with the key's
+///   closing quote dropped.
+/// * `"historical_id:15` — closing quote dropped before the `:`.
+/// * `{extract_id=3` — opening quote dropped as well.
+/// * `{"historical_id"=56` — key quoted correctly but `=` used.
+/// * a garbled fragment such as `{"extract_id":2":0}` — an entry the
+///   model aborted mid-write. Such a fragment carries no usable fields,
+///   so it is dropped rather than repaired; the surrounding entries are
+///   intact and the pair simply shows up as "missing" downstream.
+///
+/// Only the four fields of a match entry are considered, and only in
+/// key position — a value like `"evidence":"id=3"` is left alone
+/// because the scan never treats text after an opening quote as a key.
+fn repair_match_json(body: &str) -> String {
+    const KEYS: [&str; 4] = ["extract_id", "historical_id", "strength", "evidence"];
+
+    let bytes = body.as_bytes();
+    let mut out = String::with_capacity(body.len());
+    let mut i = 0;
+    let mut in_string = false;
+
+    while i < bytes.len() {
+        let c = bytes[i];
+
+        if in_string {
+            // Inside a string: copy verbatim until the closing quote.
+            if c == b'\\' && i + 1 < bytes.len() {
+                out.push_str(&body[i..i + 2]);
+                i += 2;
+                continue;
+            }
+            if c == b'"' {
+                in_string = false;
+            }
+            out.push(c as char);
+            i += 1;
+            continue;
+        }
+
+        // Outside a string. A key starts at `"` or, when the model has
+        // dropped the opening quote, at a bare `{`/`,` followed by a key.
+        let starts_bare = c == b'{' || c == b',';
+        let key_start =
+            (c == b'"' || (starts_bare && i + 1 < bytes.len())).then_some(i + 1);
+
+        if let Some(start) = key_start
+            && let Some(kw) = KEYS
+                .iter()
+                .find(|kw| body[start..].starts_with(*kw))
+        {
+            let after = start + kw.len();
+            let rest = &body[after..];
+            // Expect an optional `"` then `:` or `=`.
+            let (consumed, had_quote, sep_ok) = match rest.strip_prefix('"') {
+                Some(r) => (
+                    1,
+                    true,
+                    r.trim_start().starts_with(':') || r.trim_start().starts_with('='),
+                ),
+                None => (
+                    0,
+                    false,
+                    rest.trim_start().starts_with(':') || rest.trim_start().starts_with('='),
+                ),
+            };
+            if sep_ok {
+                // When the opening quote was dropped the scan started just
+                // past a bare `{`/`,`; that delimiter still has to be
+                // written out or the object never opens.
+                if !had_quote && starts_bare {
+                    out.push(c as char);
+                }
+                out.push_str(&format!("\"{kw}\":"));
+                let mut j = after + consumed;
+                // Skip the original separator (and its whitespace).
+                while j < bytes.len() && (bytes[j] as char).is_whitespace() {
+                    j += 1;
+                }
+                if j < bytes.len() && (bytes[j] == b':' || bytes[j] == b'=') {
+                    j += 1;
+                }
+                while j < bytes.len() && (bytes[j] as char).is_whitespace() {
+                    j += 1;
+                }
+                // `"extract_id="36"` — the model put the dropped quote on
+                // the *value* instead of the key, turning an integer into a
+                // string. Strip it so the numeric fields still deserialize.
+                if j < bytes.len()
+                    && bytes[j] == b'"'
+                    && matches!(*kw, "extract_id" | "historical_id")
+                {
+                    let mut k = j + 1;
+                    while k < bytes.len() && (bytes[k] as char).is_ascii_digit() {
+                        k += 1;
+                    }
+                    if k > j + 1 && k < bytes.len() && bytes[k] == b'"' {
+                        out.push_str(&body[j + 1..k]);
+                        i = k + 1;
+                        continue;
+                    }
+                }
+                i = j;
+                continue;
+            }
+        }
+
+        if c == b'"' {
+            in_string = true;
+        }
+        out.push(c as char);
+        i += 1;
+    }
+
+    // Neutralise stray quotes so the bracket scan in
+    // `salvage_match_entries` sees the real structure, and so an entry
+    // like `{"extract_id":2":0}` is rejected on its own instead of
+    // swallowing the rest of the array as one long string.
+    neutralise_stray_quotes(&out)
+}
+
+/// Replace stray quotes that sit between a key's `:` and a numeric
+/// value — `{"extract_id":2":0}` becomes `{"extract_id":2:0}` — so the
+/// bracket scanner in [`salvage_match_entries`] is not fooled into
+/// treating the rest of the array as one long string. The entry is still
+/// rejected afterwards; this only keeps the scan honest.
+fn neutralise_stray_quotes(body: &str) -> String {
+    const KEYS: [&str; 4] = ["extract_id", "historical_id", "strength", "evidence"];
+    let mut out = String::with_capacity(body.len());
+    let mut rest = body;
+
+    while let Some(pos) = rest.find('"') {
+        out.push_str(&rest[..pos]);
+        let after = &rest[pos + 1..];
+        let Some(kw) = KEYS.iter().find(|k| after.starts_with(*k)) else {
+            out.push('"');
+            rest = after;
+            continue;
+        };
+        let after_key = &after[kw.len()..];
+        let Some(after_colon) = after_key.strip_prefix("\":") else {
+            out.push('"');
+            rest = after;
+            continue;
+        };
+        let digits: String = after_colon.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if digits.is_empty() {
+            out.push('"');
+            rest = after;
+            continue;
+        }
+        let tail = &after_colon[digits.len()..];
+        if let Some(tail) = tail.strip_prefix('"') {
+            // `"key":"<digits>"` is a legitimate string value for
+            // `strength`/`evidence`, but never for the id fields.
+            if !matches!(*kw, "extract_id" | "historical_id") {
+                out.push('"');
+                rest = after;
+                continue;
+            }
+            out.push_str(&format!("\"{kw}\":{digits}"));
+            rest = tail;
+        } else {
+            out.push('"');
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Drop duplicate `(extract_id, historical_id)` rows; on collision
@@ -885,6 +1341,234 @@ struct MatchResponse {
 struct MatchEntry {
     extract_id: i32,
     historical_id: i32,
-    strength: String,
-    evidence: String,
+    /// The model occasionally emits `null`, a number, or an object here
+    /// instead of the requested string. Deserializing into `Value` keeps a
+    /// single odd field from failing the whole batch; the entry is then
+    /// rejected by the strength/evidence checks further down, which is
+    /// exactly the handling a bad value should get.
+    strength: serde_json::Value,
+    #[serde(default)]
+    evidence: Option<serde_json::Value>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every case below is a verbatim excerpt of a real mapper response
+    /// captured with `--llm-debug` on the plether-perps project: the model
+    /// corrupts one key per response at ~160K chars.
+    #[test]
+    fn repairs_key_typos_model_emits_in_long_responses() {
+        let cases = [
+            // `=` separator with the closing quote dropped.
+            (r#"{"matches":[{"extract_id":3,"historical_id=24,"strength":"Low","evidence":"x"}]}"#,
+             r#"{"matches":[{"extract_id":3,"historical_id":24,"strength":"Low","evidence":"x"}]}"#),
+            // `=` separator with both quotes dropped.
+            (r#"{"matches":[{"extract_id=3,"historical_id":24,"strength":"Low","evidence":"x"}]}"#,
+             r#"{"matches":[{"extract_id":3,"historical_id":24,"strength":"Low","evidence":"x"}]}"#),
+            // Closing quote dropped before the colon.
+            (r#"{"matches":[{"extract_id":27,"historical_id:15,"strength":"Low","evidence":"x"}]}"#,
+             r#"{"matches":[{"extract_id":27,"historical_id":15,"strength":"Low","evidence":"x"}]}"#),
+            // Opening quote dropped on the first key of an object.
+            (r#"{"matches":[{extract_id=3,"historical_id":24,"strength":"Low","evidence":"x"}]}"#,
+             r#"{"matches":[{"extract_id":3,"historical_id":24,"strength":"Low","evidence":"x"}]}"#),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(repair_match_json(input), expected, "input: {input}");
+        }
+    }
+
+    /// A `=` inside a value must survive: only key positions are rewritten.
+    #[test]
+    fn repair_leaves_string_values_alone() {
+        let input = r#"{"matches":[{"extract_id":1,"historical_id":2,"strength":"Low","evidence":"mint id=3 and extract_id=4 differ"}]}"#;
+        assert_eq!(repair_match_json(input), input);
+        let parsed: MatchResponse = serde_json::from_str(&repair_match_json(input)).unwrap();
+        assert_eq!(
+            parsed.matches[0].evidence.as_ref().and_then(|v| v.as_str()),
+            Some("mint id=3 and extract_id=4 differ")
+        );
+    }
+
+    #[test]
+    fn repaired_response_deserializes_into_match_entries() {
+        let input = r#"{"matches":[{"extract_id":1,"historical_id=2,"strength":"Low","evidence":"a"},{"extract_id":1,"historical_id:3,"strength":"High","evidence":"b"}]}"#;
+        let parsed: MatchResponse = serde_json::from_str(&repair_match_json(input)).unwrap();
+        assert_eq!(parsed.matches.len(), 2);
+        assert_eq!(parsed.matches[1].historical_id, 3);
+        assert_eq!(parsed.matches[1].strength.as_str(), Some("High"));
+    }
+
+    /// Valid JSON must pass through byte-identical.
+    #[test]
+    fn repair_is_identity_on_valid_json() {
+        let input = r#"{"matches":[{"extract_id":1,"historical_id":2,"strength":"Low","evidence":"e"}]}"#;
+        assert_eq!(repair_match_json(input), input);
+    }
+}
+
+#[cfg(test)]
+mod real_capture_tests {
+    use super::*;
+
+    /// (label, response body as the model emitted it, entries expected back)
+    const CAPTURES: [(&str, &str, usize); 10] = [
+        ("equals_with_value_quote", r##"{"matches":[{"extract_id="36","historical_id":23,"strength":"Low","evidence":"vault price manipulation; unrelated"}]}"##, 1),
+        ("equals_no_quotes", r##"{"matches":[{extract_id=3,"historical_id":24,"strength":"Medium","evidence":"both maintain segregated collateral accounting"}]}"##, 1),
+        ("equals_closing_dropped", r##"{"matches":[{"extract_id":4,"historical_id=15,"strength":"Low","evidence":"unbounded mint; unrelated"}]}"##, 1),
+        ("colon_closing_dropped", r##"{"matches":[{"extract_id":27,"historical_id:15,"strength":"Low","evidence":"unbounded mint; project seed floor prevents drawdown"}]}"##, 1),
+        ("garbled_fragment_between", r##"{"matches":[{"extract_id":2,"historical_id":3,"strength":"Low","evidence":"a"},{"extract_id=2":0}, {"extract_id":2,"historical_id":6,"strength":"Low","evidence":"b"}]}"##, 2),
+        ("fenced", "```json\n{\"matches\":[{\"extract_id\":1,\"historical_id=45,\"strength\":\"Low\",\"evidence\":\"reward hack\"}]}\n```", 1),
+        ("clean", r#"{"matches":[{"extract_id":1,"historical_id":45,"strength":"Low","evidence":"no overlap"}]}"#, 1),
+        // `"evidence":null` is valid JSON but was not a String. This aborted
+        // the whole mapping pass with "invalid type: null, expected a string"
+        // until the entry fields became `Value`.
+        ("null_evidence", r#"{"matches":[{"extract_id":1,"historical_id":2,"strength":"Low","evidence":null}]}"#, 1),
+        // A non-string `strength` must not fail the batch either.
+        ("numeric_strength", r#"{"matches":[{"extract_id":1,"historical_id":2,"strength":3,"evidence":"some reason here"}]}"#, 1),
+        // `{"matches":[]}` must be a warning-and-continue, not an abort —
+        // observed live batch 60/457 when the provider was degraded.
+        ("empty_array", r#"{"matches":[]}"#, 0),
+    ];
+
+    #[test]
+    fn every_captured_corruption_parses_with_all_entries_intact() {
+        for (label, raw, expected) in CAPTURES {
+            let body = llmy::client::filters::strip_markdown_fence(raw)
+                .unwrap_or_else(|| raw.to_string());
+            let repaired = repair_match_json(&body);
+            let entries = salvage_match_entries(&repaired);
+            assert_eq!(entries.len(), expected, "{label}: wrong entry count salvaged");
+            let parsed: MatchResponse = MatchResponse {
+                matches: entries
+                    .into_iter()
+                    .filter_map(|e| serde_json::from_value::<MatchEntry>(e).ok())
+                    .collect(),
+            };
+            assert_eq!(parsed.matches.len(), expected, "{label}");
+            if label == "null_evidence" {
+                assert!(parsed.matches[0].evidence.is_none(), "null must stay null");
+                continue;
+            }
+            if label == "numeric_strength" {
+                assert_eq!(parsed.matches[0].strength.as_str(), None);
+                continue;
+            }
+            if label == "empty_array" {
+                assert!(parsed.matches.is_empty(), "empty array must stay empty");
+                continue;
+            }
+            for m in &parsed.matches {
+                assert!(m.extract_id > 0, "{label}: lost extract_id");
+                assert!(m.historical_id > 0, "{label}: lost historical_id");
+                assert!(
+                    m.evidence.as_ref().and_then(|v| v.as_str()).is_some_and(|e| !e.is_empty()),
+                    "{label}: lost evidence"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod truncation_tests {
+    use super::*;
+
+    /// A response cut off by the completion cap never closes its array.
+    /// Before this was handled, one truncated batch produced zero entries
+    /// and aborted the run; the complete entries that did arrive should
+    /// survive.
+    #[test]
+    fn unterminated_array_still_yields_complete_entries() {
+        let body = r#"{"matches":[
+            {"extract_id":1,"historical_id":2,"strength":"Low","evidence":"first"},
+            {"extract_id":1,"historical_id":3,"strength":"Low","evidence":"second"},
+            {"extract_id":1,"hist"#;
+        let repaired = repair_match_json(body);
+        let entries = salvage_match_entries(&repaired);
+        assert_eq!(entries.len(), 2, "complete entries before the cut must survive");
+        assert_eq!(entries[1]["historical_id"], 3);
+    }
+
+    /// The same body with its closing bracket must parse identically.
+    #[test]
+    fn terminated_array_is_unaffected() {
+        let body = r#"{"matches":[{"extract_id":1,"historical_id":2,"strength":"Low","evidence":"a"},{"extract_id":1,"historical_id":3,"strength":"Low","evidence":"b"}]}"#;
+        let entries = salvage_match_entries(&repair_match_json(body));
+        assert_eq!(entries.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod transient_error_tests {
+    use super::*;
+    use llmy::agent::LLMYError;
+
+    #[test]
+    fn connection_refused_is_retried() {
+        // The exact failure this guards: `tcp connect error` / `os error 111`.
+        let err = LLMYError::IO(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "Connection refused (os error 111)",
+        ));
+        assert!(is_transient_transport_error(&err));
+    }
+
+    #[test]
+    fn deterministic_errors_are_not_retried() {
+        assert!(!is_transient_transport_error(&LLMYError::OutputLength));
+        assert!(!is_transient_transport_error(&LLMYError::Filtered(
+            "content policy".into()
+        )));
+    }
+}
+
+#[cfg(test)]
+mod gateway_timeout_tests {
+    use super::*;
+    use llmy::agent::LLMYError;
+
+    /// Cloudflare's proxy timeout surfaces as a bare `error code: 524`.
+    /// Before this was classified, it fell through as a hard failure and
+    /// killed the pass on the first large batch.
+    /// The substring match, exercised on the exact text llmy renders for
+    /// a gateway timeout: `openai error: error code: 524`.
+    #[test]
+    fn gateway_timeout_text_is_matched() {
+        for text in [
+            "openai error: error code: 524",
+            "error code 524",
+            "504 gateway time-out",
+            "502 bad gateway",
+        ] {
+            let lower = text.to_lowercase();
+            assert!(
+                TRANSIENT_ERROR_NEEDLES.iter().any(|n| lower.contains(n)),
+                "{text} must classify as transient"
+            );
+        }
+    }
+
+    /// Model-not-found and billing are verdicts, never worth retrying.
+    #[test]
+    fn non_retryable_text_is_rejected() {
+        for text in [
+            "openai error: not_found_error: Model 'x' is not supported",
+            "billing error: scope Some(\"mapper\") reached cap",
+            "response filtered",
+        ] {
+            let lower = text.to_lowercase();
+            assert!(
+                !TRANSIENT_ERROR_NEEDLES.iter().any(|n| lower.contains(n)),
+                "{text} must not be retried"
+            );
+        }
+    }
+
+    #[test]
+    fn output_length_limit_is_not_retried() {
+        // Must not be confused with a proxy timeout.
+        assert!(!is_transient_transport_error(&LLMYError::OutputLength));
+    }
 }
