@@ -194,4 +194,17 @@ mod added_model_tests {
         // The canonical id keeps its own (smaller) window.
         assert_eq!(canonical.info().0, 262_144);
     }
+
+    /// `minimaxai/minimax-m3.1-flash` is in the vendored registry, so it gets
+    /// its real ~1M window and non-zero pricing instead of the fallback.
+    #[test]
+    fn minimax_m3_1_flash_resolves_in_the_registry() {
+        use std::str::FromStr;
+
+        let model = OpenAIModel::from_str("minimaxai/minimax-m3.1-flash")
+            .expect("minimax id must parse");
+        assert_eq!(model.info().0, 1_000_000, "registry window must win");
+        assert!(!model.pricing().input.is_zero(), "needs real input pricing");
+        assert!(!model.pricing().output.is_zero(), "needs real output pricing");
+    }
 }

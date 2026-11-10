@@ -32,6 +32,13 @@ static PREFLIGHT_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// Last `max_bytes` of `s`, snapped to a UTF-8 boundary. Used for
 /// embedding forge output tails in error messages without risking
 /// a `str` slice panic on multi-byte boundaries.
+/// Lossy UTF-8 conversion that reuses the buffer when it is already valid
+/// (the common case) instead of allocating and copying a second copy.
+fn bytes_into_string(bytes: Vec<u8>) -> String {
+    String::from_utf8(bytes)
+        .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
+}
+
 fn tail_utf8(s: &str, max_bytes: usize) -> &str {
     if s.len() <= max_bytes {
         return s;
@@ -493,8 +500,11 @@ impl ForgeRunner {
         match outcome {
             Ok(Ok(out)) => Ok(ForgeOutput {
                 exit_code: out.status.code().unwrap_or(-2),
-                stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+                // Take ownership of the bytes instead of copying them: with
+                // `-vvvvvv` a single test run's stdout can be hundreds of MB,
+                // and a lossy copy would briefly hold two of them.
+                stdout: bytes_into_string(out.stdout),
+                stderr: bytes_into_string(out.stderr),
                 duration_ms,
                 timed_out: false,
             }),

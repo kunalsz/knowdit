@@ -162,6 +162,14 @@ pub struct StreamloopArgs {
     #[arg(long = "usage-max-link-rows", default_value_t = 10000)]
     pub usage_max_link_rows: usize,
 
+    /// Log a `[mem]` sampler line every N seconds: RSS, peak RSS, and how many
+    /// links are done / active. `0` disables. A multi-hour streamloop can grow
+    /// slowly enough to be OOM-killed hours in; this makes the growth visible
+    /// against the link phase that is advancing, so it can be attributed
+    /// instead of guessed at. Grep the log for `[mem]`.
+    #[arg(long = "memory-report-secs", default_value_t = 0)]
+    pub memory_report_secs: u64,
+
     /// After the link pipeline finishes, run the `review-findings` report
     /// phase (review → dedup-merge → write → export `audit_report.md`) into
     /// the same output folder. Off by default; run it standalone via
@@ -454,6 +462,7 @@ impl StreamloopArgs {
             report_cfg,
             usage_max_link_rows: self.usage_max_link_rows,
             novelty_gate: self.gen_specs.gen_specs_novelty_gate,
+            memory_report_secs: self.memory_report_secs,
         }
         .run()
         .await?;
@@ -1332,6 +1341,13 @@ struct LinkScheduler<B: HarnessBackend + Clone + 'static> {
     /// (serial — this runs in the scheduler's single-threaded join loop, so no
     /// lock is needed). Returned to the caller to finalize.
     report: Option<review_findings::ReportContext>,
+    /// Counters the memory sampler annotates its ticks with.
+    memory: Arc<super::memplot::MemoryCounters>,
+    /// Log an `[mem]` line every N seconds. `0` disables the sampler.
+    memory_report_secs: u64,
+    /// Human-readable description of what the run is doing right now, shown on
+    /// each `[mem]` tick so growth can be attributed to a phase.
+    phase: Arc<std::sync::Mutex<String>>,
 }
 
 impl<B: HarnessBackend + Clone + 'static> LinkScheduler<B> {
@@ -1364,6 +1380,10 @@ impl<B: HarnessBackend + Clone + 'static> LinkScheduler<B> {
                     tasks.len() + 1,
                     self.concurrency,
                 );
+                if let Ok(mut slot) = self.phase.lock() {
+                    *slot = format!("link {ordinal:04}/{total} (active={})", tasks.len());
+                }
+                self.memory.links_active.store(tasks.len() as u64, std::sync::atomic::Ordering::Relaxed);
                 tasks.spawn(async move { ctx.run_link(work).await });
                 launched += 1;
             }
@@ -1372,6 +1392,8 @@ impl<B: HarnessBackend + Clone + 'static> LinkScheduler<B> {
             };
             match joined {
                 Ok(Ok(tally)) => {
+                    self.memory.links_done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    self.memory.steps.fetch_add(tally.specs as u64, std::sync::atomic::Ordering::Relaxed);
                     stats.processed_links += 1;
                     stats.built_specs += tally.specs;
                     if tally.abandoned {
@@ -1459,6 +1481,9 @@ pub(crate) struct LinkPipelineInputs<B: HarnessBackend + Clone + Send + Sync + '
     /// Opt-in novelty gate (see `--gen-specs-novelty-gate`): judge committed
     /// specs against the pair's already-validated specs before the drain.
     pub(crate) novelty_gate: bool,
+    /// Log an `[mem]` sampler line every N seconds (`0` disables). Diagnostics
+    /// for the long-run memory growth that OOM-killed multi-hour streamloops.
+    pub(crate) memory_report_secs: u64,
 }
 
 impl<B: HarnessBackend + Clone + Send + Sync + 'static> LinkPipelineInputs<B> {
@@ -1486,6 +1511,7 @@ impl<B: HarnessBackend + Clone + Send + Sync + 'static> LinkPipelineInputs<B> {
             report_cfg,
             usage_max_link_rows,
             novelty_gate,
+            memory_report_secs,
         } = self;
         let concurrency = concurrency.max(1);
         let novelty_cache_root = gen_options.cache_key.clone();
@@ -1546,11 +1572,34 @@ impl<B: HarnessBackend + Clone + Send + Sync + 'static> LinkPipelineInputs<B> {
             novelty_gate,
             novelty_cache_root,
         });
+        // Start the memory sampler before the scheduler so the first ticks
+        // cover the startup allocations too.
+        let memory_counters = Arc::new(super::memplot::MemoryCounters::default());
+        let phase = Arc::new(std::sync::Mutex::new(String::from("starting")));
+        if memory_report_secs > 0 {
+            let counters = memory_counters.clone();
+            let phase = phase.clone();
+            tracing::info!(
+                "[mem] sampler enabled, one line every {memory_report_secs}s (grep '\\[mem\\]')"
+            );
+            let handle = super::memplot::spawn_sampler(
+                std::time::Duration::from_secs(memory_report_secs),
+                counters,
+                phase.clone(),
+            );
+            // Detach: the sampler stops when the process exits. Storing the
+            // handle would force the scheduler to own it across `.await`
+            // points for no benefit.
+            std::mem::forget(handle);
+        }
         let scheduler = LinkScheduler {
             ctx,
             concurrency,
             max_link_rows: usage_max_link_rows,
             report,
+            memory: memory_counters.clone(),
+            memory_report_secs,
+            phase: phase.clone(),
         };
         let (stats, report) = scheduler.run(stream).await?;
         if let Some(mut report) = report {

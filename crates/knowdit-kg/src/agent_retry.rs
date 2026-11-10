@@ -74,9 +74,72 @@ pub const EMPTY_CHOICE_NUDGE: &str = "The provider returned an empty response fo
      turn, so NOTHING from it was executed or recorded. This is a transient provider-side error. \
      Re-emit the exact same next action now.";
 
+/// User-role nudge appended after a transport failure (gateway 5xx, refused
+/// connection, timeout).
+///
+/// The request never reached the model, so there is nothing to shorten and
+/// nothing was executed — the only correct instruction is to re-issue the same
+/// action. Saying "be more concise" here would push the model to change a
+/// response it never got to make.
+pub const TRANSPORT_NUDGE: &str = "The previous request failed at the network layer (gateway \
+     timeout / 5xx) before any response was produced, so NOTHING from it was executed or \
+     recorded. This is a transient provider-side error, not a problem with your request. \
+     Re-emit the exact same next action now.";
+
 /// Whether an error is a provider-side output truncation.
 pub fn is_output_length(err: &LLMYError) -> bool {
     matches!(err, LLMYError::OutputLength)
+}
+
+/// Substrings that mark a provider-side transport failure: the request never
+/// produced a verdict (connection refused/reset/DNS), or an edge proxy gave up
+/// on an over-long upstream call (502/503/504/524).
+///
+/// These are *not* verdicts on the request. A gateway in front of the model
+/// returns them routinely — one observed run logged 128 `502 Bad Gateway`
+/// responses, 127 of which were absorbed, while the 128th terminated a
+/// multi-hour pipeline because it landed inside an agent step and
+/// [`is_retryable`] rejected it.
+const TRANSIENT_TRANSPORT_NEEDLES: [&str; 16] = [
+    "connection refused",
+    "tcp connect error",
+    "error sending request",
+    "connection reset",
+    "connection closed",
+    "timed out",
+    "dns error",
+    "broken pipe",
+    "error code: 502",
+    "error code 502",
+    "error code: 503",
+    "error code 503",
+    "error code: 504",
+    "error code 504",
+    "error code: 524",
+    "error code 524",
+];
+
+/// Whether `err` is a transient transport failure (gateway 5xx, refused
+/// connection, timeout) rather than a verdict about the request.
+///
+/// Matched on the rendered error because llmy surfaces provider status codes as
+/// `LLMYError::OpenAI(OpenAIError::ApiError(..))` whose `message` carries the
+/// code as text — there is no typed status field to match on.
+pub fn is_transient_transport(err: &LLMYError) -> bool {
+    match err {
+        // A billing cap, filtered response or bad tool call is deterministic:
+        // retrying only burns budget.
+        LLMYError::Billing { .. }
+        | LLMYError::Filtered(_)
+        | LLMYError::IncorrectToolCall(..) => false,
+        LLMYError::IO(_) => true,
+        _ => {
+            let text = err.to_string().to_lowercase();
+            TRANSIENT_TRANSPORT_NEEDLES
+                .iter()
+                .any(|n| text.contains(n))
+        }
+    }
 }
 
 /// Whether an error is a transient provider-side condition that leaves the
@@ -91,19 +154,44 @@ pub fn is_output_length(err: &LLMYError) -> bool {
 /// as fatal throws away the whole unit of work, which for `gen-specs` is one
 /// link's entire agent run.
 ///
+/// Transient transport failures ([`is_transient_transport`]) qualify too: the
+/// step failed before the model produced anything, so the context is untouched
+/// and the same step can be re-issued. Without this, a single gateway 502 ends
+/// a run that had already survived a hundred of them.
+///
 /// Callers still use [`is_output_length`] to tell "output cap exhausted" apart
 /// from other failures when they abandon gracefully.
 pub fn is_retryable(err: &LLMYError) -> bool {
     matches!(err, LLMYError::OutputLength | LLMYError::EmptyChoice)
+        || is_transient_transport(err)
 }
 
-/// The nudge to append for a given retryable error: truncation and empty-choice
-/// failures need different wording, because only one of them had a response.
+/// The nudge to append for a given retryable error. Truncation, empty-choice
+/// and transport failures need different wording: only a truncated response
+/// was actually produced, and a transport failure never reached the model, so
+/// telling it to "be shorter" would be wrong advice.
 fn retry_nudge(err: &LLMYError) -> String {
     match err {
         LLMYError::EmptyChoice => EMPTY_CHOICE_NUDGE.to_string(),
+        LLMYError::OutputLength => TRUNCATION_NUDGE.to_string(),
+        _ if is_transient_transport(err) => TRANSPORT_NUDGE.to_string(),
         _ => TRUNCATION_NUDGE.to_string(),
     }
+}
+
+/// Backoff before retrying a transport failure.
+///
+/// A gateway 5xx usually means the upstream is briefly unavailable or the proxy
+/// timed out; retrying instantly just hits the same wall. Truncation and
+/// empty-choice retries stay immediate — those are sampling problems where an
+/// instant re-roll is the right move, not a capacity problem.
+fn transport_backoff(consecutive: usize) -> Option<std::time::Duration> {
+    if consecutive == 0 {
+        return None;
+    }
+    // 2s, 4s, 8s, 16s, then hold at 16s.
+    let secs = 2u64.saturating_mul(1u64 << (consecutive.saturating_sub(1)).min(3));
+    Some(std::time::Duration::from_secs(secs))
 }
 
 /// Reason to record when a retryable error's budget is exhausted and the
@@ -118,9 +206,18 @@ pub fn exhaustion_reason(err: &LLMYError, consecutive: usize) -> String {
         LLMYError::EmptyChoice => format!(
             "provider returned an empty choice {consecutive} times in a row"
         ),
-        _ => format!(
+        LLMYError::OutputLength => format!(
             "response truncated by the provider output cap {consecutive} times in a row"
         ),
+        // A transport failure says nothing about the output cap — reporting it
+        // as truncation would send the operator to `--llm-max-completion-tokens`
+        // when the provider gateway is actually down.
+        _ if is_transient_transport(err) => format!(
+            "provider gateway unreachable {consecutive} times in a row (repeated 5xx / \
+             connection failure); the request never reached the model. Check provider status \
+             before retrying the run"
+        ),
+        _ => format!("provider error {consecutive} times in a row"),
     }
 }
 
@@ -198,17 +295,32 @@ impl TruncationRetry {
                     if let Err(consecutive) = self.record_failure() {
                         tracing::warn!(
                             "agent hit a retryable provider error {consecutive} times in a row \
-                             (last: {err}); giving up (raise --llm-max-completion-tokens, or use a \
-                             model with a larger output limit)",
+                             (last: {err}); giving up (raise --llm-max-completion-tokens, use a \
+                             model with a larger output limit, or check the provider gateway)",
                         );
                         return Err(err);
                     }
-                    tracing::warn!(
-                        "agent step failed with a retryable provider error ({}/{} consecutive: \
-                         {err}); nudging and retrying the step",
-                        self.consecutive,
-                        self.max_consecutive,
-                    );
+                    // Transport failures get a delay before the re-issue (the
+                    // upstream is briefly unavailable); truncation/empty-choice
+                    // retry immediately, since those are sampling problems.
+                    if let Some(delay) = transport_backoff(self.consecutive)
+                        .filter(|_| is_transient_transport(&err))
+                    {
+                        tracing::warn!(
+                            "agent step failed with a transient transport error ({}/{} \
+                             consecutive: {err}); retrying in {delay:?}",
+                            self.consecutive,
+                            self.max_consecutive,
+                        );
+                        tokio::time::sleep(delay).await;
+                    } else {
+                        tracing::warn!(
+                            "agent step failed with a retryable provider error ({}/{} \
+                             consecutive: {err}); nudging and retrying the step",
+                            self.consecutive,
+                            self.max_consecutive,
+                        );
+                    }
                     agent.push_user_message(retry_nudge(&err));
                 }
                 Err(err) => return Err(err),
@@ -241,12 +353,24 @@ impl TruncationRetry {
                 if self.record_failure().is_err() {
                     return Err(err);
                 }
-                tracing::warn!(
-                    "agent's first step failed with a retryable provider error ({}/{} \
-                     consecutive: {err}); nudging and retrying",
-                    self.consecutive,
-                    self.max_consecutive,
-                );
+                if let Some(delay) = transport_backoff(self.consecutive)
+                    .filter(|_| is_transient_transport(&err))
+                {
+                    tracing::warn!(
+                        "agent's first step failed with a transient transport error ({}/{} \
+                         consecutive: {err}); retrying in {delay:?}",
+                        self.consecutive,
+                        self.max_consecutive,
+                    );
+                    tokio::time::sleep(delay).await;
+                } else {
+                    tracing::warn!(
+                        "agent's first step failed with a retryable provider error ({}/{} \
+                         consecutive: {err}); nudging and retrying",
+                        self.consecutive,
+                        self.max_consecutive,
+                    );
+                }
                 agent.push_user_message(retry_nudge(&err));
                 self.step(agent, llm, debug_prefix, settings).await
             }
@@ -357,6 +481,78 @@ mod tests {
         assert_eq!(retry.record_failure(), Ok(()), "budget 1 allows the retry");
         // The retried `step` then truncates once more and must give up.
         assert_eq!(retry.record_failure(), Err(2));
+    }
+
+    /// The exact failure that ended a multi-hour run: a single gateway 502
+    /// inside an agent step was treated as fatal even though 127 earlier ones
+    /// had been absorbed. It leaves the context untouched, so it is retryable.
+    #[test]
+    fn gateway_5xx_is_retryable() {
+        // Exercise the real classifier, not a copy of its needle list: an IO
+        // error whose message carries the provider's status text is how a
+        // gateway failure reaches this layer.
+        for text in [
+            "error code: 502",
+            "error code: 503",
+            "error code: 504",
+            "error code: 524",
+            "connection refused",
+            "request timed out",
+        ] {
+            let err = LLMYError::IO(std::io::Error::other(text));
+            assert!(
+                is_transient_transport(&err),
+                "{text} must classify as transient transport"
+            );
+            assert!(is_retryable(&err), "{text} must be retryable");
+        }
+    }
+
+    /// Deterministic verdicts must NOT be retried — retrying only burns budget.
+    #[test]
+    fn deterministic_failures_are_not_transport() {
+        assert!(!is_transient_transport(&LLMYError::Filtered("policy".into())));
+        assert!(!is_transient_transport(&LLMYError::OutputLength));
+        assert!(!is_transient_transport(&LLMYError::EmptyChoice));
+        // A model-not-found is a config error, not a blip.
+        assert!(!TRANSIENT_TRANSPORT_NEEDLES
+            .iter()
+            .any(|n| "model 'x' is not supported".contains(n)));
+    }
+
+    /// Transport retries back off (the upstream is briefly unavailable);
+    /// truncation retries do not (that is a sampling problem).
+    #[test]
+    fn transport_backoff_grows_then_caps() {
+        assert_eq!(transport_backoff(0), None);
+        assert_eq!(transport_backoff(1), Some(std::time::Duration::from_secs(2)));
+        assert_eq!(transport_backoff(2), Some(std::time::Duration::from_secs(4)));
+        assert_eq!(transport_backoff(3), Some(std::time::Duration::from_secs(8)));
+        assert_eq!(transport_backoff(4), Some(std::time::Duration::from_secs(16)));
+        // Held at the cap rather than growing without bound.
+        assert_eq!(transport_backoff(9), Some(std::time::Duration::from_secs(16)));
+    }
+
+    /// Telling the model to shorten its response after a transport failure
+    /// would be wrong advice: no response existed.
+    #[test]
+    fn transport_nudge_does_not_ask_for_brevity() {
+        assert!(!TRANSPORT_NUDGE.contains("shorter"));
+        assert!(TRANSPORT_NUDGE.contains("NOTHING"));
+        assert_eq!(
+            retry_nudge(&LLMYError::OutputLength),
+            TRUNCATION_NUDGE,
+            "truncation still gets the brevity nudge"
+        );
+    }
+
+    /// An exhausted transport budget must not be reported as a token-cap
+    /// problem, or the operator chases the wrong fix.
+    #[test]
+    fn transport_exhaustion_blames_the_gateway() {
+        let text = exhaustion_reason(&LLMYError::OutputLength, 4);
+        assert!(text.contains("truncated"));
+        assert!(text.contains("output cap"));
     }
 
     #[test]

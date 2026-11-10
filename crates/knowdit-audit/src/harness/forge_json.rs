@@ -24,16 +24,23 @@ use alloy_serde::WithOtherFields;
 use serde::{Deserialize, Serialize};
 
 /// Top-level shape of `forge test --json`: one entry per test contract,
-/// keyed by `"path/to/file.sol:ContractName"`. Each entry is a
-/// `WithOtherFields<SuiteResult>` so unknown top-level keys (e.g. the
-/// `duration` / `warnings` fields we don't read) round-trip cleanly.
-pub type SuiteMap = BTreeMap<String, WithOtherFields<SuiteResult>>;
+/// keyed by `"path/to/file.sol:ContractName"`. Unknown keys (e.g. `duration`,
+/// `warnings`) are skipped by serde.
+///
+/// Plain values, not `WithOtherFields`: its `serde(flatten)` buffers the whole
+/// suite object (including every test's traces) before any field is read.
+pub type SuiteMap = BTreeMap<String, SuiteResult>;
 
 /// Mirror of `forge::result::SuiteResult`.
 #[derive(Debug, Default, Deserialize, Serialize)]
 pub struct SuiteResult {
     #[serde(default)]
-    pub test_results: BTreeMap<String, WithOtherFields<TestResult>>,
+    // Deliberately *not* `WithOtherFields`: that wrapper parses every unknown
+    // key into a `serde_json::Value`. Forge's `traces` / `logs` /
+    // `decoded_logs` per test are the bulk of `-vvvvvv` output (measured:
+    // ~494 MB for one invariant test, parsed to ~10 GB RSS by the wrapper),
+    // and none of them are read. Plain `TestResult` lets serde skip them.
+    pub test_results: BTreeMap<String, TestResult>,
 }
 
 /// Mirror of `forge::result::TestResult`. `kind` stays as raw
@@ -179,9 +186,8 @@ mod tests {
         assert_eq!(tr.status, TestStatus::Failure);
         assert!(tr.is_setup_failure(name));
         assert!(tr.invariant_stats().is_none());
-        // Heavy fields are captured in `other` rather than dropped.
-        assert!(tr.other.contains_key("traces"));
-        assert!(tr.other.contains_key("breakpoints"));
+        // Heavy fields (traces, breakpoints, ...) are skipped by serde, not
+        // materialized; the verdict fields above are all that is read.
     }
 
     #[test]
