@@ -1,4 +1,5 @@
 use crate::category::DeFiCategory;
+use crate::project_loader::SourceLanguage;
 use crate::vulnerability::{FindingSeverity, VulnerabilityCategory, taxonomy_prompt};
 
 /// Prompt templates for the DeFi semantic extraction pipeline.
@@ -160,7 +161,10 @@ Use these tools to record your decision (do NOT output JSON in plain text):
 - `finalize_categorization({summary?})` — call exactly once after `set_project_categories`. After this, stop emitting tool calls.
 "#;
 
-pub fn extract_semantics_user_suffix(categories: &[DeFiCategory]) -> String {
+pub fn extract_semantics_user_suffix(
+    categories: &[DeFiCategory],
+    language: SourceLanguage,
+) -> String {
     let known_categories = if categories.is_empty() {
         "None".to_string()
     } else {
@@ -171,8 +175,9 @@ pub fn extract_semantics_user_suffix(categories: &[DeFiCategory]) -> String {
             .join(", ")
     };
 
-    format!(
-        r#"
+    match language {
+        SourceLanguage::Solidity | SourceLanguage::Move => format!(
+            r#"
 ## Instructions
 
 The project materials above have already been categorized as: {known_categories}
@@ -219,7 +224,54 @@ Use these tools to stream out the extraction (do NOT emit free-form JSON):
 - `emit_semantic({{name, definition, description, category, functions: [{{name, contract, signature?}}, …]}})` — call once for each distinct DeFi Semantic you identify in this chunk. Cluster aggressively; emit one call per *distinct* semantic, with every same-meaning function listed inside `functions`.
 - `finalize_semantic_extraction({{summary?}})` — call exactly once when this chunk has been fully covered (or when it contains no meaningful DeFi semantics — call finalize directly without any `emit_semantic`). After this, stop emitting tool calls.
 "#
-    )
+        ),
+        SourceLanguage::Rust => format!(
+            r#"
+## Instructions
+
+The Rust / Solana program materials above have already been categorized as: {known_categories}
+
+Extract DeFi Semantics from the provided Rust / Solana program material chunk.
+
+### Definition of DeFi Semantic
+
+A DeFi Semantic is defined by:
+1. **Name:** A short, abstract, canonical name (e.g., "Constant Product AMM Swap", "Collateralized Debt Position Opening").
+2. **Definition:** A one-sentence formal definition of this semantic.
+3. **Description:** Concrete behavioural prose carrying the implementation details a future reader needs to recognise the same semantic in another project. **NOT** abstract metaphor like "manages user deposits". Whenever applicable from the actual Rust / Solana source, include:
+   - Account & state mutations: which passed accounts (`Account<'info, ...>`, PDA state structs, SPL Token / Token-2022 accounts, lamport balances) are read or written, and with what arithmetic / rounding direction (`checked_*`, saturating math, fixed-point scaling).
+   - Authorization & account validation: which `Signer` checks (`Signer<'info>` / `is_signer`), program `owner` checks, PDA `seeds` + canonical `bump` derivations, `has_one` / key-equality bindings, discriminator / initialization checks, and sysvar validations gate the instruction.
+   - Cross-Program Invocations (CPIs) & external boundaries: which target programs are invoked (`invoke` / `invoke_signed`), with what PDA signer seeds, whether post-CPI account state is reloaded (`reload()`), and error propagation modes.
+   - Critical invariants the path enforces or assumes, plus pre-instruction and post-instruction account state in concrete terms.
+
+   Always say WHICH account/state fields change, WITH WHAT accounting semantics, WHO must sign or own, WHEN CPIs occur relative to state writes, and WHAT invariants hold. Aim for 4–8 sentences. Detail beats brevity.
+4. **Functions:** The specific instruction handlers or entry functions in the Rust source code that implement this semantic. Put the containing `.rs` file or module path (e.g., `programs/vault/src/instructions/deposit.rs`) in the `contract` field, the instruction/function name in `name`, and the Rust `fn` header in `signature` when available. At least one entry is required per semantic.
+5. **Category:** Exactly one DeFi category, picked from the project's known categories above. Use `Others` only when none fit.
+
+### Critical Rules
+
+1. **Hard rule on abstraction.** In the `name`, `definition`, and `description` fields you MUST NOT include any of:
+   - Specific protocol or project names (Raydium, Drift, Marinade, Orca, Marginfi, Kamino, Uniswap, Aave, …).
+   - Specific crate, program, or struct names (`WhirlpoolState`, `BankVault`, …).
+   - Specific function signatures or framework-branded helper names (`deposit_and_fix(...)`).
+   - Specific branded asset tickers (SOL, mSOL, jitoSOL, USDC, DAI, stETH, …) — say "native gas token", "liquid staking receipt", "stablecoin", etc.
+   Use only abstract DeFi roles like "AMM swap pool", "shared collateral vault", "yield strategy adapter", "liquidation keeper", "fungible token account".
+   The `functions` field IS the place for project-specific implementation pointers and SHOULD keep the real `.rs` file path and function name.
+
+2. **Use canonical DeFi vocabulary:** "liquidity provision", "collateralized debt position", "yield-bearing vault share", "constant-product swap", "concentrated liquidity range order", etc.
+
+3. **Cluster instruction handlers, `#[derive(Accounts)]` validation structs, and private math helpers aggressively.** Many items in the same module serve a single DeFi operation (e.g. an instruction handler, its Anchor `Accounts` struct, and internal fee helpers = one semantic). Enumerate the callable entry functions inside `functions`; keep the *number of distinct semantics* small. Put pure account-deserialization boilerplate, error enums, view-only getters, and trivial admin setters under a single "Utility/Admin" semantic for this chunk — do not create one Utility/Admin semantic per file.
+
+4. **Be thorough within this chunk** but stay project-agnostic. Subsequent chunks of the same project receive different code; cross-chunk merging will deduplicate later, so do not skip a real semantic just because it might appear elsewhere.
+
+## Tool Usage
+
+Use these tools to stream out the extraction (do NOT emit free-form JSON):
+- `emit_semantic({{name, definition, description, category, functions: [{{name, contract, signature?}}, …]}})` — call once for each distinct DeFi Semantic you identify in this chunk. Cluster aggressively; emit one call per *distinct* semantic, with every same-meaning function listed inside `functions`.
+- `finalize_semantic_extraction({{summary?}})` — call exactly once when this chunk has been fully covered (or when it contains no meaningful DeFi semantics — call finalize directly without any `emit_semantic`). After this, stop emitting tool calls.
+"#
+        ),
+    }
 }
 
 pub fn narrative_extract_semantics_user_suffix(categories: &[DeFiCategory]) -> String {
@@ -403,7 +455,10 @@ Use these tools (do NOT emit free-form JSON):
     )
 }
 
-pub fn extract_findings_user_suffix(categories: &[DeFiCategory]) -> String {
+pub fn extract_findings_user_suffix(
+    categories: &[DeFiCategory],
+    language: SourceLanguage,
+) -> String {
     let known_categories = if categories.is_empty() {
         "None".to_string()
     } else {
@@ -414,8 +469,9 @@ pub fn extract_findings_user_suffix(categories: &[DeFiCategory]) -> String {
             .join(", ")
     };
 
-    format!(
-        r#"
+    match language {
+        SourceLanguage::Solidity | SourceLanguage::Move => format!(
+            r#"
 ## Instructions
 
 The underlying project for this report has already been categorized as: {known_categories}
@@ -454,7 +510,49 @@ Use these tools to stream out the extraction (do NOT emit free-form JSON):
 - `emit_finding({{title, severity, category, subcategory, root_cause, description, patterns, exploits}})` — call once per *atomic* vulnerability mechanism. If one original report finding decomposes into multiple independent mechanisms, share the same `title` across the calls but populate `root_cause` / `patterns` / `exploits` independently for each.
 - `finalize_finding_extraction({{summary?}})` — call exactly once when every distinct finding in this chunk has been emitted (or when the chunk contains no findings — call finalize directly without `emit_finding`). Stop afterwards.
 "#
-    )
+        ),
+        SourceLanguage::Rust => format!(
+            r#"
+## Instructions
+
+The underlying Rust / Solana project for this report has already been categorized as: {known_categories}
+
+Extract the unique vulnerability findings described in the audit material above.
+
+### Definition of Vulnerability Pattern
+
+For each finding, capture:
+1. **title**: Keep the original report title when one is available.
+2. **root_cause**: The technical and economic root cause. Cite the specific account-validation omission, accounting step, state mutation, CPI ordering, or failure mode that constitutes the bug, not abstract metaphor. E.g. "withdrawal instruction reads cached vault token balance before invoking a CPI hook and never calls `reload()`, allowing reentrant or hook-driven balance changes to be double-counted" — not just "stale state".
+3. **description**: Concrete description of the vulnerable behavioural shape and its impact, in terms of account/state pre- and post-conditions. Include WHICH account or state fields drift, WHO can supply or manipulate the accounts, and WHAT downstream instructions consume the corrupted state.
+4. **severity**: One of `High`, `Medium`, or `Low` using the severity definitions above.
+5. **patterns**: The specific account constraints, signer/owner/PDA seed checks, CPI orderings, deserialization/discriminator checks, lamport/closure lifecycles, or arithmetic shapes that constitute the bug (e.g. "mutable user obligation and liquidator obligation accounts lack a key-inequality check, so passing the same pubkey aliases both mutable borrows; post-CPI token account is not reloaded") rather than generic labels ("missing validation").
+6. **exploits**: Concrete attack sequence in terms of `(signer, instruction, passed accounts / PDAs, observed state, multi-instruction or cross-tx ordering)`. Make it reproducible so a future reader can translate the prose into an explicit transaction sequence.
+7. **category**: Exactly one top-level vulnerability category from the taxonomy.
+8. **subcategory**: Exactly one subcategory from the chosen top-level category.
+
+### Critical Rules
+
+0. **Hard rule on abstraction.** Outside the `title` field, the `root_cause`, `description`, `patterns`, and `exploits` fields MUST NOT include any of:
+   - Specific protocol or project names (Raydium, Drift, Marinade, Orca, Marginfi, Kamino, Uniswap, Aave, …).
+   - Specific program, crate, or struct names (`WhirlpoolState`, `BankVault`, …).
+   - Specific project-branded function signatures (`deposit_and_fix(...)`).
+   - Specific branded asset tickers (SOL, mSOL, jitoSOL, USDC, DAI, stETH, …) — say "native gas token", "liquid staking receipt", "stablecoin", etc. instead.
+   Use only abstract roles like "AMM swap pool", "shared collateral vault", "liquidation keeper", "yield strategy adapter", "fungible token account". The `title` field is the only place where the original report wording is preserved verbatim.
+1. Deduplicate repeated mentions of the same finding inside this material chunk.
+2. **Atomic decomposition.** If a single original finding describes ≥2 independently triggerable vulnerability mechanisms, emit one record per mechanism. The records share the same `title` (original report title) but each record's `root_cause`, `patterns`, and `exploits` MUST describe one mechanism only.
+3. Include economically meaningful root causes when the bug depends on incentives, liquidity flow, or bridge accounting.
+4. Do not invent findings that are not supported by the material above.
+5. Always use a subcategory name exactly as written in the taxonomy.
+
+## Tool Usage
+
+Use these tools to stream out the extraction (do NOT emit free-form JSON):
+- `emit_finding({{title, severity, category, subcategory, root_cause, description, patterns, exploits}})` — call once per *atomic* vulnerability mechanism. If one original report finding decomposes into multiple independent mechanisms, share the same `title` across the calls but populate `root_cause` / `patterns` / `exploits` independently for each.
+- `finalize_finding_extraction({{summary?}})` — call exactly once when every distinct finding in this chunk has been emitted (or when the chunk contains no findings — call finalize directly without `emit_finding`). Stop afterwards.
+"#
+        ),
+    }
 }
 
 pub fn narrative_extract_findings_user_suffix(categories: &[DeFiCategory]) -> String {
@@ -526,24 +624,42 @@ pub fn narrative_combined_extract_user_suffix(categories: &[DeFiCategory]) -> St
             .collect::<Vec<_>>()
             .join(", ")
     };
+    let taxonomy = taxonomy_prompt();
 
     format!(
         r###"
+## Severity Definitions
+
+- High: Exploitation directly causes meaningful fund loss (including Critical / High findings).
+- Medium: Exploitation does not directly cause fund loss, or only causes bounded operational / griefing / denial-of-service impact.
+- Low: Gas/compute optimizations, hardening suggestions, or minor correctness issues.
+
+## Vulnerability Taxonomy
+
+{taxonomy}
 ## Instructions
 
 The report's protocol has been categorized as: {known_categories}
 
-Extract both reusable exploit-pattern semantics and atomic vulnerability findings from the report above in one pass. The report may contain an overview, vulnerable or reconstructed code, an attack flow, a PoC, a classification table, remediation, lessons, and on-chain verification. Treat those sections as evidence for the same report, not as separate incidents.
+Extract both reusable exploit-pattern semantics and atomic vulnerability findings from the report above in one pass. The report may cover any smart-contract ecosystem (Solidity/EVM, Rust/Solana/Anchor, Move, etc.) and may contain an overview, vulnerable or reconstructed code, an attack flow, a PoC, a classification table, remediation, lessons, and on-chain verification. Treat those sections as evidence for the same report, not as separate incidents.
 
 ### Semantics
 
-Emit one semantic for each distinct reusable exploit mechanism. Keep names, definitions, and descriptions project-agnostic, but preserve concrete state variables, functions, call ordering, assumptions, and prerequisites in the description. Every semantic needs at least one function reference; use `_narrative` and the report filename when no function is named.
+Emit one semantic for each distinct reusable exploit mechanism. Keep `name`, `definition`, and `description` protocol-agnostic, while preserving concrete technical anchors in `description`:
+- State & account mutations (EVM storage variables, Solana `Account<'info, ...>` / PDA state / SPL or Token-2022 token accounts / lamports, accounting formulas, rounding direction).
+- Authorization & validation gates (`msg.sender` / modifiers, or Solana `Signer`, program `owner`, PDA `seeds` + canonical `bump`, `has_one` / key-equality, discriminator checks).
+- External calls / Cross-Program Invocations (`invoke` / `invoke_signed`, post-CPI `reload()`, callback or hook ordering) and prerequisites.
+Every semantic needs at least one function reference in `functions`: put the referenced contract or `.rs` module/program path in `contract` and function/instruction name in `name`, or emit `{{name: "_narrative", contract: "<report_filename>"}}` when no function is named.
 
 ### Findings
 
-Emit one finding for each independently triggerable vulnerability mechanism. If a classification table gives IDs such as V-01, V-02, or V-03, preserve each independently supported row as a separate finding even when several findings share one attack. Do not collapse a prerequisite, missing defense, bypass condition, or separately exploitable impact mechanism into a generic report-level finding. Conversely, do not create a finding for a venue or dependency explicitly described as not vulnerable, such as an exchange pool used only to exit minted or stolen assets. Do not treat remediation, lessons, or comparison incidents as new findings.
+Emit one finding for each independently triggerable vulnerability mechanism. Classify each finding with `severity` (`High`, `Medium`, or `Low`) and with an exact `(category, subcategory)` pair from `## Vulnerability Taxonomy` above. If a classification table gives IDs such as V-01, V-02, or V-03, preserve each independently supported row as a separate finding even when several findings share one attack. Do not collapse a prerequisite, missing defense, bypass condition, or separately exploitable impact mechanism into a generic report-level finding. Conversely, do not create a finding for a venue or dependency explicitly described as not vulnerable, such as an exchange pool used only to exit minted or stolen assets. Do not treat remediation, lessons, or comparison incidents as new findings.
 
-Use the original report title for related findings when no more specific title exists. Preserve explicit severity when the report states it; otherwise infer from impact. Respect the report's own distinction between verified, inferred, reconstructed, estimated, superseded, and unconfirmed evidence in the finding prose. Never invent a transaction, address, code fact, or vulnerability absent from the report.
+Use the original report title for related findings when no more specific title exists. Preserve explicit severity when the report states it (mapping Critical to `High`, Informational to `Low`); otherwise infer from impact. Cite concrete EVM or Solana/SVM failure mechanics in `root_cause`, `patterns`, and `exploits` (e.g., missing signer/owner/PDA bump validation, stale post-CPI account state without `reload()`, duplicate mutable account aliasing, improper account closure/revival, or reentrancy/accounting drift). Respect the report's own distinction between verified, inferred, reconstructed, estimated, superseded, and unconfirmed evidence in the finding prose. Never invent a transaction, address, code fact, or vulnerability absent from the report.
+
+### Hard Rule on Abstraction
+
+Outside the finding `title` and semantic `functions` pointer fields, NEVER include specific protocol/project names (Uniswap, Aave, Raydium, Drift, Marinade, Orca, Marginfi, …), specific contract/program/crate/struct names (`UniswapV2Pair`, `WhirlpoolState`, …), or branded token tickers (`USDC`, `stETH`, `SOL`, `mSOL`, `jitoSOL`, …). Use canonical DeFi roles instead (`"shared collateral vault"`, `"AMM swap pool"`, `"liquid staking receipt"`, `"native gas token"`, `"fungible token account"`).
 
 ### Links
 
@@ -553,7 +669,7 @@ After emitting all semantics and findings, link every finding to one or more sem
 
 Use only these tools; do not emit free-form JSON:
 - `emit_narrative_semantic({{id, name, definition, description, category, functions: [{{name, contract, signature?}}, …]}})` — once per distinct exploit-pattern semantic.
-- `emit_narrative_finding({{id, title, severity, category, subcategory, root_cause, description, patterns, exploits}})` — once per atomic vulnerability mechanism, including independently supported classification-table rows.
+- `emit_narrative_finding({{id, title, severity, category, subcategory, root_cause, description, patterns, exploits}})` — once per atomic vulnerability mechanism, using an exact `(category, subcategory)` from the taxonomy above.
 - `link_narrative_finding({{finding_id, semantic_ids}})` — after the referenced records exist; every finding must have at least one semantic.
 - `finalize_narrative_extraction({{summary?}})` — exactly once after all records and links are emitted.
 "###
@@ -972,3 +1088,49 @@ Respond with strict JSON in the exact shape:
 {"nodes":[{"semantic_id":1,"category":"Dexes"},{"semantic_id":2,"category":"Tokens"}]}
 ```
 Coverage is mandatory: every listed node id must appear exactly once. Never use `Others`."#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn solidity_and_move_extraction_suffixes_are_identical_and_preserved() {
+        let cats = [DeFiCategory::Lending, DeFiCategory::Dexes];
+        let sol_sem = extract_semantics_user_suffix(&cats, SourceLanguage::Solidity);
+        let move_sem = extract_semantics_user_suffix(&cats, SourceLanguage::Move);
+        assert_eq!(sol_sem, move_sem);
+        assert!(sol_sem.contains("msg.sender"));
+
+        let sol_find = extract_findings_user_suffix(&cats, SourceLanguage::Solidity);
+        let move_find = extract_findings_user_suffix(&cats, SourceLanguage::Move);
+        assert_eq!(sol_find, move_find);
+        assert!(sol_find.contains("transferFrom"));
+    }
+
+    #[test]
+    fn rust_extraction_suffixes_include_solana_account_and_cpi_guidance() {
+        let cats = [DeFiCategory::Lending];
+        let rust_sem = extract_semantics_user_suffix(&cats, SourceLanguage::Rust);
+        assert!(rust_sem.contains("Signer<'info>"));
+        assert!(rust_sem.contains("invoke_signed"));
+        assert!(rust_sem.contains("reload()"));
+        assert!(rust_sem.contains("Raydium"));
+
+        let rust_find = extract_findings_user_suffix(&cats, SourceLanguage::Rust);
+        assert!(rust_find.contains("reload()"));
+        assert!(rust_find.contains("PDA"));
+        assert!(rust_find.contains("mSOL"));
+    }
+
+    #[test]
+    fn narrative_combined_suffix_embeds_taxonomy_and_solana_guidance() {
+        let suffix = narrative_combined_extract_user_suffix(&[DeFiCategory::Dexes]);
+        assert!(suffix.contains("## Vulnerability Taxonomy"));
+        assert!(suffix.contains("Missing Signer or Account Owner Validation"));
+        assert!(suffix.contains("Stale Account State Read After CPI"));
+        assert!(suffix.contains("Duplicate Mutable Accounts Aliasing"));
+        assert!(suffix.contains("Account<'info, ...>"));
+        assert!(suffix.contains("invoke_signed"));
+        assert!(suffix.contains("reload()"));
+    }
+}

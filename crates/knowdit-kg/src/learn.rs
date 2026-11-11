@@ -1319,7 +1319,7 @@ impl ProjectData {
         let user_suffix = if self.is_narrative {
             prompts::narrative_extract_semantics_user_suffix(categories)
         } else {
-            prompts::extract_semantics_user_suffix(categories)
+            prompts::extract_semantics_user_suffix(categories, self.source_language())
         };
         let suffix_tokens = model.config.count_tokens_lossy(&user_suffix);
 
@@ -1543,7 +1543,7 @@ impl ProjectData {
         let user_suffix = if self.is_narrative {
             prompts::narrative_extract_findings_user_suffix(categories)
         } else {
-            prompts::extract_findings_user_suffix(categories)
+            prompts::extract_findings_user_suffix(categories, self.source_language())
         };
         let suffix_tokens = model.config.count_tokens_lossy(&user_suffix);
         let chunk_budget = match chunk_input_budget {
@@ -1865,6 +1865,45 @@ mod narrative_tests {
             Err(error) => panic!("unexpected narrative deserialization error: {error}"),
         };
         assert_eq!(decoded.items.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn rust_project_prompt_body_uses_rust_fence_and_pairs_report() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "knowdit-rust-learn-test-{}-{nanos}",
+            std::process::id()
+        ));
+        let prog_file = tmp_dir.join("programs/vault/src/lib.rs");
+        std::fs::create_dir_all(prog_file.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&prog_file, "pub fn deposit() {}").expect("write source");
+        let report_file = tmp_dir.join("audit.md");
+        std::fs::write(&report_file, "# [H-01] Missing signer check").expect("write report");
+
+        let spec = format!("solana_vault:{}:sol-99", tmp_dir.display());
+        let project = ProjectData::from_spec_with_options(
+            &spec,
+            Some(knowdit_project::SourceLanguage::Rust),
+            Some(&report_file),
+        )
+        .await
+        .expect("load rust project with report");
+
+        assert_eq!(
+            project.source_language(),
+            knowdit_project::SourceLanguage::Rust
+        );
+        let body = project.build_project_prompt_body();
+        assert!(body.contains("```rust\npub fn deposit() {}\n```"));
+        let report_body = project
+            .build_report_prompt_body()
+            .expect("paired report body");
+        assert!(report_body.contains("# [H-01] Missing signer check"));
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }
 

@@ -96,6 +96,15 @@ EXCLUDED_DIRS = {
     "test", "mock", "deploy", "script", "target", ".git",
 }
 
+RUST_EXCLUDED_DIRS = (EXCLUDED_DIRS - {"lib"}) | {
+    "tests", "benches", "examples", "fuzz", "mocks", "scripts",
+    "migrations", "client", "cli", "sdk", "ts-sdk", ".anchor",
+    "test-ledger", "vendor",
+}
+
+SUPPORTED_LANGUAGES = ("solidity", "rust", "move")
+DEFAULT_LANGUAGES = "solidity,rust"
+
 SKIPPED_FILENAME = "skipped_cantina_reviews.txt"
 SKIP_LIST_FILENAME = "skip-ids.txt"
 MAPPING_FILENAME = "mapping.json"
@@ -543,13 +552,52 @@ def materialize(dataset_dir: Path, reports_dir: Path, records: list[ReportRecord
 # Clone / verify (phase 2)
 # ---------------------------------------------------------------------------
 
-def has_solidity(root: Path) -> bool:
+def parse_languages(raw: str) -> set[str]:
+    langs: set[str] = set()
+    for token in raw.split(","):
+        token = token.strip().lower()
+        if not token:
+            continue
+        if token in ("sol", "solidity"):
+            langs.add("solidity")
+        elif token in ("rs", "rust", "solana", "anchor"):
+            langs.add("rust")
+        elif token in ("move", "sui"):
+            langs.add("move")
+        else:
+            raise SystemExit(
+                f"unsupported language `{token}` in --languages "
+                f"(expected subset of {', '.join(SUPPORTED_LANGUAGES)})"
+            )
+    if not langs:
+        raise SystemExit("--languages must name at least one language")
+    return langs
+
+
+def has_in_scope_sources(root: Path, languages: set[str] | None = None) -> bool:
     if not root.is_dir():
         return False
-    for path in root.rglob("*.sol"):
-        if path.is_file() and not any(part in EXCLUDED_DIRS for part in path.parts):
-            return True
+    enabled = languages or {"solidity", "rust"}
+    if "solidity" in enabled:
+        for path in root.rglob("*.sol"):
+            rel_parts = path.relative_to(root).parts[:-1]
+            if path.is_file() and not any(part in EXCLUDED_DIRS for part in rel_parts):
+                return True
+    if "rust" in enabled:
+        for path in root.rglob("*.rs"):
+            rel_parts = path.relative_to(root).parts[:-1]
+            if path.is_file() and not any(part in RUST_EXCLUDED_DIRS for part in rel_parts):
+                return True
+    if "move" in enabled:
+        for path in root.rglob("*.move"):
+            rel_parts = path.relative_to(root).parts[:-1]
+            if path.is_file() and not any(part in EXCLUDED_DIRS for part in rel_parts):
+                return True
     return False
+
+
+def has_solidity(root: Path) -> bool:
+    return has_in_scope_sources(root, {"solidity"})
 
 
 def run(argv: list[str], cwd: Path | None = None, env: dict | None = None,
@@ -693,7 +741,8 @@ def _dest_dir(dest_root: Path, scope: ScopeRepo, multi_ref: bool) -> Path:
     return dest_root / name
 
 
-def clone_contest(record: ReportRecord, contracts_dir: Path) -> tuple[bool, str | None]:
+def clone_contest(record: ReportRecord, contracts_dir: Path,
+                  enabled_languages: set[str] | None = None) -> tuple[bool, str | None]:
     """Clone every in-scope (repo, ref) pair for one engagement.
 
     Each pair lands in its own subdirectory; the loader walks the tree
@@ -702,7 +751,7 @@ def clone_contest(record: ReportRecord, contracts_dir: Path) -> tuple[bool, str 
     """
     dest_root = contracts_dir / str(record.id)
     sentinel = dest_root / CLONE_SENTINEL
-    if sentinel.is_file() and has_solidity(dest_root):
+    if sentinel.is_file() and has_in_scope_sources(dest_root, enabled_languages):
         return True, None
     if dest_root.exists():
         shutil.rmtree(dest_root, ignore_errors=True)
@@ -723,7 +772,7 @@ def clone_contest(record: ReportRecord, contracts_dir: Path) -> tuple[bool, str 
             reasons.append(f"{scope.url}@{scope.ref or 'HEAD'}: {reason}")
             print(f"  ! clone failed ({reason}): {scope.url}", flush=True)
 
-    if cloned_any and has_solidity(dest_root):
+    if cloned_any and has_in_scope_sources(dest_root, enabled_languages):
         try:
             sentinel.write_text(f"{record.id}\n{record.slug}\n", encoding="utf-8")
         except OSError as exc:
@@ -734,7 +783,7 @@ def clone_contest(record: ReportRecord, contracts_dir: Path) -> tuple[bool, str 
         detail = "; ".join(reasons) if reasons else "no cloneable URL"
         return False, f"all clones failed ({detail})"
     shutil.rmtree(dest_root, ignore_errors=True)
-    return False, "no .sol files after excludes"
+    return False, "no in-scope source files after excludes"
 
 
 # ---------------------------------------------------------------------------
@@ -753,6 +802,9 @@ def learn_batch(ids: list[int], args: argparse.Namespace) -> bool:
         "--merge-concurrency", str(args.merge_concurrency),
         "--context-window-utilization", str(args.context_window_utilization),
     ]
+    langs = parse_languages(args.languages)
+    if len(langs) == 1:
+        argv.extend(["--language", next(iter(langs))])
     if args.link_per_batch:
         argv.append("--link")
     return run(argv)
@@ -877,6 +929,9 @@ def build_parser() -> argparse.ArgumentParser:
                              "postgres://). Required unless --prepare-only/--skip-learn.")
     parser.add_argument("--knowdit-bin", default="./target/release/knowdit",
                         help="Path to the knowdit binary (default: ./target/release/knowdit).")
+    parser.add_argument("--languages", default=DEFAULT_LANGUAGES,
+                        help="Comma-separated source languages to accept "
+                             f"(subset of {', '.join(SUPPORTED_LANGUAGES)}; default: {DEFAULT_LANGUAGES}).")
     parser.add_argument("--batch-size", type=int, default=10,
                         help="Engagements cloned+learned per batch (default: 10).")
     parser.add_argument("--concurrency", type=int, default=1,
@@ -953,6 +1008,7 @@ def check_preconditions(args: argparse.Namespace, records: list[ReportRecord]) -
 def main(argv: list[str] | None = None) -> int:
     global CLONE_TIMEOUT, SUBMODULE_TIMEOUT
     args = build_parser().parse_args(argv)
+    enabled_languages = parse_languages(args.languages)
     args.dataset_dir = args.dataset_dir.resolve()
     args.reports_dir = args.reports_dir.resolve()
     CLONE_TIMEOUT = args.clone_timeout
@@ -1030,11 +1086,11 @@ def main(argv: list[str] | None = None) -> int:
             cloned: list[ReportRecord] = []
             for record in batch:
                 print(f"\n[clone] {record.id} ({record.slug}) <- {record.primary_url}")
-                ok, error = clone_contest(record, contracts_dir)
+                ok, error = clone_contest(record, contracts_dir, enabled_languages)
                 if ok:
                     cloned.append(record)
                 else:
-                    empty = bool(error) and "no .sol files" in error
+                    empty = bool(error) and ("no .sol files" in error or "no in-scope source files" in error)
                     record.status = "skipped:empty" if empty else "skipped:clone-failed"
                     record.error = error
                     skipped_notes.append(f"{record.id} {record.slug}: {error}")

@@ -248,15 +248,15 @@ impl ProfileAttemptHandle {
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct FinalizeProfileArgs {
-    /// The project's source language — exactly one of
-    /// `"Solidity"` or `"Move"`. Determine this by reading
+    /// The project's source language — one of `"Solidity"`,
+    /// `"Move"`, or `"Rust"`. Determine this by reading
     /// representative source files: `.sol` extension + Solidity
     /// syntax (`pragma solidity`, `contract X { ... }`) → emit
     /// `"Solidity"`; `.move` extension + Move syntax (`module
     /// pkg::name;`, `entry fun`, `struct ... has key`) → emit
-    /// `"Move"`. The `finalize_profile` tool refuses any other
-    /// value, so the agent must determine the language before
-    /// it can terminate.
+    /// `"Move"`; `.rs` extension + Rust/Solana syntax (`#[program]`,
+    /// `pub fn`, `Account<'info, ...>`) → emit `"Rust"`. The
+    /// `finalize_profile` tool refuses any other value.
     pub language: String,
     /// 100-300 word prose describing what the project IS — the
     /// mechanism it uses, what role it plays. No marketing language.
@@ -301,7 +301,7 @@ impl FinalizeProfileArgs {
         let language = knowdit_repo_model::SourceLanguage::parse_lenient(&self.language)
             .ok_or_else(|| {
                 format!(
-                    "language must be exactly \"Solidity\" or \"Move\" (got {:?}). \
+                    "language must be \"Solidity\", \"Move\", or \"Rust\" (got {:?}). \
                      Identify the project's source language by reading at least one \
                      source file and re-call finalize_profile with the correct value.",
                     self.language
@@ -401,12 +401,12 @@ Workflow:
   2. Use read_file to read the most informative docs (README first, then scope, then audit
      notes if present). Cap your reads at {max_files_read}.
   3. Read at least one project source file (NOT just docs) to confirm the source language.
-     Solidity vs Move is decided by combining the file extension with concrete syntax —
+     Combine the file extension with concrete syntax —
      `.sol` + `pragma solidity` + `contract X {{ ... }}` ⇒ Solidity; `.move` + `module
-     pkg::name;` + `entry fun` / `struct ... has key` ⇒ Move. Mark your answer in
-     `finalize_profile`'s `language` field.
-  4. If docs are absent or unhelpful, fall back to list_dir on src/ (or contracts/) +
-     read_file on 2-3 of the main contract files for shape inference.
+     pkg::name;` + `entry fun` / `struct ... has key` ⇒ Move; `.rs` + `pub fn` / `#[program]` /
+     `Account<'info, ...>` ⇒ Rust. Mark your answer in `finalize_profile`'s `language` field.
+  4. If docs are absent or unhelpful, fall back to list_dir on src/ (or contracts/ / programs/) +
+     read_file on 2-3 of the main contract/program files for shape inference.
   5. Call finalize_profile exactly once with a complete profile.
 
 Tool reference (all relative paths are resolved against the project root):
@@ -417,9 +417,10 @@ Tool reference (all relative paths are resolved against the project root):
 
 Rules for each field:
 
-  - language: exactly `"Solidity"` or `"Move"`. Read at least one source file (NOT just
+  - language: `"Solidity"`, `"Move"`, or `"Rust"`. Read at least one source file (NOT just
     docs/README) and confirm: `.sol` with `pragma solidity` + `contract X` keywords ⇒
-    Solidity; `.move` with `module pkg::name;` + `entry fun` / `struct ... has key` ⇒ Move.
+    Solidity; `.move` with `module pkg::name;` + `entry fun` / `struct ... has key` ⇒ Move;
+    `.rs` with Rust / Anchor / Solana program items ⇒ Rust.
     `finalize_profile` will REFUSE to commit any other value (you'll see an `error:` tool
     response and the run will continue), so determine this before calling finalize.
 

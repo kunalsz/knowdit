@@ -17,8 +17,27 @@ use std::path::{Path, PathBuf};
 use clap::{Args, ValueEnum};
 use color_eyre::eyre::{Result, WrapErr};
 use knowdit_kg::db::HistoricalDatabase;
-use knowdit_project::{FoundryOptions, HardhatOptions, ProjectData, ProjectSpec};
+use knowdit_project::{FoundryOptions, HardhatOptions, ProjectData, ProjectSpec, SourceLanguage};
 use knowdit_repo_model::RepoDatabase;
+
+/// CLI-facing selector for [`SourceLanguage`]. Kept in `knowdit` so
+/// `knowdit-repo-model` stays free of `clap` dependencies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, serde::Serialize, serde::Deserialize)]
+pub enum SourceLanguageCliArg {
+    Solidity,
+    Move,
+    Rust,
+}
+
+impl From<SourceLanguageCliArg> for SourceLanguage {
+    fn from(value: SourceLanguageCliArg) -> Self {
+        match value {
+            SourceLanguageCliArg::Solidity => Self::Solidity,
+            SourceLanguageCliArg::Move => Self::Move,
+            SourceLanguageCliArg::Rust => Self::Rust,
+        }
+    }
+}
 
 /// `--project name:path[:platform_id]`. Sole owner of the project
 /// spec at the CLI surface. All "what does this project look like"

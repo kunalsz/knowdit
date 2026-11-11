@@ -169,10 +169,25 @@ impl C4PairedProjectData {
     /// produce:
     ///
     /// * `audits/<id>.json` — contest metadata. Required.
-    /// * `contracts/<id>/` — Solidity sources. Required.
+    /// * `contracts/<id>/` — Solidity / Move / Rust sources. Required.
     /// * `reports/<id>.md` — markdown audit report. Optional; logged
     ///   when missing but not an error.
     pub async fn from_dataset_dir(dataset_dir: &Path, contest_id: u32) -> Result<Self> {
+        Self::from_dataset_dir_with_language(dataset_dir, contest_id, None).await
+    }
+
+    /// Language-parameterized variant of [`Self::from_dataset_dir`].
+    /// When `language_override` is `Some(lang)`, walks `contracts/<id>/`
+    /// strictly for `lang`. When `None`, auto-detects across
+    /// [`SourceLanguage::ALL`]; if multiple languages appear in the
+    /// same contest tree, picks the one with the largest in-scope file
+    /// count (tie-breaking `Solidity > Move > Rust` for backwards
+    /// determinism).
+    pub async fn from_dataset_dir_with_language(
+        dataset_dir: &Path,
+        contest_id: u32,
+        language_override: Option<SourceLanguage>,
+    ) -> Result<Self> {
         let audit_path = dataset_dir
             .join("audits")
             .join(format!("{contest_id}.json"));
@@ -196,16 +211,61 @@ impl C4PairedProjectData {
             &dataset_dir.join("reports").join(format!("{contest_id}.md")),
         );
 
-        let scope = ProjectScope::build_from_patterns(
-            contracts_dir,
-            &["**/*.sol"],
-            &crate::data::DEFAULT_VENDORED_EXCLUDES,
-        )?;
+        let (language, scope) = match language_override {
+            Some(lang) => {
+                let scope = ProjectData::build_language_scope(&contracts_dir, lang)?;
+                if scope.is_empty() {
+                    return Err(eyre!(
+                        "no {} source files found under {}",
+                        lang.display_name(),
+                        contracts_dir.display()
+                    ));
+                }
+                (lang, scope)
+            }
+            None => {
+                let mut candidates: Vec<(SourceLanguage, ProjectScope)> = Vec::new();
+                for lang in SourceLanguage::ALL {
+                    if let Ok(scope) = ProjectData::build_language_scope(&contracts_dir, lang)
+                        && !scope.is_empty()
+                    {
+                        candidates.push((lang, scope));
+                    }
+                }
+                if candidates.is_empty() {
+                    return Err(eyre!(
+                        "no Solidity, Move, or Rust source files found under {}",
+                        contracts_dir.display()
+                    ));
+                }
+                if candidates.len() > 1 {
+                    let breakdown = candidates
+                        .iter()
+                        .map(|(lang, s)| format!("{}={}", lang.display_name(), s.len()))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    candidates.sort_by(|(l_lang, l_scope), (r_lang, r_scope)| {
+                        r_scope
+                            .len()
+                            .cmp(&l_scope.len())
+                            .then_with(|| l_lang.cmp(r_lang))
+                    });
+                    tracing::info!(
+                        "c4-{contest_id} contains multiple source languages ({breakdown}); \
+                         selected {} ({} files)",
+                        candidates[0].0.display_name(),
+                        candidates[0].1.len()
+                    );
+                }
+                candidates.remove(0)
+            }
+        };
+
         let content = scope.read().await?;
         let project = ProjectData::new(
             meta.title.clone(),
             Some(format!("c4-{contest_id}")),
-            SourceLanguage::Solidity,
+            language,
             content,
         );
         Ok(Self {
@@ -253,9 +313,18 @@ impl C4PairedProjectData {
     /// anywhere are dropped, never an error.
     ///
     /// Returns `Ok(None)` when the contest is not ingestible: no `scope`, no
-    /// in-scope files on disk, or a language other than Solidity/Move (the
-    /// only extractors we have). The report is optional.
+    /// in-scope files on disk, or a language other than Solidity/Move/Rust.
+    /// The report is optional.
     pub async fn from_sherlock(out_dir: &Path, contest_id: u32) -> Result<Option<Self>> {
+        Self::from_sherlock_with_language(out_dir, contest_id, None).await
+    }
+
+    /// Language-parameterized variant of [`Self::from_sherlock`].
+    pub async fn from_sherlock_with_language(
+        out_dir: &Path,
+        contest_id: u32,
+        language_override: Option<SourceLanguage>,
+    ) -> Result<Option<Self>> {
         let meta_path = out_dir.join("metadata").join(format!("{contest_id}.json"));
         let meta: SherlockMeta = serde_json::from_str(
             &std::fs::read_to_string(&meta_path)
@@ -273,8 +342,9 @@ impl C4PairedProjectData {
             .as_deref()
             .map(|template| source_root.join(template.replace('/', "__")));
         let mut files: Vec<ScopedSourceFile> = Vec::new();
-        let mut has_sol = false;
-        let mut has_move = false;
+        let mut sol_count = 0usize;
+        let mut move_count = 0usize;
+        let mut rust_count = 0usize;
         for repo in &meta.scope {
             let basename = repo.repo.rsplit('/').next().unwrap_or(repo.repo.as_str());
             let mut roots = vec![source_root.join(repo.repo.replace('/', "__"))];
@@ -293,8 +363,9 @@ impl C4PairedProjectData {
                     .extension()
                     .and_then(|ext| ext.to_str())
                 {
-                    Some("sol") => has_sol = true,
-                    Some("move") => has_move = true,
+                    Some("sol") => sol_count += 1,
+                    Some("move") => move_count += 1,
+                    Some("rs") => rust_count += 1,
                     _ => {}
                 }
                 files.push(ScopedSourceFile {
@@ -305,15 +376,30 @@ impl C4PairedProjectData {
             }
         }
 
-        // Solidity wins when both are present; keep only the chosen language's
-        // files so we never feed `.move` into the Solidity extractor.
-        let (language, keep_ext) = if has_sol {
-            (SourceLanguage::Solidity, "sol")
-        } else if has_move {
-            (SourceLanguage::Move, "move")
-        } else {
-            return Ok(None);
+        let language = match language_override {
+            Some(lang) => lang,
+            None => {
+                let mut counts = [
+                    (SourceLanguage::Solidity, sol_count),
+                    (SourceLanguage::Move, move_count),
+                    (SourceLanguage::Rust, rust_count),
+                ]
+                .into_iter()
+                .filter(|(_, c)| *c > 0)
+                .collect::<Vec<_>>();
+                if counts.is_empty() {
+                    return Ok(None);
+                }
+                counts.sort_by(|(l_lang, l_count), (r_lang, r_count)| {
+                    r_count
+                        .cmp(l_count)
+                        .then_with(|| l_lang.cmp(r_lang))
+                });
+                counts[0].0
+            }
         };
+
+        let keep_ext = language.extension();
         files.retain(|file| {
             file.relative_path.extension().and_then(|ext| ext.to_str()) == Some(keep_ext)
         });
@@ -342,5 +428,85 @@ impl C4PairedProjectData {
             Some(report) => Self::audit_only(project, report),
             None => Self::bare(project),
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_file(root: &Path, rel: &str, body: &str) {
+        let p = root.join(rel);
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent).expect("mkdir");
+        }
+        std::fs::write(p, body).expect("write");
+    }
+
+    #[tokio::test]
+    async fn c4_loads_rust_solana_contest_and_report() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_file(
+            tmp.path(),
+            "audits/77.json",
+            r#"{"contestId": 77, "title": "Solana Perps"}"#,
+        );
+        write_file(
+            tmp.path(),
+            "contracts/77/programs/perps/src/lib.rs",
+            "pub fn liquidate() {}",
+        );
+        write_file(
+            tmp.path(),
+            "contracts/77/tests/perps.rs",
+            "// integration test excluded",
+        );
+        write_file(tmp.path(), "reports/77.md", "# [H-01] Missing signer check");
+
+        let paired = C4PairedProjectData::from_dataset_dir(tmp.path(), 77)
+            .await
+            .expect("load rust c4 contest");
+        assert_eq!(paired.project.language, SourceLanguage::Rust);
+        assert_eq!(paired.project.platform_id.as_deref(), Some("c4-77"));
+        assert_eq!(paired.project.source_files().len(), 1);
+        assert_eq!(
+            paired.project.source_files()[0].relative_path,
+            PathBuf::from("programs/perps/src/lib.rs")
+        );
+        assert!(paired.audit.is_some());
+    }
+
+    #[tokio::test]
+    async fn sherlock_loads_rust_solana_contest() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_file(
+            tmp.path(),
+            "metadata/42.json",
+            r#"{
+                "title": "Solana Lending",
+                "scope": [{
+                    "repo": "org/solana-lending",
+                    "files": [{"name": "programs/lending/src/lib.rs"}]
+                }]
+            }"#,
+        );
+        write_file(
+            tmp.path(),
+            "source/42/org__solana-lending/programs/lending/src/lib.rs",
+            "pub fn borrow() {}",
+        );
+        write_file(
+            tmp.path(),
+            "reports/42/report.md",
+            "## [H-01] Unvalidated PDA",
+        );
+
+        let paired = C4PairedProjectData::from_sherlock(tmp.path(), 42)
+            .await
+            .expect("sherlock load result")
+            .expect("sherlock contest should be ingestible");
+        assert_eq!(paired.project.language, SourceLanguage::Rust);
+        assert_eq!(paired.project.source_files().len(), 1);
+        assert!(paired.audit.is_some());
     }
 }

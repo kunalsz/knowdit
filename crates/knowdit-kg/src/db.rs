@@ -1456,12 +1456,27 @@ impl HistoricalDatabase {
     }
 
     async fn seed_finding_categories_within<C: ConnectionTrait>(&self, conn: &C) -> Result<()> {
-        let existing = finding_category::Entity::find().all(conn).await?;
-        if !existing.is_empty() {
-            return Ok(());
-        }
+        let existing: HashSet<(VulnerabilityCategory, String)> = finding_category::Entity::find()
+            .all(conn)
+            .await?
+            .into_iter()
+            .map(|row| {
+                (
+                    row.category,
+                    crate::vulnerability::normalize_taxonomy_key(&row.name),
+                )
+            })
+            .collect();
 
+        let mut inserted = 0usize;
         for entry in FINDING_TAXONOMY {
+            let key = (
+                entry.category,
+                crate::vulnerability::normalize_taxonomy_key(entry.subcategory),
+            );
+            if existing.contains(&key) {
+                continue;
+            }
             let am = finding_category::ActiveModel {
                 category: Set(entry.category),
                 name: Set(entry.subcategory.to_string()),
@@ -1469,12 +1484,15 @@ impl HistoricalDatabase {
                 ..Default::default()
             };
             finding_category::Entity::insert(am).exec(conn).await?;
+            inserted += 1;
         }
 
-        tracing::info!(
-            "Seeded {} vulnerability subcategories",
-            FINDING_TAXONOMY.len()
-        );
+        if inserted > 0 {
+            tracing::info!(
+                "Seeded {inserted} missing vulnerability subcategor(y/ies) ({} total)",
+                FINDING_TAXONOMY.len()
+            );
+        }
         Ok(())
     }
 
@@ -8187,6 +8205,68 @@ INSERT INTO `demo` (`value`) VALUES ('backslash \' quote');
         let ids: Vec<i32> = nodes.iter().map(|n| n.id).collect();
         assert!(ids.contains(&canonical));
         assert!(!ids.contains(&raw), "merged-away raw must be excluded");
+
+        drop(db);
+        cleanup_test_db(&path);
+    }
+
+    #[tokio::test]
+    async fn seed_finding_categories_incrementally_backfills_missing_entries() {
+        let (db, path) = create_test_db().await;
+
+        let initial_rows = finding_category::Entity::find()
+            .all(&db.db)
+            .await
+            .expect("query initial finding_category rows");
+        assert_eq!(initial_rows.len(), FINDING_TAXONOMY.len());
+
+        let preserved = initial_rows
+            .iter()
+            .find(|r| r.name == "Missing Input Validation")
+            .expect("baseline subcategory present")
+            .clone();
+
+        // Delete two Solana subcategories to simulate opening a pre-upgrade kg.db.
+        finding_category::Entity::delete_many()
+            .filter(
+                finding_category::Column::Name.is_in([
+                    "Missing Signer or Account Owner Validation",
+                    "Stale Account State Read After CPI",
+                ]),
+            )
+            .exec(&db.db)
+            .await
+            .expect("delete simulated new subcategories");
+
+        let reduced = finding_category::Entity::find()
+            .all(&db.db)
+            .await
+            .expect("query reduced rows");
+        assert_eq!(reduced.len(), FINDING_TAXONOMY.len() - 2);
+
+        db.init().await.expect("re-init backfills missing subcategories");
+        let backfilled = finding_category::Entity::find()
+            .all(&db.db)
+            .await
+            .expect("query backfilled rows");
+        assert_eq!(backfilled.len(), FINDING_TAXONOMY.len());
+
+        let preserved_after = backfilled
+            .iter()
+            .find(|r| r.name == "Missing Input Validation")
+            .expect("baseline subcategory still present");
+        assert_eq!(
+            preserved_after.id, preserved.id,
+            "existing finding_category primary keys must remain stable"
+        );
+
+        // Second init() is completely idempotent.
+        db.init().await.expect("idempotent init");
+        let after_second = finding_category::Entity::find()
+            .all(&db.db)
+            .await
+            .expect("query rows after second init");
+        assert_eq!(after_second.len(), FINDING_TAXONOMY.len());
 
         drop(db);
         cleanup_test_db(&path);

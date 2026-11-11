@@ -22,6 +22,17 @@ pub struct LearnArgs {
     #[arg(long = "project", short = 'p')]
     pub projects: Vec<String>,
 
+    /// Explicit source language (`solidity`, `move`, `rust`). When omitted,
+    /// auto-detects from file extensions and errors on mixed-language repos.
+    #[arg(long, value_enum)]
+    pub language: Option<crate::cli::SourceLanguageCliArg>,
+
+    /// Optional markdown audit report to pair with a single `--project` so
+    /// findings and semantic-to-finding links are extracted alongside source
+    /// semantics.
+    #[arg(long)]
+    pub report: Option<PathBuf>,
+
     /// Number of projects to categorize+extract concurrently (merge is always serial)
     #[arg(long, default_value_t = 1)]
     pub concurrency: usize,
@@ -45,6 +56,11 @@ pub struct LearnC4Args {
     /// Code4rena data directory (expects audits/ and contracts/ subdirs)
     #[arg(long)]
     pub c4_dir: PathBuf,
+
+    /// Explicit source language override (`solidity`, `move`, `rust`) for
+    /// mixed-language contest repositories. Auto-detected when omitted.
+    #[arg(long, value_enum)]
+    pub language: Option<crate::cli::SourceLanguageCliArg>,
 
     /// Specific Code4rena contest IDs to process
     #[arg(long, value_delimiter = ',')]
@@ -128,12 +144,18 @@ impl LearnArgs {
     pub async fn run(self, db: &HistoricalDatabase) -> Result<()> {
         self.merge.validate()?;
         self.finding_link.validate()?;
+        color_eyre::eyre::ensure!(
+            self.report.is_none() || self.projects.len() <= 1,
+            "--report requires at most one --project; use `knowdit learn c4` for multi-project report batches"
+        );
 
         let llm = crate::llm::provider_compat(self.llm.clone().to_llm().await);
         let mut all_projects = Vec::new();
+        let language = self.language.map(Into::into);
 
         for spec in &self.projects {
-            match ProjectData::from_path_spec(spec).await {
+            match ProjectData::from_spec_with_options(spec, language, self.report.as_deref()).await
+            {
                 Ok(data) => all_projects.push(data),
                 Err(e) => tracing::error!("Failed to load project '{}': {}", spec, e),
             }
@@ -184,8 +206,9 @@ impl LearnC4Args {
             })
             .collect();
 
+        let language = self.language.map(Into::into);
         for c4id in &contest_ids {
-            match ProjectData::from_c4(&self.c4_dir, *c4id).await {
+            match ProjectData::from_c4_with_language(&self.c4_dir, *c4id, language).await {
                 Ok(data) => all_projects.push(data),
                 Err(e) => tracing::error!("Failed to load c4 project {}: {}", c4id, e),
             }
@@ -301,6 +324,11 @@ pub struct LearnSherlockArgs {
     #[arg(long)]
     pub sherlock_dir: PathBuf,
 
+    /// Explicit source language override (`solidity`, `move`, `rust`) for
+    /// mixed-language Sherlock contests. Auto-detected when omitted.
+    #[arg(long, value_enum)]
+    pub language: Option<crate::cli::SourceLanguageCliArg>,
+
     /// Specific Sherlock contest IDs to process (default: all discovered)
     #[arg(long, value_delimiter = ',')]
     pub sherlock_ids: Vec<u32>,
@@ -364,8 +392,10 @@ impl LearnSherlockArgs {
         }
 
         let mut all_projects = Vec::new();
+        let language = self.language.map(Into::into);
         for id in &ids {
-            match ProjectData::from_sherlock(&self.sherlock_dir, *id).await {
+            match ProjectData::from_sherlock_with_language(&self.sherlock_dir, *id, language).await
+            {
                 Ok(Some(data)) => all_projects.push(data),
                 Ok(None) => {
                     tracing::info!("Skipping sherlock contest {} (no scope / unsupported)", id)

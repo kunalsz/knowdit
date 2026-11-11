@@ -308,6 +308,10 @@ impl StreamloopArgs {
                 .await
             }
             SourceLanguage::Move => Err(eyre!("Move language not supported in this build")),
+            SourceLanguage::Rust => Err(eyre!(
+                "Rust/Solana target auditing is not supported in `workflow streamloop` \
+                 (only KG learning via `knowdit learn`, `knowdit workflow learn`, and `knowdit feed` is supported)"
+            )),
         }?;
 
         // Stamp the profile phase + run total, then write the centralized

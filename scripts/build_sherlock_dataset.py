@@ -81,6 +81,15 @@ EXCLUDED_DIRS = {
     "test", "mock", "deploy", "script", "target", ".git",
 }
 
+RUST_EXCLUDED_DIRS = (EXCLUDED_DIRS - {"lib"}) | {
+    "tests", "benches", "examples", "fuzz", "mocks", "scripts",
+    "migrations", "client", "cli", "sdk", "ts-sdk", ".anchor",
+    "test-ledger", "vendor",
+}
+
+SUPPORTED_LANGUAGES = ("solidity", "rust", "move")
+DEFAULT_LANGUAGES = "solidity,rust"
+
 SKIPPED_FILENAME = "skipped_sherlock.txt"
 SKIP_LIST_FILENAME = "skip-ids.txt"
 
@@ -240,18 +249,48 @@ def parse_scope(scope: str) -> tuple[list[RepoBlock], list[str]]:
     return blocks, bare
 
 
-def is_solidity_scope(files: list[str]) -> bool:
-    """False only when files are listed and NONE is Solidity.
+def parse_languages(raw: str) -> set[str]:
+    langs: set[str] = set()
+    for token in raw.split(","):
+        token = token.strip().lower()
+        if not token:
+            continue
+        if token in ("sol", "solidity"):
+            langs.add("solidity")
+        elif token in ("rs", "rust", "solana", "anchor"):
+            langs.add("rust")
+        elif token in ("move", "sui"):
+            langs.add("move")
+        else:
+            raise SystemExit(
+                f"unsupported language `{token}` in --languages "
+                f"(expected subset of {', '.join(SUPPORTED_LANGUAGES)})"
+            )
+    if not langs:
+        raise SystemExit("--languages must name at least one language")
+    return langs
 
-    Mixed scopes (`.sol` beside `.move`/`.go`/`.vy`) stay in: the C4 loader
-    reads `**/*.sol` only, so the non-Solidity entries are simply ignored.
-    """
+
+def is_supported_scope(files: list[str], enabled_languages: set[str] | None = None) -> bool:
+    """False only when files are listed and NONE matches `enabled_languages`."""
     if not files:
         return True
-    return any(f.lower().endswith(".sol") for f in files)
+    enabled = enabled_languages or {"solidity", "rust"}
+    exts: set[str] = set()
+    if "solidity" in enabled:
+        exts.add(".sol")
+    if "rust" in enabled:
+        exts.add(".rs")
+    if "move" in enabled:
+        exts.add(".move")
+    return any(any(f.lower().endswith(ext) for ext in exts) for f in files)
 
 
-def parse_report(path: Path) -> ReportRecord:
+def is_solidity_scope(files: list[str]) -> bool:
+    return is_supported_scope(files, {"solidity"})
+
+
+def parse_report(path: Path, enabled_languages: set[str] | None = None) -> ReportRecord:
     text = path.read_text(encoding="utf-8", errors="replace")
     slug = path.stem
     scope = scope_section(text)
@@ -288,20 +327,17 @@ def parse_report(path: Path) -> ReportRecord:
                           repos=repos, commits=commits, scope_files=scope_files)
 
     if not repos:
-        # Bare/missing scope: fall back to the packaged mirror. The commit is
-        # unknown, so the default branch is used; the post-clone `.sol` check
-        # is what ultimately decides.
         record.repos = [mirror]
         record.commits = {mirror: None}
         record.error = "no repo in Scope; using sherlock-audit mirror"
-        if not is_solidity_scope(scope_files):
+        if not is_supported_scope(scope_files, enabled_languages):
             record.status = "skipped:non-solidity"
-            record.error = "scope lists files, none Solidity"
+            record.error = "scope lists files, none in enabled --languages"
         return record
 
-    if not is_solidity_scope(scope_files):
+    if not is_supported_scope(scope_files, enabled_languages):
         record.status = "skipped:non-solidity"
-        record.error = "scope lists files, none Solidity"
+        record.error = "scope lists files, none in enabled --languages"
         return record
 
     return record
@@ -433,14 +469,31 @@ def materialize(dataset_dir: Path, reports_dir: Path, records: list[ReportRecord
 # Clone / verify (phase 2)
 # ---------------------------------------------------------------------------
 
-def has_solidity(root: Path) -> bool:
-    """True when any `.sol` exists outside the loader's excluded dirs."""
+def has_in_scope_sources(root: Path, languages: set[str] | None = None) -> bool:
     if not root.is_dir():
         return False
-    for path in root.rglob("*.sol"):
-        if path.is_file() and not any(part in EXCLUDED_DIRS for part in path.parts):
-            return True
+    enabled = languages or {"solidity", "rust"}
+    if "solidity" in enabled:
+        for path in root.rglob("*.sol"):
+            rel_parts = path.relative_to(root).parts[:-1]
+            if path.is_file() and not any(part in EXCLUDED_DIRS for part in rel_parts):
+                return True
+    if "rust" in enabled:
+        for path in root.rglob("*.rs"):
+            rel_parts = path.relative_to(root).parts[:-1]
+            if path.is_file() and not any(part in RUST_EXCLUDED_DIRS for part in rel_parts):
+                return True
+    if "move" in enabled:
+        for path in root.rglob("*.move"):
+            rel_parts = path.relative_to(root).parts[:-1]
+            if path.is_file() and not any(part in EXCLUDED_DIRS for part in rel_parts):
+                return True
     return False
+
+
+def has_solidity(root: Path) -> bool:
+    """True when any `.sol` exists outside the loader's excluded dirs."""
+    return has_in_scope_sources(root, {"solidity"})
 
 
 def run(argv: list[str], cwd: Path | None = None, env: dict | None = None,
@@ -572,21 +625,12 @@ def clone_repo(url: str, dest: Path, commit: str | None) -> tuple[bool, str]:
     return True, ""
 
 
-def clone_contest(record: ReportRecord, contracts_dir: Path) -> tuple[bool, str | None]:
-    """Clone every repo for one contest under `contracts/<id>/`.
-
-    Priority order:
-      1. `https://github.com/sherlock-audit/<slug>` — the packaged mirror, which
-         nests every in-scope repo and is therefore complete by construction.
-      2. The repo(s) named in the report at their pinned commits.
-      3. Neither works -> the contest is reported as a clone failure and lands
-         in `skipped_sherlock.txt`.
-
-    Returns `(ok, error)`; the sentinel is written only on full success.
-    """
+def clone_contest(record: ReportRecord, contracts_dir: Path,
+                  enabled_languages: set[str] | None = None) -> tuple[bool, str | None]:
+    """Clone every repo for one contest under `contracts/<id>/`."""
     dest_root = contracts_dir / str(record.id)
     sentinel = dest_root / CLONE_SENTINEL
-    if sentinel.is_file() and has_solidity(dest_root):
+    if sentinel.is_file() and has_in_scope_sources(dest_root, enabled_languages):
         return True, None
     if dest_root.exists():
         shutil.rmtree(dest_root, ignore_errors=True)
@@ -617,11 +661,11 @@ def clone_contest(record: ReportRecord, contracts_dir: Path) -> tuple[bool, str 
 
     # 1. Packaged mirror first: it nests every in-scope repo at the audited
     #    commit, so when it exists it is the most complete single source.
-    complete = attempt([mirror]) and has_solidity(dest_root)
+    complete = attempt([mirror]) and has_in_scope_sources(dest_root, enabled_languages)
     # 2. Otherwise the repo(s) named in the report, at their pinned commits.
     if not complete and primary:
         print(f"  . mirror unavailable; falling back to the report's repo(s)", flush=True)
-        complete = attempt(primary) and has_solidity(dest_root)
+        complete = attempt(primary) and has_in_scope_sources(dest_root, enabled_languages)
 
     if complete:
         try:
@@ -634,7 +678,7 @@ def clone_contest(record: ReportRecord, contracts_dir: Path) -> tuple[bool, str 
         detail = "; ".join(reasons) if reasons else "no cloneable URL"
         return False, f"all clones failed ({detail})"
     shutil.rmtree(dest_root, ignore_errors=True)
-    return False, "no .sol files after excludes"
+    return False, "no in-scope source files after excludes"
 
 
 # ---------------------------------------------------------------------------
@@ -655,6 +699,9 @@ def learn_batch(ids: list[int], args: argparse.Namespace) -> bool:
         "--merge-concurrency", str(args.merge_concurrency),
         "--context-window-utilization", str(args.context_window_utilization),
     ]
+    langs = parse_languages(args.languages)
+    if len(langs) == 1:
+        argv.extend(["--language", next(iter(langs))])
     if args.link_per_batch:
         argv.append("--link")
     return run(argv)
@@ -781,6 +828,9 @@ def build_parser() -> argparse.ArgumentParser:
                              "postgres://). Required unless --prepare-only/--skip-learn.")
     parser.add_argument("--knowdit-bin", default="./target/release/knowdit",
                         help="Path to the knowdit binary (default: ./target/release/knowdit).")
+    parser.add_argument("--languages", default=DEFAULT_LANGUAGES,
+                        help="Comma-separated source languages to accept "
+                             f"(subset of {', '.join(SUPPORTED_LANGUAGES)}; default: {DEFAULT_LANGUAGES}).")
     parser.add_argument("--batch-size", type=int, default=10,
                         help="Contests cloned+learned per batch (default: 10).")
     parser.add_argument("--concurrency", type=int, default=1,
@@ -859,6 +909,7 @@ def check_preconditions(args: argparse.Namespace, records: list[ReportRecord]) -
 def main(argv: list[str] | None = None) -> int:
     global CLONE_TIMEOUT, SUBMODULE_TIMEOUT
     args = build_parser().parse_args(argv)
+    enabled_languages = parse_languages(args.languages)
     args.dataset_dir = args.dataset_dir.resolve()
     args.reports_dir = args.reports_dir.resolve()
     CLONE_TIMEOUT = args.clone_timeout
@@ -868,7 +919,7 @@ def main(argv: list[str] | None = None) -> int:
     if not report_paths:
         raise SystemExit(f"no .md reports under {args.reports_dir}")
 
-    records = [parse_report(path) for path in report_paths]
+    records = [parse_report(path, enabled_languages) for path in report_paths]
 
     if not args.no_resume and not args.force:
         resumed = apply_manifest_resume(args.dataset_dir, records)
@@ -919,11 +970,11 @@ def main(argv: list[str] | None = None) -> int:
             cloned: list[ReportRecord] = []
             for record in batch:
                 print(f"\n[clone] {record.id} ({record.slug}) <- {record.primary_url}")
-                ok, error = clone_contest(record, contracts_dir)
+                ok, error = clone_contest(record, contracts_dir, enabled_languages)
                 if ok:
                     cloned.append(record)
                 else:
-                    empty = bool(error) and "no .sol files" in error
+                    empty = bool(error) and ("no .sol files" in error or "no in-scope source files" in error)
                     record.status = "skipped:empty" if empty else "skipped:clone-failed"
                     record.error = error
                     skipped_notes.append(f"{record.id} {record.slug}: {error}")

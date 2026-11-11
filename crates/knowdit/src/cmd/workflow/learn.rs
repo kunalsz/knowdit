@@ -65,6 +65,17 @@ pub struct WorkflowLearnArgs {
     #[arg(long = "project", short = 'p')]
     pub project: String,
 
+    /// Explicit source language (`solidity`, `move`, `rust`). When
+    /// omitted, auto-detects from file extensions under `path`.
+    #[arg(long, value_enum)]
+    pub language: Option<crate::cli::SourceLanguageCliArg>,
+
+    /// Optional markdown audit report paired with `--project` so
+    /// vulnerability findings and finding-to-semantic links are
+    /// learned alongside source semantics.
+    #[arg(long)]
+    pub report: Option<std::path::PathBuf>,
+
     /// Historical KG connection. Same flag (`--database-url`,
     /// `DATABASE_URL`) as the standalone `learn` commands.
     #[command(flatten)]
@@ -99,9 +110,13 @@ impl WorkflowLearnArgs {
         let kg = self.kg.connect_init().await?;
 
         // ----- Phase 1: categorize + extract + dedup-merge --------
-        let project = ProjectData::from_path_spec(&self.project)
-            .await
-            .wrap_err_with(|| format!("failed to load project '{}'", self.project))?;
+        let project = ProjectData::from_spec_with_options(
+            &self.project,
+            self.language.map(Into::into),
+            self.report.as_deref(),
+        )
+        .await
+        .wrap_err_with(|| format!("failed to load project '{}'", self.project))?;
         if project.is_completed(&kg).await? {
             tracing::info!(
                 "Project {} already in KG — skipping phase 1 (extract+merge)",

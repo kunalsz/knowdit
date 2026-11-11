@@ -80,13 +80,28 @@ impl ProjectData {
     // ----------------------------------------------------------------
 
     /// Parse a `name:path` / `name:path:platform_id` spec and load
-    /// the project, auto-detecting Solidity vs Move based on which
-    /// extension is present under `path`. Errors when both are
-    /// present (we don't support mixed-language projects) or when
-    /// neither is.
+    /// the project, auto-detecting Solidity vs Move vs Rust based on
+    /// which extension is present under `path`. Errors when multiple
+    /// languages are present without an override or when none is.
     pub async fn from_source_dir_spec(spec: &str) -> Result<Self> {
+        Self::from_source_dir_spec_with_language(spec, None).await
+    }
+
+    /// Parse a `name:path` / `name:path:platform_id` spec and load
+    /// the project with an optional explicit [`SourceLanguage`]
+    /// override (used to disambiguate mixed EVM + Solana repos).
+    pub async fn from_source_dir_spec_with_language(
+        spec: &str,
+        language_override: Option<SourceLanguage>,
+    ) -> Result<Self> {
         let parsed = ProjectSpec::parse(spec)?;
-        Self::from_source_dir(&parsed.name, &parsed.root, parsed.platform_id.as_deref()).await
+        Self::from_source_dir_with_language(
+            &parsed.name,
+            &parsed.root,
+            parsed.platform_id.as_deref(),
+            language_override,
+        )
+        .await
     }
 
     /// Parse a `name:path` / `name:path:platform_id` spec and load
@@ -96,6 +111,50 @@ impl ProjectData {
     pub async fn from_path_spec(spec: &str) -> Result<Self> {
         let parsed = ProjectSpec::parse(spec)?;
         Self::from_dir(&parsed.name, &parsed.root, parsed.platform_id.as_deref()).await
+    }
+
+    /// Build the in-scope file set for a single `language` under
+    /// `root_dir`. Honours a repo-root `scope.txt` when present and
+    /// non-empty (intersected with `**/*.<ext>` and the language's
+    /// non-production exclude set); otherwise walks `**/*.<ext>` with
+    /// [`DEFAULT_VENDORED_EXCLUDES`] (Solidity/Move) or
+    /// [`RUST_VENDORED_EXCLUDES`] (Rust).
+    pub fn build_language_scope(root_dir: &Path, language: SourceLanguage) -> Result<ProjectScope> {
+        let ext_glob = format!("**/*.{}", language.extension());
+        let excludes: &[&str] = match language {
+            SourceLanguage::Solidity | SourceLanguage::Move => &DEFAULT_VENDORED_EXCLUDES,
+            SourceLanguage::Rust => &RUST_VENDORED_EXCLUDES,
+        };
+        if let Some(scope_globs) = crate::scope::read_scope_txt(root_dir)?
+            && !scope_globs.is_empty()
+        {
+            let refs: Vec<&str> = scope_globs.iter().map(String::as_str).collect();
+            let scoped = ProjectScope::build_from_patterns(root_dir.to_path_buf(), &refs, excludes)
+                .wrap_err_with(|| {
+                    format!(
+                        "failed to build {} scope from scope.txt under {}",
+                        language.display_name(),
+                        root_dir.display()
+                    )
+                })?;
+            return scoped
+                .filter_by_patterns(&[ext_glob.as_str()], &[])
+                .wrap_err_with(|| {
+                    format!(
+                        "failed to filter {} scope under {}",
+                        language.display_name(),
+                        root_dir.display()
+                    )
+                });
+        }
+        ProjectScope::build_from_patterns(root_dir.to_path_buf(), &[ext_glob.as_str()], excludes)
+            .wrap_err_with(|| {
+                format!(
+                    "failed to build {} scope under {}",
+                    language.display_name(),
+                    root_dir.display()
+                )
+            })
     }
 
     /// Load a Solidity project from `root_dir`. Walks the tree with
@@ -137,39 +196,63 @@ impl ProjectData {
         root_dir: &Path,
         platform_id: Option<&str>,
     ) -> Result<Self> {
-        let solidity_scope = ProjectScope::build_from_patterns(
-            root_dir.to_path_buf(),
-            &["**/*.sol"],
-            &DEFAULT_VENDORED_EXCLUDES,
-        )
-        .ok();
-        let move_scope = ProjectScope::build_from_patterns(
-            root_dir.to_path_buf(),
-            &["**/*.move"],
-            &DEFAULT_VENDORED_EXCLUDES,
-        )
-        .ok();
+        Self::from_source_dir_with_language(name, root_dir, platform_id, None).await
+    }
 
-        let (language, scope) = match (
-            solidity_scope
-                .as_ref()
-                .map(|s| !s.is_empty())
-                .unwrap_or(false),
-            move_scope.as_ref().map(|s| !s.is_empty()).unwrap_or(false),
-        ) {
-            (true, false) => (SourceLanguage::Solidity, solidity_scope.unwrap()),
-            (false, true) => (SourceLanguage::Move, move_scope.unwrap()),
-            (true, true) => {
-                return Err(eyre!(
-                    "project directory contains both Solidity and Move sources: {}",
-                    root_dir.display()
-                ));
+    /// Load a project from `root_dir` with an optional explicit
+    /// `language_override`. When `language_override` is `Some(lang)`,
+    /// only `lang`'s scope is walked so mixed-language repositories
+    /// (e.g. EVM + Solana bridges) can target a single language cleanly.
+    /// When `None`, probes all [`SourceLanguage::ALL`] variants and
+    /// requires a unique non-empty match.
+    pub async fn from_source_dir_with_language(
+        name: &str,
+        root_dir: &Path,
+        platform_id: Option<&str>,
+        language_override: Option<SourceLanguage>,
+    ) -> Result<Self> {
+        let (language, scope) = match language_override {
+            Some(lang) => {
+                let scope = Self::build_language_scope(root_dir, lang)?;
+                if scope.is_empty() {
+                    return Err(eyre!(
+                        "no {} source files found under {}",
+                        lang.display_name(),
+                        root_dir.display()
+                    ));
+                }
+                (lang, scope)
             }
-            (false, false) => {
-                return Err(eyre!(
-                    "no Solidity or Move source files found under {}",
-                    root_dir.display()
-                ));
+            None => {
+                let mut non_empty: Vec<(SourceLanguage, ProjectScope)> = Vec::new();
+                for lang in SourceLanguage::ALL {
+                    if let Ok(scope) = Self::build_language_scope(root_dir, lang)
+                        && !scope.is_empty()
+                    {
+                        non_empty.push((lang, scope));
+                    }
+                }
+                match non_empty.len() {
+                    0 => {
+                        return Err(eyre!(
+                            "no Solidity, Move, or Rust source files found under {}",
+                            root_dir.display()
+                        ));
+                    }
+                    1 => non_empty.remove(0),
+                    _ => {
+                        let names = non_empty
+                            .iter()
+                            .map(|(lang, _)| lang.display_name())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        return Err(eyre!(
+                            "project directory contains multiple source languages ({names}): {}; \
+                             pass --language <solidity|move|rust> to select one",
+                            root_dir.display()
+                        ));
+                    }
+                }
             }
         };
         let content = scope.read().await?;
@@ -319,6 +402,119 @@ pub(crate) const DEFAULT_VENDORED_EXCLUDES: [&str; 42] = [
     "target/**",
 ];
 
+/// Default directory excludes for Rust / Solana / Anchor projects.
+///
+/// Differs intentionally from [`DEFAULT_VENDORED_EXCLUDES`] in two ways:
+/// 1. Preserves `lib/` and `libs/` — Cargo never vendors third-party
+///    dependencies into `lib/`, whereas Solana workspaces commonly put
+///    first-party shared crates under `lib/<crate>/src/` or `libs/<crate>/src/`.
+/// 2. Excludes Cargo/Anchor non-production trees (`tests/`, `benches/`,
+///    `examples/`, `fuzz/`, `mocks/`, `scripts/`, `migrations/`, `client/`,
+///    `cli/`, `sdk/`, `ts-sdk/`, `.anchor/`, `test-ledger/`) so integration
+///    harnesses and off-chain SDKs do not flood LLM prompts.
+pub(crate) const RUST_VENDORED_EXCLUDES: [&str; 100] = [
+    ".git",
+    ".git/**",
+    "**/.git",
+    "**/.git/**",
+    "target",
+    "target/**",
+    "**/target",
+    "**/target/**",
+    ".anchor",
+    ".anchor/**",
+    "**/.anchor",
+    "**/.anchor/**",
+    "test-ledger",
+    "test-ledger/**",
+    "**/test-ledger",
+    "**/test-ledger/**",
+    "node_modules",
+    "node_modules/**",
+    "**/node_modules",
+    "**/node_modules/**",
+    "build",
+    "build/**",
+    "**/build",
+    "**/build/**",
+    "artifacts",
+    "artifacts/**",
+    "**/artifacts",
+    "**/artifacts/**",
+    "cache",
+    "cache/**",
+    "**/cache",
+    "**/cache/**",
+    "test",
+    "test/**",
+    "**/test",
+    "**/test/**",
+    "tests",
+    "tests/**",
+    "**/tests",
+    "**/tests/**",
+    "benches",
+    "benches/**",
+    "**/benches",
+    "**/benches/**",
+    "examples",
+    "examples/**",
+    "**/examples",
+    "**/examples/**",
+    "fuzz",
+    "fuzz/**",
+    "**/fuzz",
+    "**/fuzz/**",
+    "mock",
+    "mock/**",
+    "**/mock",
+    "**/mock/**",
+    "mocks",
+    "mocks/**",
+    "**/mocks",
+    "**/mocks/**",
+    "script",
+    "script/**",
+    "**/script",
+    "**/script/**",
+    "scripts",
+    "scripts/**",
+    "**/scripts",
+    "**/scripts/**",
+    "deploy",
+    "deploy/**",
+    "**/deploy",
+    "**/deploy/**",
+    "migrations",
+    "migrations/**",
+    "**/migrations",
+    "**/migrations/**",
+    "client",
+    "client/**",
+    "**/client",
+    "**/client/**",
+    "cli",
+    "cli/**",
+    "**/cli",
+    "**/cli/**",
+    "sdk",
+    "sdk/**",
+    "**/sdk",
+    "**/sdk/**",
+    "ts-sdk",
+    "ts-sdk/**",
+    "**/ts-sdk",
+    "**/ts-sdk/**",
+    "vendor",
+    "vendor/**",
+    "**/vendor",
+    "**/vendor/**",
+    "src/vendor",
+    "src/vendor/**",
+    "**/src/vendor",
+    "**/src/vendor/**",
+];
+
 // ---------------------------------------------------------------------------
 // Spec parsing (shared by from_source_dir_spec / from_path_spec).
 // ---------------------------------------------------------------------------
@@ -418,14 +614,88 @@ mod tests {
 
     #[tokio::test]
     async fn from_source_dir_rejects_mixed_language() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("tempdir");
         write(dir.path(), "src/A.sol", "");
         write(dir.path(), "sources/A.move", "");
         let err = ProjectData::from_source_dir("p", dir.path(), None)
             .await
             .err()
-            .unwrap();
-        assert!(err.to_string().contains("both Solidity and Move"));
+            .expect("mixed language error");
+        assert!(err.to_string().contains("multiple source languages"));
+    }
+
+    #[tokio::test]
+    async fn from_source_dir_picks_rust_and_preserves_libs_while_pruning_tests_and_sdk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(dir.path(), "programs/vault/src/lib.rs", "pub mod state;");
+        write(dir.path(), "lib/math/src/lib.rs", "pub fn mul_div() {}");
+        write(dir.path(), "libs/common/src/lib.rs", "pub struct Config;");
+        write(dir.path(), "tests/vault_litesvm.rs", "// excluded test");
+        write(dir.path(), "benches/compute.rs", "// excluded bench");
+        write(dir.path(), "sdk/src/lib.rs", "// excluded sdk");
+        write(dir.path(), "client/src/main.rs", "// excluded client");
+        write(dir.path(), "target/debug/build/out.rs", "// excluded target");
+
+        let pd = ProjectData::from_source_dir("vault", dir.path(), Some("sol-1"))
+            .await
+            .expect("load rust project");
+        assert_eq!(pd.language, SourceLanguage::Rust);
+        let rels: Vec<PathBuf> = pd
+            .source_files()
+            .iter()
+            .map(|f| f.relative_path.clone())
+            .collect();
+        assert_eq!(
+            rels,
+            vec![
+                PathBuf::from("lib/math/src/lib.rs"),
+                PathBuf::from("libs/common/src/lib.rs"),
+                PathBuf::from("programs/vault/src/lib.rs"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn from_source_dir_with_language_disambiguates_mixed_evm_and_solana_repo() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(dir.path(), "contracts/Bridge.sol", "contract Bridge {}");
+        write(dir.path(), "programs/bridge/src/lib.rs", "pub fn relay() {}");
+
+        assert!(
+            ProjectData::from_source_dir("bridge", dir.path(), None)
+                .await
+                .is_err()
+        );
+
+        let rust_pd = ProjectData::from_source_dir_with_language(
+            "bridge-solana",
+            dir.path(),
+            None,
+            Some(SourceLanguage::Rust),
+        )
+        .await
+        .expect("select Rust side");
+        assert_eq!(rust_pd.language, SourceLanguage::Rust);
+        assert_eq!(rust_pd.source_files().len(), 1);
+        assert_eq!(
+            rust_pd.source_files()[0].relative_path,
+            PathBuf::from("programs/bridge/src/lib.rs")
+        );
+
+        let sol_pd = ProjectData::from_source_dir_with_language(
+            "bridge-evm",
+            dir.path(),
+            None,
+            Some(SourceLanguage::Solidity),
+        )
+        .await
+        .expect("select Solidity side");
+        assert_eq!(sol_pd.language, SourceLanguage::Solidity);
+        assert_eq!(sol_pd.source_files().len(), 1);
+        assert_eq!(
+            sol_pd.source_files()[0].relative_path,
+            PathBuf::from("contracts/Bridge.sol")
+        );
     }
 
     #[test]

@@ -67,12 +67,48 @@ impl ProjectData {
     }
 
     /// Parse `name:path` / `name:path:platform_id` and load the
-    /// project, auto-detecting Solidity vs Move.
+    /// project, auto-detecting Solidity vs Move vs Rust.
     pub async fn from_source_dir_spec(spec: &str) -> Result<Self> {
+        Self::from_spec_with_options(spec, None, None).await
+    }
+
+    /// Parse `name:path` / `name:path:platform_id` with an optional
+    /// explicit [`SourceLanguage`] override and an optional markdown
+    /// audit report path. When `report_path` is `Some`, missing or
+    /// empty report files return an error rather than silently
+    /// producing zero findings.
+    pub async fn from_spec_with_options(
+        spec: &str,
+        language: Option<SourceLanguage>,
+        report_path: Option<&Path>,
+    ) -> Result<Self> {
+        let project =
+            knowdit_project::ProjectData::from_source_dir_spec_with_language(spec, language)
+                .await?;
+        let paired = match report_path {
+            Some(path) => {
+                if !path.is_file() {
+                    return Err(crate::error::KgError::other(format!(
+                        "audit report file not found: {}",
+                        path.display()
+                    )));
+                }
+                let text = tokio::fs::read_to_string(path).await?;
+                if text.trim().is_empty() {
+                    return Err(crate::error::KgError::other(format!(
+                        "audit report file is empty: {}",
+                        path.display()
+                    )));
+                }
+                knowdit_project::C4PairedProjectData::audit_only(
+                    project,
+                    AuditReportMaterial::Text(text),
+                )
+            }
+            None => knowdit_project::C4PairedProjectData::bare(project),
+        };
         Ok(Self {
-            paired: knowdit_project::C4PairedProjectData::bare(
-                knowdit_project::ProjectData::from_source_dir_spec(spec).await?,
-            ),
+            paired,
             is_narrative: false,
             feed_source: None,
         })
@@ -94,8 +130,21 @@ impl ProjectData {
     /// inside the underlying `C4PairedProjectData.audit` so the
     /// learn-pipeline's prompt builders pick it up automatically.
     pub async fn from_c4(dataset_dir: &Path, contest_id: u32) -> Result<Self> {
-        let paired =
-            knowdit_project::C4PairedProjectData::from_dataset_dir(dataset_dir, contest_id).await?;
+        Self::from_c4_with_language(dataset_dir, contest_id, None).await
+    }
+
+    /// Language-parameterized variant of [`Self::from_c4`].
+    pub async fn from_c4_with_language(
+        dataset_dir: &Path,
+        contest_id: u32,
+        language: Option<SourceLanguage>,
+    ) -> Result<Self> {
+        let paired = knowdit_project::C4PairedProjectData::from_dataset_dir_with_language(
+            dataset_dir,
+            contest_id,
+            language,
+        )
+        .await?;
         Ok(Self {
             paired,
             is_narrative: false,
@@ -105,16 +154,27 @@ impl ProjectData {
 
     /// Load a Sherlock contest from a `sherlock-scrape/out` directory.
     /// Returns `Ok(None)` when the contest is not ingestible (no scope
-    /// files, or a non-Solidity/Move language) so bulk callers can skip it.
+    /// files, or a non-Solidity/Move/Rust language) so bulk callers can skip it.
     pub async fn from_sherlock(out_dir: &Path, contest_id: u32) -> Result<Option<Self>> {
+        Self::from_sherlock_with_language(out_dir, contest_id, None).await
+    }
+
+    /// Language-parameterized variant of [`Self::from_sherlock`].
+    pub async fn from_sherlock_with_language(
+        out_dir: &Path,
+        contest_id: u32,
+        language: Option<SourceLanguage>,
+    ) -> Result<Option<Self>> {
         Ok(
-            knowdit_project::C4PairedProjectData::from_sherlock(out_dir, contest_id)
-                .await?
-                .map(|paired| Self {
-                    paired,
-                    is_narrative: false,
-                    feed_source: None,
-                }),
+            knowdit_project::C4PairedProjectData::from_sherlock_with_language(
+                out_dir, contest_id, language,
+            )
+            .await?
+            .map(|paired| Self {
+                paired,
+                is_narrative: false,
+                feed_source: None,
+            }),
         )
     }
 

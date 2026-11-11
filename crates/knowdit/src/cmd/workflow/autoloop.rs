@@ -150,10 +150,10 @@ impl AutoloopArgs {
         // language. Refuse a Move project here with a hard pointer to
         // streamloop rather than silently failing the forge preflight.
         let detected_language = self.project.to_project_data().await?.language;
-        if detected_language == knowdit_project::SourceLanguage::Move {
+        if detected_language != knowdit_project::SourceLanguage::Solidity {
             return Err(eyre!(
-                "`workflow autoloop` is Solidity-only — Sui Move projects must run via \
-                 `workflow streamloop`, which dispatches on language."
+                "`workflow autoloop` is Solidity-only (detected {}); non-Solidity projects cannot use the Foundry autoloop.",
+                detected_language.display_name(),
             ));
         }
 
