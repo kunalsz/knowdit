@@ -2873,6 +2873,7 @@ dependencies = [
  "knowdit-kg-model",
  "knowdit-project",
  "knowdit-repo-model",
+ "knowdit-rust",
  "knowdit-sol",
  "llmy",
  "sea-orm",
@@ -2916,6 +2917,7 @@ dependencies = [
  "knowdit-kg-model",
  "knowdit-project",
  "knowdit-repo-model",
+ "knowdit-rust",
  "knowdit-sol",
  "llmy",
  "schemars",
@@ -2983,6 +2985,7 @@ dependencies = [
  "globset",
  "knowdit-cg-static",
  "knowdit-repo-model",
+ "knowdit-rust",
  "knowdit-sol",
  "serde",
  "serde_json",
@@ -3008,6 +3011,23 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "knowdit-rust"
+version = "1.0.1"
+dependencies = [
+ "color-eyre",
+ "glob",
+ "knowdit-repo-model",
+ "proc-macro2",
+ "serde",
+ "serde_json",
+ "syn 2.0.117",
+ "tempfile",
+ "tokio",
+ "toml",
+ "tracing",
 ]
 
 [[package]]

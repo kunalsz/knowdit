@@ -298,7 +298,7 @@ impl AutoloopArgs {
                 &repo,
                 primary_llm,
                 &spec_name,
-                &self.harness,
+                self.harness.harness_debug_prefix.clone(),
                 &self.regen,
             )
             .await?;

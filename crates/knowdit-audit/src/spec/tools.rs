@@ -518,7 +518,8 @@ struct AddAuxContractStateArgs {
     contract: String,
     /// State variable name on that auxiliary contract.
     name: String,
-    /// Solidity type, e.g. `uint256`, `address`, `mapping(address => uint256)`.
+    /// Source-language type, e.g. `uint256` / `address` (Solidity) or `u64` / `Pubkey` (Rust).
+    #[serde(alias = "rust_type", alias = "field_type")]
     solidity_type: String,
     /// What this variable is for in the attack scenario.
     purpose: String,
@@ -836,8 +837,9 @@ impl ReadContractSourceTool {
         let mut out = String::new();
         for id in contract_ids {
             if let Some(contract) = self.project.contract(id) {
+                let fence = ProjectIndex::code_fence_for_path(&contract.relative_file_path);
                 out.push_str(&format!(
-                    "## contract `{}` @ `{}` (id={})\n```solidity\n{}\n```\n---\n",
+                    "## contract `{}` @ `{}` (id={})\n```{fence}\n{}\n```\n---\n",
                     contract.name,
                     contract.relative_file_path.display(),
                     contract.id,
@@ -847,8 +849,9 @@ impl ReadContractSourceTool {
         }
         for id in interface_ids {
             if let Some(interface) = self.project.interface(id) {
+                let fence = ProjectIndex::code_fence_for_path(&interface.relative_file_path);
                 out.push_str(&format!(
-                    "## interface `{}` @ `{}` (id={})\n```solidity\n{}\n```\n---\n",
+                    "## interface `{}` @ `{}` (id={})\n```{fence}\n{}\n```\n---\n",
                     interface.name,
                     interface.relative_file_path.display(),
                     interface.id,
@@ -908,7 +911,8 @@ impl ReadFunctionSourceTool {
                         f.id,
                     ));
                     if let Some(body) = &f.content {
-                        out.push_str("```solidity\n");
+                        let fence = ProjectIndex::code_fence_for_path(&f.relative_file_path);
+                        out.push_str(&format!("```{fence}\n"));
                         out.push_str(body.trim_end());
                         out.push_str("\n```\n");
                     } else {

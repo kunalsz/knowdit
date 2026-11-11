@@ -457,7 +457,7 @@ impl StreamloopArgs {
             spec_name,
             language_prompt_prefix,
             gen_options,
-            harness: self.harness.clone(),
+            harness_debug_prefix: self.harness.harness_debug_prefix.clone(),
             reflect: self.reflect.clone(),
             regen: self.regen.clone(),
             output_folder: self.output_folder.clone(),
@@ -569,11 +569,9 @@ struct LinkContext<B: HarnessBackend + Clone + 'static> {
     /// [`HarnessBackend`] impl so the per-link pipeline never has to
     /// branch on language.
     harness_backend: B,
-    /// Original CLI args — kept because regen still consumes a few
-    /// fields (`harness_debug_prefix`, `harness_via_ir`, etc.) that
-    /// don't have a home on the backend handle. Trim once a `Move`
-    /// path lands and we settle on the smallest shared surface.
-    harness: HarnessSharedArgs,
+    /// Optional debug prefix forwarded into `RegenArgs::regen_specs`
+    /// without coupling `LinkContext<B>` to Foundry's `HarnessSharedArgs`.
+    harness_debug_prefix: Option<String>,
     reflect: ReflectSharedArgs,
     regen: RegenSharedArgs,
     output_folder: PathBuf,
@@ -1060,7 +1058,7 @@ impl<B: HarnessBackend + Clone + 'static> LinkContext<B> {
             &self.repo,
             regen_llm,
             &self.spec_name,
-            &self.harness,
+            self.harness_debug_prefix.clone(),
             &self.regen,
             active_spec_ids,
         )
@@ -1470,7 +1468,7 @@ pub(crate) struct LinkPipelineInputs<B: HarnessBackend + Clone + Send + Sync + '
     pub(crate) spec_name: String,
     pub(crate) language_prompt_prefix: String,
     pub(crate) gen_options: SpecGenOptions,
-    pub(crate) harness: HarnessSharedArgs,
+    pub(crate) harness_debug_prefix: Option<String>,
     pub(crate) reflect: ReflectSharedArgs,
     pub(crate) regen: RegenSharedArgs,
     pub(crate) output_folder: PathBuf,
@@ -1506,7 +1504,7 @@ impl<B: HarnessBackend + Clone + Send + Sync + 'static> LinkPipelineInputs<B> {
             spec_name,
             language_prompt_prefix,
             gen_options,
-            harness,
+            harness_debug_prefix,
             reflect,
             regen,
             output_folder,
@@ -1567,7 +1565,7 @@ impl<B: HarnessBackend + Clone + Send + Sync + 'static> LinkPipelineInputs<B> {
             spec_name,
             repo_root,
             harness_backend: backend,
-            harness,
+            harness_debug_prefix,
             reflect,
             regen,
             output_folder,

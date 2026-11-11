@@ -176,6 +176,9 @@ pub struct StaticCommand {
 pub enum StaticCommands {
     /// Solidity tree-sitter / AST extraction tools (no LLM)
     Solidity(StaticSolidityCommand),
+
+    /// Rust / Solana AST, call-graph, and account/state-graph extraction tools (no LLM)
+    Rust(StaticRustCommand),
 }
 
 #[derive(Args)]
@@ -258,6 +261,28 @@ pub enum StaticSolidityCommands {
 
     /// Export the stored Solidity state-variable read/write graph (populated by `call-graph`) as DOT/PDF
     ExportStateVariableDot(cmd::solidity::SolidityExportStateVariableDotArgs),
+}
+
+#[derive(Args)]
+pub struct StaticRustCommand {
+    #[command(subcommand)]
+    pub command: StaticRustCommands,
+}
+
+#[derive(Subcommand)]
+pub enum StaticRustCommands {
+    /// Extract Rust / Solana modules, state structs, and callables as JSON via syn AST
+    Extract(cmd::rust::ExtractRustArgs),
+
+    /// Build a static Rust / Solana callgraph AND account/state-variable read/write analysis
+    /// and write both to the project database
+    CallGraph(cmd::rust::RustCallGraphStaticArgs),
+
+    /// Export the stored Rust / Solana callgraph from the project database as DOT/PDF
+    ExportCallGraphDot(cmd::rust::RustExportCallGraphDotArgs),
+
+    /// Export the stored Rust / Solana account/state-variable read/write graph as DOT/PDF
+    ExportStateVariableDot(cmd::rust::RustExportStateVariableDotArgs),
 }
 
 // ---------------------------------------------------------------------------
@@ -418,6 +443,7 @@ impl StaticCommand {
     pub async fn run(self) -> color_eyre::Result<()> {
         match self.command {
             StaticCommands::Solidity(command) => command.run().await,
+            StaticCommands::Rust(command) => command.run().await,
         }
     }
 }
@@ -454,6 +480,18 @@ impl StaticSolidityCommand {
             StaticSolidityCommands::CallGraph(args) => args.run().await?,
             StaticSolidityCommands::ExportCallGraphDot(args) => args.run().await?,
             StaticSolidityCommands::ExportStateVariableDot(args) => args.run().await?,
+        }
+        Ok(())
+    }
+}
+
+impl StaticRustCommand {
+    pub async fn run(self) -> color_eyre::Result<()> {
+        match self.command {
+            StaticRustCommands::Extract(args) => args.run().await?,
+            StaticRustCommands::CallGraph(args) => args.run().await?,
+            StaticRustCommands::ExportCallGraphDot(args) => args.run().await?,
+            StaticRustCommands::ExportStateVariableDot(args) => args.run().await?,
         }
         Ok(())
     }

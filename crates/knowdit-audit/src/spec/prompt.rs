@@ -52,11 +52,34 @@ pub(super) fn build_regen_prompt_extension(mode: &SpecRegenMode, feedback: &str)
     }
 }
 
-pub(super) fn build_system_prompt(link: &LinkInput, source: LinkSource) -> String {
+fn apply_language_prefix(language_prompt_prefix: &str, body: String) -> String {
+    let trimmed = language_prompt_prefix.trim();
+    if trimmed.is_empty() {
+        body
+    } else {
+        format!("{trimmed}\n\n{body}")
+    }
+}
+
+fn pipeline_role_label(language_prompt_prefix: &str) -> &'static str {
+    let trimmed = language_prompt_prefix.trim();
+    if trimmed.is_empty() || trimmed.contains("**Solidity**") {
+        "Solidity smart-contract"
+    } else {
+        "smart-contract"
+    }
+}
+
+pub(super) fn build_system_prompt(
+    link: &LinkInput,
+    source: LinkSource,
+    language_prompt_prefix: &str,
+) -> String {
     let extract = &link.extract;
     let historical = &link.historical;
     let finding = &link.finding;
     let extract_functions = render_extracted_functions(&extract.functions);
+    let role_label = pipeline_role_label(language_prompt_prefix);
     // The task framing + finding-section header depend on where the finding came
     // from: a Knowledge Mapper topic hint (explore for related issues) vs an
     // externally-reported finding (validate this specific issue).
@@ -71,7 +94,7 @@ pub(super) fn build_system_prompt(link: &LinkInput, source: LinkSource) -> Strin
         ),
     };
     let mut prompt = format!(
-        r#"You are the Specification Generator agent for a knowledge-driven Solidity smart-contract auditing pipeline.
+        r#"You are the Specification Generator agent for a knowledge-driven {role_label} auditing pipeline.
 
 ## Your task
 
@@ -127,7 +150,7 @@ Use these as the primary source of truth for `setup.contracts` keys and `sequenc
         finding_exploits = link.finding_rendered_exploits.trim(),
     );
     prompt.push_str(SPEC_MODEL_AND_RULES);
-    prompt
+    apply_language_prefix(language_prompt_prefix, prompt)
 }
 
 /// Static bulk of the gen-spec system prompt - the audit-specification model,
@@ -254,10 +277,15 @@ fn bounded(text: &str, cap: usize) -> String {
 ///
 /// Only meaningful for [`LinkSource::Mapper`] — the CLI rejects pair
 /// granularity for externally-reported findings.
-pub(super) fn build_pair_system_prompt(link: &LinkInput, source: LinkSource) -> String {
+pub(super) fn build_pair_system_prompt(
+    link: &LinkInput,
+    source: LinkSource,
+    language_prompt_prefix: &str,
+) -> String {
     let extract = &link.extract;
     let historical = &link.historical;
     let extract_functions = render_extracted_functions(&extract.functions);
+    let role_label = pipeline_role_label(language_prompt_prefix);
     debug_assert!(!link.pack.is_empty(), "pair prompt requires a non-empty pack");
     let task_paragraph = match source {
         LinkSource::Mapper => "You are given ONE `(project_semantic, historical_semantic)` pair from the Knowledge Mapper together with a **pack of historical findings** — independent write-ups from other projects that the global linker attached to the same historical semantic. They are *topic hints*, drawn from other projects; they likely will not fit the current project verbatim, and several of them may restate the same underlying mechanism. **Your task is to use the whole pack as starting points to look for every plausibly related issue inside the matched project semantic, and emit `AuditSpecification`(s) describing those issues.** A committed spec only needs to be *related* to the hint that seeded it (same root-cause family, same kind of state corruption, same exploit shape, or any concrete generalization/specialization of its mechanism). It does NOT have to be a verbatim reproduction.",
@@ -303,7 +331,7 @@ pub(super) fn build_pair_system_prompt(link: &LinkInput, source: LinkSource) -> 
         prior_section.push('\n');
     }
     let mut prompt = format!(
-        r#"You are the Specification Generator agent for a knowledge-driven Solidity smart-contract auditing pipeline.
+        r#"You are the Specification Generator agent for a knowledge-driven {role_label} auditing pipeline.
 
 ## Your task
 
@@ -354,7 +382,7 @@ Use these as the primary source of truth for `setup.contracts` keys and `sequenc
         prior_section = prior_section,
     );
     prompt.push_str(SPEC_MODEL_AND_RULES);
-    prompt
+    apply_language_prefix(language_prompt_prefix, prompt)
 }
 
 /// Pair-mode user prompt: same tool choreography as [`build_user_prompt`],
@@ -456,4 +484,80 @@ fn render_extracted_functions(functions: &[ExtractedFunction]) -> String {
         ));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use knowdit_kg_model::{
+        ExtractedSemantic,
+        category::DeFiCategory,
+        db::{audit_finding, semantic_node},
+        link_strength::LinkStrength,
+    };
+    use knowdit_repo_model::MatchStrength;
+
+    fn sample_link() -> LinkInput {
+        LinkInput {
+            extract_id: 1,
+            historical_id: 2,
+            finding_id: 3,
+            strength: MatchStrength::High,
+            link_strength: LinkStrength::High,
+            extract: ExtractedSemantic {
+                name: "Vault Withdraw".to_string(),
+                category: DeFiCategory::Lending,
+                definition: "Withdraws assets".to_string(),
+                description: "Updates vault shares and transfers tokens".to_string(),
+                functions: vec![ExtractedFunction {
+                    name: "withdraw".to_string(),
+                    contract: "solana_vault".to_string(),
+                    signature: Some(
+                        "pub fn withdraw(ctx: Context<Withdraw>, shares: u64) -> Result<()>"
+                            .to_string(),
+                    ),
+                }],
+            },
+            historical: semantic_node::Model {
+                id: 2,
+                name: "Vault Share Burn".to_string(),
+                category: DeFiCategory::Lending,
+                definition: "Burns shares".to_string(),
+                description: "Burns shares and sends underlying".to_string(),
+            },
+            historical_rendered_description: "Burns shares and sends underlying".to_string(),
+            finding: audit_finding::Model {
+                id: 3,
+                title: "Missing authority check".to_string(),
+                severity: FindingSeverity::High,
+                root_cause: "No signer check".to_string(),
+                description: "Attacker drains vault".to_string(),
+                patterns: "Unsigned account".to_string(),
+                exploits: "Pass victim vault".to_string(),
+            },
+            finding_rendered_description: "Attacker drains vault".to_string(),
+            finding_rendered_patterns: "Unsigned account".to_string(),
+            finding_rendered_exploits: "Pass victim vault".to_string(),
+            pre_committed_spec_ids: Vec::new(),
+            pack: Vec::new(),
+            prior_committed_summaries: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn empty_prefix_preserves_solidity_role_and_non_solidity_prefix_prepends_cleanly() {
+        let link = sample_link();
+        let default_prompt = build_system_prompt(&link, LinkSource::Mapper, "");
+        assert!(default_prompt.starts_with(
+            "You are the Specification Generator agent for a knowledge-driven Solidity smart-contract auditing pipeline."
+        ));
+
+        let rust_prefix = "## Project source language\n\n- language: **Rust (Solana / SVM)**";
+        let rust_prompt = build_system_prompt(&link, LinkSource::Mapper, rust_prefix);
+        assert!(rust_prompt.starts_with(rust_prefix));
+        assert!(rust_prompt.contains(
+            "You are the Specification Generator agent for a knowledge-driven smart-contract auditing pipeline."
+        ));
+        assert!(!rust_prompt.contains("Solidity smart-contract auditing pipeline"));
+    }
 }

@@ -49,7 +49,10 @@ pub struct SuqenceCallStep {
 /// the project source.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuxStateVariable {
-    /// Solidity type of the variable, e.g. `uint256`, `address`.
+    /// Source-language type of the variable, e.g. `uint256` / `address`
+    /// (Solidity) or `u64` / `Pubkey` (Rust). Kept named `solidity_type`
+    /// for DB JSON backwards compatibility with aliases for non-Solidity callers.
+    #[serde(alias = "rust_type", alias = "field_type")]
     pub solidity_type: String,
     /// What this variable is for in the attack scenario.
     pub purpose: String,

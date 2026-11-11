@@ -125,8 +125,19 @@ fn number_findings(findings: &[RenderFinding]) -> (Vec<Numbered<'_>>, Vec<Number
     (body, oos)
 }
 
-/// Render the full client report from the per-canonical [`RenderFinding`]s.
+/// Render the full client report from the per-canonical [`RenderFinding`]s
+/// using the default `"solidity"` PoC code fence.
 pub fn render_markdown_report(project_name: &str, findings: &[RenderFinding]) -> String {
+    render_markdown_report_with_fence(project_name, findings, "solidity")
+}
+
+/// Language-parameterized report renderer (`code_fence` = `"solidity"`,
+/// `"rust"`, `"move"`, etc.).
+pub fn render_markdown_report_with_fence(
+    project_name: &str,
+    findings: &[RenderFinding],
+    code_fence: &str,
+) -> String {
     let (body, oos) = number_findings(findings);
 
     let mut out = String::new();
@@ -173,7 +184,7 @@ pub fn render_markdown_report(project_name: &str, findings: &[RenderFinding]) ->
         }
         let _ = writeln!(out, "---\n\n## {} severity findings\n", sev.as_str());
         for n in &in_sev {
-            render_body_finding(&mut out, n);
+            render_body_finding(&mut out, n, code_fence);
         }
     }
 
@@ -215,7 +226,7 @@ pub fn render_markdown_report(project_name: &str, findings: &[RenderFinding]) ->
     out
 }
 
-fn render_body_finding(out: &mut String, n: &Numbered<'_>) {
+fn render_body_finding(out: &mut String, n: &Numbered<'_>, code_fence: &str) {
     let f = n.finding;
     let _ = writeln!(out, "### {}: {}\n", n.id, f.title);
     let _ = writeln!(out, "**Severity:** {}\n", f.severity.as_str());
@@ -229,11 +240,33 @@ fn render_body_finding(out: &mut String, n: &Numbered<'_>) {
     if !f.poc.trim().is_empty() {
         let _ = writeln!(
             out,
-            "#### Proof of Concept\n\n```solidity\n{}\n```\n",
+            "#### Proof of Concept\n\n```{code_fence}\n{}\n```\n",
             f.poc
         );
     }
     if !f.recommendation.trim().is_empty() {
         let _ = writeln!(out, "#### Recommendation\n\n{}\n", f.recommendation);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn renders_poc_with_requested_language_fence() {
+        let findings = vec![RenderFinding {
+            canonical_id: 1,
+            severity: ReviewSeverity::High,
+            title: "Missing Signer Check".to_string(),
+            description: "Withdraw skips signer verification.".to_string(),
+            location: "programs/vault/src/lib.rs:14".to_string(),
+            impact: "Vault drained.".to_string(),
+            recommendation: "Use Signer<'info>.".to_string(),
+            poc: "#[test]\nfn exploit() {}".to_string(),
+            duplicates: Vec::new(),
+        }];
+        let md = render_markdown_report_with_fence("SolanaVault", &findings, "rust");
+        assert!(md.contains("#### Proof of Concept\n\n```rust\n#[test]\nfn exploit() {}\n```"));
     }
 }

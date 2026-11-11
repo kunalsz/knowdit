@@ -24,6 +24,7 @@ foundry-compilers-artifacts.workspace = true
 
 knowdit-repo-model.workspace = true
 knowdit-sol.workspace = true
+knowdit-rust.workspace = true
 knowdit-cg-static.workspace = true
 
 [dev-dependencies]

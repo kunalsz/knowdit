@@ -32,7 +32,9 @@ use knowdit_audit::harness::solidity::SolidityHarness;
 use knowdit_audit::reflect::agent_loop::GraderOptions;
 use knowdit_audit::reflect::review_grader::{ReviewGrader, ReviewInput};
 use knowdit_audit::report::merge::{MergeAgent, MergeInput};
-use knowdit_audit::report::render::{DuplicateBrief, RenderFinding, render_markdown_report};
+use knowdit_audit::report::render::{
+    DuplicateBrief, RenderFinding, render_markdown_report_with_fence,
+};
 use knowdit_repo_model::{
     FindingMergeDecision, LoadedReportFinding, RawFindingMember, RepoDatabase, ReportFindingSeed,
     ReviewSeverity, ReviewedFinding, SourceLanguage,
@@ -604,7 +606,14 @@ impl ReportContext {
                 render_findings.push(rf);
             }
         }
-        let markdown = render_markdown_report(&self.project_name, &render_findings);
+        let code_fence = self
+            .repo
+            .get_project_profile()
+            .await?
+            .map(|p| p.language.code_fence())
+            .unwrap_or("solidity");
+        let markdown =
+            render_markdown_report_with_fence(&self.project_name, &render_findings, code_fence);
         let report_path = self.output_folder.join("audit_report.md");
         let tmp = report_path.with_extension("md.tmp");
         std::fs::write(&tmp, markdown)

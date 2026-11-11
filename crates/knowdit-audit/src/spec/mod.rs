@@ -2113,9 +2113,9 @@ impl PlannedLinkWork {
         };
 
         let mut system_prompt = if pair_mode {
-            build_pair_system_prompt(link, options.link_source)
+            build_pair_system_prompt(link, options.link_source, &options.language_prompt_prefix)
         } else {
-            build_system_prompt(link, options.link_source)
+            build_system_prompt(link, options.link_source, &options.language_prompt_prefix)
         };
         if let Some(ext) = prompt_extension {
             system_prompt.push_str("\n\n");

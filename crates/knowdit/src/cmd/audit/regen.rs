@@ -137,7 +137,7 @@ impl RegenArgs {
             &repo,
             llm,
             &spec.name,
-            &self.harness,
+            self.harness.harness_debug_prefix.clone(),
             &self.shared,
         )
         .await?;
@@ -164,14 +164,14 @@ impl RegenArgs {
         repo: &RepoDatabase,
         llm: &LLM,
         project_name: &str,
-        harness: &HarnessSharedArgs,
+        debug_prefix: Option<String>,
         shared: &RegenSharedArgs,
     ) -> Result<RegenStats> {
         let spec_options = SpecGenOptions {
             max_agent_steps: shared.spec_regen_max_agent_steps,
             max_specs_per_link: shared.spec_regen_max_specs_per_link,
             cache_key: format!("{}-knowdit-spec-regen", project_name),
-            debug_prefix: harness.harness_debug_prefix.clone(),
+            debug_prefix,
             language_prompt_prefix: harness_backend.prompt_prefix().to_string(),
             ..SpecGenOptions::default()
         };
@@ -200,7 +200,7 @@ impl RegenArgs {
         repo: &RepoDatabase,
         llm: &LLM,
         project_name: &str,
-        harness: &HarnessSharedArgs,
+        debug_prefix: Option<String>,
         shared: &RegenSharedArgs,
         spec_ids: &[i32],
     ) -> Result<(RegenStats, Vec<i32>, Vec<i32>)> {
@@ -211,7 +211,7 @@ impl RegenArgs {
             max_agent_steps: shared.spec_regen_max_agent_steps,
             max_specs_per_link: shared.spec_regen_max_specs_per_link,
             cache_key: format!("{}-knowdit-spec-regen", project_name),
-            debug_prefix: harness.harness_debug_prefix.clone(),
+            debug_prefix,
             language_prompt_prefix: harness_backend.prompt_prefix().to_string(),
             ..SpecGenOptions::default()
         };

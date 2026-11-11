@@ -30,6 +30,7 @@ pub mod foundry;
 pub mod hardhat;
 pub mod moves;
 pub mod scope;
+pub mod solana;
 pub mod treesitter;
 
 pub use c4::{AuditMeta, AuditReportMaterial, C4PairedProjectData};
@@ -37,9 +38,14 @@ pub use data::{ProjectData, ProjectSpec, SourceLanguage};
 pub use foundry::{FoundryOptions, FoundryProject};
 pub use hardhat::{HardhatOptions, HardhatProject};
 pub use knowdit_cg_static::{StaticCallGraphResult, StorageAnalysisResult};
+pub use knowdit_rust::{
+    ExtractedRustCallable, ExtractedRustContainer, RustCallGraphResult, RustContainerKind,
+    RustProgramManifest, RustStorageResult, RustWorkspace,
+};
 pub use moves::{
     MovePlatform, MoveProjectDescriptor, MoveVulnerabilityFinding, MoveVulnerabilitySnippet,
     MoveVulnerabilitySnippetFile, list_contest_ids, list_move_projects, load_move_audit_reports,
 };
 pub use scope::{ProjectScope, ProjectScopeContent, ScopedSourceFile, read_scope_txt};
+pub use solana::{SolanaOptions, SolanaProject};
 pub use treesitter::SolidityTreesitterProject;

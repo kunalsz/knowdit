@@ -214,6 +214,9 @@ impl ProjectIndex {
     /// inherited members included).
     pub(crate) fn has_state_variable(&self, key: &str) -> bool {
         let key = key.trim();
+        if !self.lookup_state_var(key).is_empty() {
+            return true;
+        }
         match key.split_once('.') {
             Some((contract, field)) => {
                 let var_ids = self.lookup_state_var(field.trim());
@@ -227,7 +230,7 @@ impl ProjectIndex {
                         .unwrap_or(false)
                 })
             }
-            None => !self.lookup_state_var(key).is_empty(),
+            None => false,
         }
     }
 
@@ -359,7 +362,8 @@ impl ProjectIndex {
                 function.id
             ));
             if let Some(content) = &function.content {
-                out.push_str("source:\n```solidity\n");
+                let fence = Self::code_fence_for_path(&function.relative_file_path);
+                out.push_str(&format!("source:\n```{fence}\n"));
                 out.push_str(content.trim_end());
                 out.push_str("\n```\n");
             }
@@ -669,16 +673,164 @@ impl ProjectIndex {
         out
     }
 
-    /// Render a function's full Solidity signature line (including visibility,
-    /// mutability, and return types) via the tree-sitter extractor in
-    /// `knowdit-sol`. Falls back to the bare `name(args)` form when there is no
-    /// body content (interface declarations) or the source can't be parsed.
+    /// Infer the markdown code-fence tag for a source file path.
+    pub(crate) fn code_fence_for_path(path: &std::path::Path) -> &'static str {
+        match path.extension().and_then(|e| e.to_str()) {
+            Some("rs") => "rust",
+            Some("move") => "move",
+            _ => "solidity",
+        }
+    }
+
+    /// Render a function's full signature line (including visibility,
+    /// mutability/lifetimes, and return types) via `knowdit-rust` for `.rs`
+    /// files or `knowdit-sol` for Solidity files. Falls back to `name(args)`
+    /// when there is no body content or the source cannot be parsed.
     fn render_function_signature(&self, function: &Function) -> String {
-        if let Some(source) = function.content.as_deref()
-            && let Ok(Some(sig)) = knowdit_sol::signature::extract_function_signature(source)
-        {
-            return format!("`{sig}`");
+        if let Some(source) = function.content.as_deref() {
+            let extracted = if function.relative_file_path.extension().and_then(|e| e.to_str())
+                == Some("rs")
+            {
+                knowdit_rust::extract_function_signature(source)
+            } else {
+                knowdit_sol::signature::extract_function_signature(source)
+            };
+            if let Ok(Some(sig)) = extracted {
+                return format!("`{sig}`");
+            }
         }
         format!("`{}({})`", function.name, function.args)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use knowdit_repo_model::cg::{FileChunk, FileLocation};
+    use std::path::PathBuf;
+
+    #[test]
+    fn renders_rust_signatures_and_fences_in_project_index() {
+        let mut contracts = BTreeMap::new();
+        contracts.insert(
+            1,
+            Contract {
+                id: 1,
+                name: "solana_vault".to_string(),
+                relative_file_path: PathBuf::from("programs/vault/src/lib.rs"),
+                chunk: FileChunk {
+                    loc: FileLocation {
+                        start_line: 1,
+                        start_column: 0,
+                        end_line: 10,
+                        end_column: 0,
+                    },
+                    content: "pub mod solana_vault {}".to_string(),
+                },
+                functions: vec![Function {
+                    id: 1,
+                    name: "withdraw".to_string(),
+                    args: "ctx: Context<Withdraw>, amount: u64".to_string(),
+                    relative_file_path: PathBuf::from("programs/vault/src/lib.rs"),
+                    loc: FileLocation {
+                        start_line: 2,
+                        start_column: 0,
+                        end_line: 5,
+                        end_column: 0,
+                    },
+                    content: Some(
+                        "pub fn withdraw(ctx: Context<Withdraw>, amount: u64) -> Result<()> {\n    Ok(())\n}"
+                            .to_string(),
+                    ),
+                    calls: Vec::new(),
+                    description: None,
+                }],
+                description: None,
+            },
+        );
+        let index = ProjectIndex::build(
+            CallGraph {
+                contracts,
+                interfaces: BTreeMap::new(),
+            },
+            StorageGraph::default(),
+            InheritanceGraph::default(),
+        );
+        let lookup = index.render_contract_lookup(
+            index.contract(1).expect("contract 1"),
+            Some("withdraw"),
+        );
+        assert!(lookup.contains("```rust\n"));
+        let mem = index.render_contract_memory(index.contract(1).expect("contract 1"));
+        assert!(mem.contains("`pub fn withdraw(ctx: Context<Withdraw>, amount: u64) -> Result<()>`"));
+    }
+
+    #[test]
+    fn knowdit_rust_graphs_plug_directly_into_project_index_grounding() {
+        let src = r#"
+            use anchor_lang::prelude::*;
+            use anchor_spl::token::{self, TokenAccount, Transfer};
+
+            #[program]
+            pub mod solana_vault {
+                use super::*;
+                pub fn withdraw(ctx: Context<Withdraw>, amount: u64) -> Result<()> {
+                    let v = &mut ctx.accounts.vault;
+                    v.total_assets -= amount;
+                    token::transfer(
+                        CpiContext::new(
+                            ctx.accounts.token_program.to_account_info(),
+                            Transfer {
+                                from: ctx.accounts.vault_token.to_account_info(),
+                                to: ctx.accounts.user_token.to_account_info(),
+                                authority: v.to_account_info(),
+                            },
+                        ),
+                        amount,
+                    )?;
+                    Ok(())
+                }
+            }
+
+            #[account]
+            pub struct Vault {
+                pub total_assets: u64,
+            }
+
+            #[derive(Accounts)]
+            pub struct Withdraw<'info> {
+                #[account(mut)]
+                pub vault: Account<'info, Vault>,
+                #[account(mut)]
+                pub vault_token: Account<'info, TokenAccount>,
+                #[account(mut)]
+                pub user_token: Account<'info, TokenAccount>,
+                pub token_program: AccountInfo<'info>,
+            }
+        "#;
+
+        let analysis = knowdit_rust::RustStaticAnalyzer::analyze(&[knowdit_rust::RustSourceInput {
+            relative_path: PathBuf::from("programs/vault/src/lib.rs"),
+            content: src.to_string(),
+        }])
+        .expect("analyze anchor vault");
+
+        let index = ProjectIndex::build(
+            analysis.call_graph.call_graph,
+            analysis.storage.storage,
+            analysis.storage.inheritance,
+        );
+
+        assert!(index.has_contract("solana_vault"));
+        assert!(index.has_contract("Vault"));
+        assert!(index.contract_has_function("solana_vault", "withdraw"));
+        assert!(index.has_state_variable("Vault.total_assets"));
+        assert!(
+            index.has_state_variable("solana_vault.total_assets"),
+            "ContractInherit must expose Vault fields on solana_vault"
+        );
+        assert!(index.has_state_variable("solana_vault.vault_token.amount"));
+        assert!(index.has_state_variable("vault_token.amount"));
+        assert!(!index.has_state_variable("UnknownModule.total_assets"));
     }
 }
