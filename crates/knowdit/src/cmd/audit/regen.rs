@@ -26,7 +26,7 @@
 //!      crash anywhere mid-pipeline leaves zero dirty rows.
 
 use clap::Args;
-use color_eyre::eyre::{Result, WrapErr};
+use color_eyre::eyre::{Result, WrapErr, eyre};
 use knowdit_audit::harness::HarnessBackend;
 use knowdit_audit::harness::solidity::{CodegenRegenInMemory, RegenOutcome};
 use knowdit_audit::spec::{
@@ -36,14 +36,16 @@ use knowdit_audit::spec::{
 use knowdit_audit::types::AuditSpecification;
 use knowdit_repo_model::{
     LoadedSpecification, PendingReflection, ReflectionResult, RegenEventRecord, RepoDatabase,
-    repo::SpecificationRecord,
+    SourceLanguage, repo::SpecificationRecord,
 };
 use llmy::client::client::LLM;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
-use super::fuzz_common::{FuzzOptionsBuild, HarnessSharedArgs};
+use super::fuzz_common::{
+    FuzzOptionsBuild, HarnessSharedArgs, SolanaFuzzOptionsBuild, SolanaHarnessSharedArgs,
+};
 use crate::cli::{DatabaseArgs, LoadedRepoDatabase, ProjectArgs};
 
 /// Regen-only knobs (the harness backend itself lives in
@@ -106,41 +108,80 @@ pub struct RegenArgs {
     #[command(flatten)]
     pub harness: HarnessSharedArgs,
 
+    /// Solana `LiteSVM` + SBF backend knobs (`--solana-*`).
+    #[command(flatten)]
+    pub solana_harness: SolanaHarnessSharedArgs,
+
     #[command(flatten)]
     pub shared: RegenSharedArgs,
 }
 
 impl RegenArgs {
-    /// CLI entry: open the project DB, build the Solidity harness
-    /// backend, delegate to [`Self::regen`], print summary.
+    /// CLI entry: open the project DB, resolve the language harness backend
+    /// (`SolidityHarness` or `SolanaHarness`), preflight, run [`Self::regen`],
+    /// and print summary.
     pub async fn run(self, llm: &LLM) -> Result<()> {
         let LoadedRepoDatabase { spec, repo, .. } = self
             .project
             .to_repo_database(self.db.database_path.clone(), self.db.variant_render_cap)
             .await?;
-        let harness_backend = self.harness.to_solidity_harness(FuzzOptionsBuild {
-            repo_root: spec.root.clone(),
-            default_cache_key: format!("{}-knowdit-regen", spec.name),
-            max_specs: 0,
-            concurrency: self.shared.regen_concurrency.unwrap_or(1).max(1),
-            regenerate: false,
-            via_ir: self.harness.harness_via_ir,
-        })?;
-        // Preflight before the regen agent loop touches forge — same
-        // rationale as standalone fuzz.
-        harness_backend
-            .preflight(&spec.root)
-            .await
-            .wrap_err("forge environment preflight failed")?;
-        let stats = Self::regen(
-            &harness_backend,
-            &repo,
-            llm,
-            &spec.name,
-            self.harness.harness_debug_prefix.clone(),
-            &self.shared,
-        )
-        .await?;
+        let language = match repo.get_project_profile().await? {
+            Some(p) => p.language,
+            None => self.project.to_project_data().await?.language,
+        };
+        let stats = match language {
+            SourceLanguage::Solidity => {
+                let harness_backend = self.harness.to_solidity_harness(FuzzOptionsBuild {
+                    repo_root: spec.root.clone(),
+                    default_cache_key: format!("{}-knowdit-regen", spec.name),
+                    max_specs: 0,
+                    concurrency: self.shared.regen_concurrency.unwrap_or(1).max(1),
+                    regenerate: false,
+                    via_ir: self.harness.harness_via_ir,
+                })?;
+                harness_backend
+                    .preflight(&spec.root)
+                    .await
+                    .wrap_err("forge environment preflight failed")?;
+                Self::regen(
+                    &harness_backend,
+                    &repo,
+                    llm,
+                    &spec.name,
+                    self.harness.harness_debug_prefix.clone(),
+                    &self.shared,
+                )
+                .await?
+            }
+            SourceLanguage::Rust => {
+                let harness_backend = self.solana_harness.to_solana_harness(
+                    &self.harness,
+                    SolanaFuzzOptionsBuild {
+                        repo_root: spec.root.clone(),
+                        default_cache_key: format!("{}-knowdit-regen", spec.name),
+                        max_specs: 0,
+                        concurrency: self.shared.regen_concurrency.unwrap_or(1).max(1),
+                        regenerate: false,
+                    },
+                )?;
+                harness_backend
+                    .preflight(&spec.root)
+                    .await
+                    .wrap_err("Solana LiteSVM environment preflight failed")?;
+                Self::regen(
+                    &harness_backend,
+                    &repo,
+                    llm,
+                    &spec.name,
+                    self.harness.harness_debug_prefix.clone(),
+                    &self.shared,
+                )
+                .await?
+            }
+            SourceLanguage::Move => {
+                return Err(eyre!("Move target regen is not supported in this build"));
+            }
+        };
         println!(
             "Regen finished: examined={} codegen_regen={} spec_regen={} escalated_chain_depth={} skipped_no_pair={} skipped_abandoned_spec={} errors={}",
             stats.examined,

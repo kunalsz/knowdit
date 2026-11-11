@@ -152,7 +152,7 @@ impl AutoloopArgs {
         let detected_language = self.project.to_project_data().await?.language;
         if detected_language != knowdit_project::SourceLanguage::Solidity {
             return Err(eyre!(
-                "`workflow autoloop` is Solidity-only (detected {}); non-Solidity projects cannot use the Foundry autoloop.",
+                "`workflow autoloop` is Solidity-only (detected {}); use `knowdit workflow streamloop` for Rust/Solana and non-Solidity projects.",
                 detected_language.display_name(),
             ));
         }

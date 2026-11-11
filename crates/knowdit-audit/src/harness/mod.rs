@@ -16,9 +16,10 @@
 //!     `LocalCgroup` backend (Linux only).
 pub mod backend;
 #[cfg(target_os = "linux")]
-mod cgroup;
+pub(crate) mod cgroup;
 pub mod forge;
 pub mod forge_json;
+pub mod solana;
 pub mod solidity;
 
 pub use backend::HarnessBackend;

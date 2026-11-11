@@ -1,0 +1,96 @@
+# Reproducible offline-capable Solana / Anchor / LiteSVM execution image
+# Default image tag consumed by `SolanaHarness`: `lazymio/knowdit:solana`
+#
+# Build:
+#   docker build -f docker/Dockerfile.solana -t lazymio/knowdit:solana .
+
+FROM rust:1.85-bookworm
+
+ARG AGAVE_VERSION=2.1.15
+ARG ANCHOR_VERSION=0.30.1
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    CARGO_HOME=/opt/knowdit-cargo-home \
+    RUSTUP_HOME=/usr/local/rustup \
+    SOLANA_INSTALL_DIR=/opt/solana \
+    KNOWDIT_SOLANA_VENDOR=/opt/knowdit-solana-vendor
+
+ENV PATH="/opt/knowdit-cargo-home/bin:/opt/solana/active_release/bin:/usr/local/cargo/bin:${PATH}"
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        clang \
+        cmake \
+        curl \
+        git \
+        libclang-dev \
+        libssl-dev \
+        libudev-dev \
+        llvm \
+        pkg-config \
+        protobuf-compiler \
+        python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install LLVM source-based coverage support (`cargo-llvm-cov`) for Gate 2 Tier 1.
+RUN rustup component add llvm-tools-preview rustfmt clippy \
+    && cargo install --locked cargo-llvm-cov
+
+# Install Agave / Solana SBF toolchain (`cargo-build-sbf`, `solana`, SBF SDK).
+RUN sh -c "$(curl -sSfL https://release.anza.xyz/v${AGAVE_VERSION}/install)" -s - v${AGAVE_VERSION} \
+    && mkdir -p /opt/solana \
+    && cp -a /root/.local/share/solana/install/* /opt/solana/ \
+    && rm -rf /root/.local/share/solana
+
+# Install Anchor CLI for Anchor workspace prebuilds.
+RUN cargo install --git https://github.com/coral-xyz/anchor --tag v${ANCHOR_VERSION} anchor-cli --locked || true
+
+# Pre-vendor every crate needed by per-spec LiteSVM + proptest harnesses so
+# `docker run --network none` compiles completely offline.
+RUN mkdir -p /tmp/knowdit-seed-harness/src "${KNOWDIT_SOLANA_VENDOR}" "${CARGO_HOME}" \
+    && cat > /tmp/knowdit-seed-harness/Cargo.toml <<'EOF'
+[package]
+name = "knowdit-seed-harness"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+borsh = { version = "1", features = ["derive"] }
+bs58 = "0.5"
+bytemuck = { version = "1", features = ["derive"] }
+litesvm = "0.6"
+proptest = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+solana-sdk = "2.2"
+solana-program = "2.2"
+spl-associated-token-account = "6"
+spl-token = "7"
+EOF
+RUN echo "pub fn seed() {}" > /tmp/knowdit-seed-harness/src/lib.rs \
+    && cd /tmp/knowdit-seed-harness \
+    && cargo generate-lockfile \
+    && cargo vendor --locked "${KNOWDIT_SOLANA_VENDOR}" > /tmp/vendor-config.toml \
+    && cp /tmp/knowdit-seed-harness/Cargo.lock /opt/knowdit-solana-seed.lock \
+    && cat > "${CARGO_HOME}/config.toml" <<'EOF'
+[source.crates-io]
+replace-with = "vendored-sources"
+
+[source.vendored-sources]
+directory = "/opt/knowdit-solana-vendor"
+
+[net]
+offline = true
+EOF
+RUN rm -rf /tmp/knowdit-seed-harness /tmp/vendor-config.toml \
+    && groupadd -g 1000 knowdit || true \
+    && useradd -m -u 1000 -g 1000 -s /bin/bash knowdit || true \
+    && chmod -R a+rX "${CARGO_HOME}" "${KNOWDIT_SOLANA_VENDOR}" /opt/solana "${RUSTUP_HOME}" /opt/knowdit-solana-seed.lock
+
+USER 1000:1000
+WORKDIR /workspace
+ENTRYPOINT ["/usr/local/cargo/bin/cargo"]

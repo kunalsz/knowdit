@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 /// A freshly-created cgroup v2 child. Drops by killing every process
 /// inside via `cgroup.kill` then `rmdir`-ing.
 #[derive(Debug)]
-pub(super) struct ScopedCgroup {
+pub(crate) struct ScopedCgroup {
     abs_path: PathBuf,
 }
 
@@ -33,7 +33,7 @@ impl ScopedCgroup {
     /// path relative to `/sys/fs/cgroup` (e.g.
     /// `user.slice/user-1000.slice/user@1000.service/app.slice`) on
     /// success, or `None` if no usable parent was found.
-    pub(super) fn probe_parent() -> Option<String> {
+    pub(crate) fn probe_parent() -> Option<String> {
         let raw = std::fs::read_to_string("/proc/self/cgroup").ok()?;
         // cgroup v2 lines look like `0::/user.slice/.../my.scope`.
         let line = raw.lines().find(|l| l.starts_with("0::"))?;
@@ -66,7 +66,7 @@ impl ScopedCgroup {
 
     /// `parent_rel` is what [`Self::probe_parent`] returned. `name`
     /// should be unique per concurrent invocation.
-    pub(super) fn create(
+    pub(crate) fn create(
         parent_rel: &str,
         name: &str,
         mem_max_bytes: u64,
@@ -83,7 +83,7 @@ impl ScopedCgroup {
     }
 
     /// Move `pid` (and its tgid group) into this cgroup.
-    pub(super) fn add_pid(&self, pid: u32) -> std::io::Result<()> {
+    pub(crate) fn add_pid(&self, pid: u32) -> std::io::Result<()> {
         std::fs::write(
             self.abs_path.join("cgroup.procs"),
             pid.to_string().as_bytes(),

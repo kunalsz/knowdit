@@ -26,7 +26,6 @@ use std::sync::Arc;
 
 use clap::Args;
 use color_eyre::eyre::{Result, WrapErr};
-use knowdit_audit::harness::solidity::SolidityHarness;
 use knowdit_audit::reflect::GraderPair;
 use knowdit_audit::reflect::agent_loop::{CoverageSummary, GraderOptions, RunSummary};
 use knowdit_audit::reflect::coverage_audit;
@@ -35,10 +34,11 @@ use knowdit_audit::reflect::severity_grader::{SeverityInput, SeverityOutput};
 use knowdit_audit::types::AuditSpecification;
 use knowdit_repo_model::{
     CodeGenStatus, LoadedCodeGen, LoadedHarnessRun, LoadedSpecification, ReflectionRecord,
-    ReflectionResult, RepoDatabase, SourceLanguage, ValidFindingRecord,
+    ReflectionResult, RepoDatabase, ValidFindingRecord,
 };
 use llmy::client::client::LLM;
 
+use super::fuzz_common::language_prompt_prefix_for;
 use crate::cli::{DatabaseArgs, LoadedRepoDatabase, ProjectArgs};
 
 /// Knobs for the reflect phase. Long-flag names carry a
@@ -167,13 +167,7 @@ impl ReflectArgs {
                  profile phase)."
             )
         })?;
-        // Standalone CLI: Solidity-only path (see map-semantics).
-        if profile.language != SourceLanguage::Solidity {
-            return Err(color_eyre::eyre::eyre!(
-                "standalone `agentic reflect` only supports Solidity projects; use `workflow streamloop` for other languages"
-            ));
-        }
-        let language_prompt_prefix = SolidityHarness::PROMPT_PREFIX.to_string();
+        let language_prompt_prefix = language_prompt_prefix_for(profile.language)?.to_string();
         if shared.allow_redo_reflect {
             let cleared = repo.clear_reflections_for_redo().await?;
             tracing::warn!(

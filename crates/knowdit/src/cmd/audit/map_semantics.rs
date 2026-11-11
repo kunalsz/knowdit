@@ -14,13 +14,13 @@
 use clap::Args;
 use color_eyre::eyre::{Result, eyre};
 use itertools::Itertools;
-use knowdit_audit::harness::solidity::SolidityHarness;
 use knowdit_audit::mapper::{KnowledgeMapper, MapperOptions, MapperOutcome};
 use knowdit_kg::db::HistoricalDatabase;
 use knowdit_kg_model::category::DeFiCategory;
 use knowdit_repo_model::RepoDatabase;
 use llmy::client::client::LLM;
 
+use super::fuzz_common::language_prompt_prefix_for;
 use crate::cli::{DatabaseArgs, HistoricalDatabaseArgs, LoadedRepoDatabase, ProjectArgs};
 
 /// Knobs for the map-semantics phase. Long-flag names carry a
@@ -125,12 +125,20 @@ impl MapSemanticsArgs {
             .project
             .to_repo_database(self.db.database_path.clone(), self.db.variant_render_cap)
             .await?;
+        let profile = repo.get_project_profile().await?.ok_or_else(|| {
+            eyre!(
+                "Knowledge Mapper requires a ProjectProfile; run `knowdit agentic profile` for \
+                 project '{}' first (or let `workflow streamloop` run the profile phase)",
+                spec.name
+            )
+        })?;
+        let language_prefix = language_prompt_prefix_for(profile.language)?.to_string();
         let outcome = Self::map_semantics(
             &repo,
             &kg,
             llm,
             &spec.name,
-            SolidityHarness::PROMPT_PREFIX.to_string(),
+            language_prefix,
             &self.shared,
         )
         .await?;

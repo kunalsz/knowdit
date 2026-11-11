@@ -28,7 +28,6 @@ use std::sync::Arc;
 
 use clap::Args;
 use color_eyre::eyre::{Result, WrapErr};
-use knowdit_audit::harness::solidity::SolidityHarness;
 use knowdit_audit::reflect::agent_loop::GraderOptions;
 use knowdit_audit::reflect::review_grader::{ReviewGrader, ReviewInput};
 use knowdit_audit::report::merge::{MergeAgent, MergeInput};
@@ -37,7 +36,7 @@ use knowdit_audit::report::render::{
 };
 use knowdit_repo_model::{
     FindingMergeDecision, LoadedReportFinding, RawFindingMember, RepoDatabase, ReportFindingSeed,
-    ReviewSeverity, ReviewedFinding, SourceLanguage,
+    ReviewSeverity, ReviewedFinding,
 };
 use llmy::client::client::LLM;
 use serde::{Deserialize, Serialize};
@@ -45,6 +44,7 @@ use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 
 use crate::cli::{DatabaseArgs, LoadedRepoDatabase, ProjectArgs};
+use crate::cmd::audit::fuzz_common::language_prompt_prefix_for;
 use crate::cmd::workflow::utils::write_json_atomic;
 
 /// Tunables shared by the standalone command and streamloop's flag.
@@ -118,9 +118,6 @@ impl ReviewFindingsArgs {
             .to_repo_database(self.db.database_path.clone(), self.db.variant_render_cap)
             .await?;
 
-        // Standalone CLI is Solidity-only (mirrors `agentic reflect`); other
-        // languages must come through `workflow streamloop --review-findings`,
-        // which threads its own backend prompt prefix in.
         let profile = repo.get_project_profile().await?.ok_or_else(|| {
             color_eyre::eyre::eyre!(
                 "review-findings requires a ProjectProfile; run `knowdit agentic profile` for \
@@ -128,12 +125,7 @@ impl ReviewFindingsArgs {
                 spec.name
             )
         })?;
-        if profile.language != SourceLanguage::Solidity {
-            return Err(color_eyre::eyre::eyre!(
-                "standalone `workflow review-findings` only supports Solidity; use \
-                 `workflow streamloop --review-findings` for other languages"
-            ));
-        }
+        let language_prompt_prefix = language_prompt_prefix_for(profile.language)?.to_string();
 
         let scope_override = resolve_scope_override(self.shared.scope_file.as_deref())?;
         let options = self.shared.grader_options(&spec.name);
@@ -142,7 +134,7 @@ impl ReviewFindingsArgs {
             llm: llm.clone(),
             project_name: spec.name,
             repo_root: spec.root,
-            language_prompt_prefix: SolidityHarness::PROMPT_PREFIX.to_string(),
+            language_prompt_prefix,
             scope_override,
             options,
             output_folder: self.output_folder,

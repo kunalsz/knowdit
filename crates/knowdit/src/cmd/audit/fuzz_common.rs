@@ -16,9 +16,11 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use clap::Args;
-use color_eyre::eyre::Result;
+use color_eyre::eyre::{Result, eyre};
 use knowdit_audit::harness::forge::{ForgeBackend, ForgeRunner};
+use knowdit_audit::harness::solana::{SolanaBackend, SolanaFuzzOptions, SolanaHarness};
 use knowdit_audit::harness::solidity::{FuzzOptions, HarnessKind, SolidityHarness};
+use knowdit_repo_model::SourceLanguage;
 
 /// CLI mirror of [`HarnessKind`] (kebab-cased on the command line).
 /// Two-variant `clap::ValueEnum` that we map to the audit-crate enum.
@@ -294,5 +296,134 @@ impl HarnessSharedArgs {
             via_ir: build.via_ir,
             list_test_files_max_depth: self.harness_list_test_files_max_depth,
         }
+    }
+}
+
+/// Resolve the audit-phase language prompt prefix for standalone CLI commands
+/// (`map-semantics`, `gen-specs`, `reflect`, `review-findings`).
+pub fn language_prompt_prefix_for(language: SourceLanguage) -> Result<&'static str> {
+    match language {
+        SourceLanguage::Solidity => Ok(SolidityHarness::PROMPT_PREFIX),
+        SourceLanguage::Rust => Ok(SolanaHarness::PROMPT_PREFIX),
+        SourceLanguage::Move => Err(eyre!(
+            "Move target auditing is not supported in this build"
+        )),
+    }
+}
+
+/// Solana `LiteSVM` + SBF runtime knobs (`--solana-*`), flattened alongside
+/// [`HarnessSharedArgs`] in `agentic fuzz`, `agentic regen`, and
+/// `workflow streamloop` without flag collisions.
+#[derive(Args, Clone, Debug)]
+pub struct SolanaHarnessSharedArgs {
+    /// Path to a local `cargo` binary. When set, Knowdit runs `cargo test`
+    /// directly on the host (with optional cgroup v2 memory cap). When unset,
+    /// Knowdit uses `lazymio/knowdit:solana` in Docker if present locally,
+    /// otherwise resolves `cargo` from `$PATH`.
+    #[arg(long = "solana-cargo-bin")]
+    pub solana_cargo_bin: Option<PathBuf>,
+
+    /// Path to a local `cargo-build-sbf` binary used to compile missing SBF
+    /// `.so` artifacts in local mode.
+    #[arg(long = "solana-build-sbf-bin")]
+    pub solana_build_sbf_bin: Option<PathBuf>,
+
+    /// Docker image used for sandboxed offline `LiteSVM` + SBF builds.
+    #[arg(long = "solana-docker-image", default_value = "lazymio/knowdit:solana")]
+    pub solana_docker_image: String,
+
+    /// Per-invocation memory ceiling in GiB (`0` disables the ceiling).
+    #[arg(long = "solana-mem-cap-gb", default_value_t = 12)]
+    pub solana_mem_cap_gb: u64,
+
+    /// Directory where per-spec `LiteSVM` harness crates and the shared
+    /// `.knowdit-cargo-target` live (defaults to `<repo>/knowdit_solana_harness`).
+    #[arg(long = "solana-harness-dir")]
+    pub solana_harness_dir: Option<PathBuf>,
+
+    /// Hard timeout per `cargo test` / `cargo-build-sbf` subprocess (seconds).
+    #[arg(long = "solana-timeout-secs", default_value_t = 600)]
+    pub solana_timeout_secs: u64,
+
+    /// `PROPTEST_CASES` count for stateful `Handler` sequences.
+    #[arg(long = "solana-test-runs", default_value_t = 256)]
+    pub solana_test_runs: u64,
+
+    /// `PROPTEST_CASES` count for `cargo llvm-cov` coverage runs.
+    #[arg(long = "solana-coverage-runs", default_value_t = 64)]
+    pub solana_coverage_runs: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct SolanaFuzzOptionsBuild {
+    pub repo_root: PathBuf,
+    pub default_cache_key: String,
+    pub max_specs: usize,
+    pub concurrency: usize,
+    pub regenerate: bool,
+}
+
+impl SolanaHarnessSharedArgs {
+    pub fn to_solana_backend(&self) -> Result<SolanaBackend> {
+        let mem_cap_bytes =
+            (self.solana_mem_cap_gb > 0).then(|| self.solana_mem_cap_gb * 1024 * 1024 * 1024);
+        SolanaBackend::new(
+            self.solana_cargo_bin.clone(),
+            self.solana_build_sbf_bin.clone(),
+            self.solana_docker_image.clone(),
+            mem_cap_bytes,
+        )
+    }
+
+    pub fn to_solana_fuzz_options(
+        &self,
+        shared_harness: &HarnessSharedArgs,
+        build: SolanaFuzzOptionsBuild,
+    ) -> SolanaFuzzOptions {
+        let cache_key = shared_harness
+            .harness_cache_key
+            .clone()
+            .unwrap_or(build.default_cache_key);
+        let mem_cap_bytes =
+            (self.solana_mem_cap_gb > 0).then(|| self.solana_mem_cap_gb * 1024 * 1024 * 1024);
+        SolanaFuzzOptions {
+            repo_root: build.repo_root,
+            harness_dir: self
+                .solana_harness_dir
+                .clone()
+                .or_else(|| shared_harness.harness_dir.clone()),
+            cargo_bin: self.solana_cargo_bin.clone(),
+            build_sbf_bin: self.solana_build_sbf_bin.clone(),
+            docker_image: self.solana_docker_image.clone(),
+            mem_cap_bytes,
+            timeout_secs: self.solana_timeout_secs,
+            test_runs: self.solana_test_runs,
+            coverage_runs: self.solana_coverage_runs,
+            max_agent_steps: shared_harness.harness_max_agent_steps,
+            max_specs: build.max_specs,
+            concurrency: build.concurrency.max(1),
+            regenerate: build.regenerate,
+            cache_key,
+            debug_prefix: shared_harness.harness_debug_prefix.clone(),
+            llm_settings: None,
+            window_restart_threshold_tokens: shared_harness.harness_window_restart_threshold_tokens,
+            max_restarts: shared_harness.harness_max_restarts,
+            gate2_fidelity_threshold: shared_harness.gate2_fidelity_threshold,
+            list_test_files_max_depth: shared_harness.harness_list_test_files_max_depth,
+        }
+    }
+
+    pub fn to_solana_harness(
+        &self,
+        shared_harness: &HarnessSharedArgs,
+        build: SolanaFuzzOptionsBuild,
+    ) -> Result<SolanaHarness> {
+        let backend = self.to_solana_backend()?;
+        let options = self.to_solana_fuzz_options(shared_harness, build);
+        Ok(SolanaHarness::new(
+            shared_harness.harness_mode.into(),
+            options,
+            backend,
+        ))
     }
 }

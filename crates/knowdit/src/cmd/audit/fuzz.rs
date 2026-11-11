@@ -8,13 +8,15 @@
 //! `code_gen` row is already `Completed` unless `--fuzz-regenerate` is set.
 
 use clap::Args;
-use color_eyre::eyre::{Result, WrapErr};
+use color_eyre::eyre::{Result, WrapErr, eyre};
 use knowdit_audit::harness::HarnessBackend;
 use knowdit_audit::harness::solidity::FuzzOutcome;
-use knowdit_repo_model::RepoDatabase;
+use knowdit_repo_model::{RepoDatabase, SourceLanguage};
 use llmy::client::client::LLM;
 
-use super::fuzz_common::{FuzzOptionsBuild, HarnessSharedArgs};
+use super::fuzz_common::{
+    FuzzOptionsBuild, HarnessSharedArgs, SolanaFuzzOptionsBuild, SolanaHarnessSharedArgs,
+};
 use crate::cli::{DatabaseArgs, LoadedRepoDatabase, ProjectArgs};
 
 /// Fuzz-only knobs (the harness backend itself lives in
@@ -52,34 +54,65 @@ pub struct FuzzArgs {
     #[command(flatten)]
     pub harness: HarnessSharedArgs,
 
+    /// Solana `LiteSVM` + SBF backend knobs (`--solana-*`) used when
+    /// `project_metadata.profile` declares `Rust`.
+    #[command(flatten)]
+    pub solana_harness: SolanaHarnessSharedArgs,
+
     #[command(flatten)]
     pub shared: FuzzSharedArgs,
 }
 
 impl FuzzArgs {
-    /// CLI entry: open the project DB, build the Solidity harness
-    /// backend, delegate to [`Self::fuzz`], print one-line summary.
+    /// CLI entry: open the project DB, resolve the project's language backend
+    /// (`SolidityHarness` or `SolanaHarness`), preflight, run [`Self::fuzz`],
+    /// and print one-line summary.
     pub async fn run(self, llm: &LLM) -> Result<()> {
         let LoadedRepoDatabase { spec, repo, .. } = self
             .project
             .to_repo_database(self.db.database_path.clone(), self.db.variant_render_cap)
             .await?;
-        let harness_backend = self.harness.to_solidity_harness(FuzzOptionsBuild {
-            repo_root: spec.root.clone(),
-            default_cache_key: format!("{}-knowdit-fuzz", spec.name),
-            max_specs: self.shared.fuzz_max_specs,
-            concurrency: self.shared.fuzz_concurrency.unwrap_or(1).max(1),
-            regenerate: self.shared.fuzz_regenerate,
-            via_ir: self.harness.harness_via_ir,
-        })?;
-        // Preflight the forge environment before any harness-codegen
-        // agent runs, so misconfigured projects fail with forge's own
-        // error message instead of burning LLM steps.
-        harness_backend
-            .preflight(&spec.root)
-            .await
-            .wrap_err("forge environment preflight failed")?;
-        let outcome = Self::fuzz(&harness_backend, &repo, llm).await?;
+        let language = match repo.get_project_profile().await? {
+            Some(p) => p.language,
+            None => self.project.to_project_data().await?.language,
+        };
+        let outcome = match language {
+            SourceLanguage::Solidity => {
+                let harness_backend = self.harness.to_solidity_harness(FuzzOptionsBuild {
+                    repo_root: spec.root.clone(),
+                    default_cache_key: format!("{}-knowdit-fuzz", spec.name),
+                    max_specs: self.shared.fuzz_max_specs,
+                    concurrency: self.shared.fuzz_concurrency.unwrap_or(1).max(1),
+                    regenerate: self.shared.fuzz_regenerate,
+                    via_ir: self.harness.harness_via_ir,
+                })?;
+                harness_backend
+                    .preflight(&spec.root)
+                    .await
+                    .wrap_err("forge environment preflight failed")?;
+                Self::fuzz(&harness_backend, &repo, llm).await?
+            }
+            SourceLanguage::Rust => {
+                let harness_backend = self.solana_harness.to_solana_harness(
+                    &self.harness,
+                    SolanaFuzzOptionsBuild {
+                        repo_root: spec.root.clone(),
+                        default_cache_key: format!("{}-knowdit-fuzz", spec.name),
+                        max_specs: self.shared.fuzz_max_specs,
+                        concurrency: self.shared.fuzz_concurrency.unwrap_or(1).max(1),
+                        regenerate: self.shared.fuzz_regenerate,
+                    },
+                )?;
+                harness_backend
+                    .preflight(&spec.root)
+                    .await
+                    .wrap_err("Solana LiteSVM environment preflight failed")?;
+                Self::fuzz(&harness_backend, &repo, llm).await?
+            }
+            SourceLanguage::Move => {
+                return Err(eyre!("Move target fuzzing is not supported in this build"));
+            }
+        };
         println!(
             "Fuzz finished: processed={} completed={} abandoned={} error={} violated={} skipped_resumed={}",
             outcome.processed_count,

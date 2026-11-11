@@ -9,16 +9,16 @@ use std::path::PathBuf;
 
 use clap::{Args, ValueEnum};
 use color_eyre::eyre::Result;
-use knowdit_audit::harness::solidity::SolidityHarness;
 use knowdit_audit::spec::{
     LinkSource, LinkSpecSummary, SpecGenOptions, SpecGenOutcome, SpecGranularity,
     SpecificationGenerator,
 };
 use knowdit_kg_model::link_strength::LinkStrength;
-use knowdit_repo_model::{MatchStrength, RepoDatabase};
+use knowdit_repo_model::{MatchStrength, RepoDatabase, SourceLanguage};
 use llmy::client::client::LLM;
 use serde::Serialize;
 
+use super::fuzz_common::language_prompt_prefix_for;
 use crate::cli::{DatabaseArgs, LoadedRepoDatabase, ProjectArgs};
 
 /// CLI-layer mirror of the 3-tier strength tiers used by both
@@ -316,11 +316,17 @@ impl GenSpecsArgs {
             .project
             .to_repo_database(self.db.database_path.clone(), self.db.variant_render_cap)
             .await?;
+        let language = repo
+            .get_project_profile()
+            .await?
+            .map(|p| p.language)
+            .unwrap_or(SourceLanguage::Solidity);
+        let language_prefix = language_prompt_prefix_for(language)?.to_string();
         let outcome = Self::gen_specs(
             &repo,
             llm,
             &spec.name,
-            SolidityHarness::PROMPT_PREFIX.to_string(),
+            language_prefix,
             &self.shared,
         )
         .await?;

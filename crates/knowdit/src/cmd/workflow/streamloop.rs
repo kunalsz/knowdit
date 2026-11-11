@@ -61,12 +61,15 @@ use tokio::task::JoinSet;
 
 use crate::cmd::audit::extract_semantics::{ExtractSemanticsArgs, ExtractSemanticsSharedArgs};
 use crate::cmd::audit::fuzz::FuzzSharedArgs;
-use crate::cmd::audit::fuzz_common::{FuzzOptionsBuild, HarnessSharedArgs};
+use crate::cmd::audit::fuzz_common::{
+    FuzzOptionsBuild, HarnessSharedArgs, SolanaFuzzOptionsBuild, SolanaHarnessSharedArgs,
+};
 use crate::cmd::audit::gen_specs::GenSpecsSharedArgs;
 use crate::cmd::audit::map_semantics::{MapSemanticsArgs, MapSemanticsSharedArgs};
 use crate::cmd::audit::profile::{ProfileArgs, ProfileSharedArgs};
 use crate::cmd::audit::reflect::{ReflectArgs, ReflectSharedArgs};
 use crate::cmd::audit::regen::{RegenArgs, RegenSharedArgs};
+use crate::cmd::rust::{RustCallGraphStaticArgs, RustScopeCliArgs};
 use crate::cmd::solidity::SolidityCallGraphStaticArgs;
 use crate::cmd::workflow::review_findings;
 use crate::cmd::workflow::utils::write_json_atomic;
@@ -102,6 +105,12 @@ pub struct StreamloopArgs {
 
     #[command(flatten)]
     pub harness: HarnessSharedArgs,
+
+    #[command(flatten)]
+    pub solana_harness: SolanaHarnessSharedArgs,
+
+    #[command(flatten)]
+    pub rust_scope: RustScopeCliArgs,
 
     #[command(flatten)]
     pub fuzz: FuzzSharedArgs,
@@ -308,10 +317,62 @@ impl StreamloopArgs {
                 .await
             }
             SourceLanguage::Move => Err(eyre!("Move language not supported in this build")),
-            SourceLanguage::Rust => Err(eyre!(
-                "Rust/Solana target auditing is not supported in `workflow streamloop` \
-                 (only KG learning via `knowdit learn`, `knowdit workflow learn`, and `knowdit feed` is supported)"
-            )),
+            SourceLanguage::Rust => {
+                let harness_backend = self.solana_harness.to_solana_harness(
+                    &self.harness,
+                    SolanaFuzzOptionsBuild {
+                        repo_root: repo_root.clone(),
+                        default_cache_key: self
+                            .stream_fuzz_cache_key
+                            .clone()
+                            .unwrap_or_else(|| format!("{}-knowdit-fuzz", spec_name)),
+                        max_specs: 0,
+                        concurrency: self.fuzz.fuzz_concurrency.unwrap_or(1).max(1),
+                        regenerate: self.fuzz.fuzz_regenerate,
+                    },
+                )?;
+                tracing::info!("[streamloop preflight] verifying Solana LiteSVM + SBF environment");
+                harness_backend.preflight(&repo_root).await.wrap_err(
+                    "Solana LiteSVM environment preflight failed — ensure SBF `.so` artifacts \
+                     or `lazymio/knowdit:solana` / `cargo-build-sbf` are available and re-run",
+                )?;
+                tracing::info!("[streamloop preflight] Solana LiteSVM environment OK");
+
+                tracing::info!("[streamloop stage 3/8] loading call graph (Rust / Solana)");
+                let cg = repo.load_call_graph().await?;
+                if cg.contracts.is_empty() {
+                    tracing::info!(
+                        "[streamloop stage 3/8] no containers in call graph — running static Rust call-graph phase"
+                    );
+                    RustCallGraphStaticArgs::update_call_graph(
+                        &repo,
+                        &repo_root,
+                        &self.rust_scope.to_solana_options(),
+                    )
+                    .await?;
+                }
+                let cg = repo.load_call_graph().await?;
+                if cg.contracts.is_empty() {
+                    return Err(eyre!(
+                        "no available Rust modules or account structs found after call-graph rebuild"
+                    ));
+                }
+                tracing::info!(
+                    "[streamloop stage 3/8] Rust call graph ready: {} container(s)",
+                    cg.contracts.len()
+                );
+                self.run_with_backend(
+                    harness_backend,
+                    primary_llm.clone(),
+                    reflect_llm,
+                    repo,
+                    repo_root,
+                    spec_name,
+                    project_data,
+                    &kg,
+                )
+                .await
+            }
         }?;
 
         // Stamp the profile phase + run total, then write the centralized

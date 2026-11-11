@@ -532,3 +532,14 @@ impl AgenticSolidityCommand {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::KnowditCommand;
+    use clap::CommandFactory;
+
+    #[test]
+    fn cli_command_tree_has_no_flag_collisions() {
+        KnowditCommand::command().debug_assert();
+    }
+}
