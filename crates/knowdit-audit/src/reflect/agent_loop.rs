@@ -34,8 +34,6 @@ use llmy::harness::Agent;
 use serde::Serialize;
 use tokio::sync::Mutex;
 
-use crate::spec::{ProjectIndex, spec_memory_criteria};
-
 /// 80% of the model's max input tokens — same default as
 /// `SpecificationGenerator` and `SolidityFuzzGenerator`.
 pub const DEFAULT_COMPACT_RATIO: f64 = 0.8;
@@ -150,7 +148,6 @@ impl<T> AttemptHandle<T> {
 /// step-budget exhaustion bubble out as `Err` and the caller
 /// **must not** persist a row in those cases.
 pub async fn drive_agent_loop<T: Send + Sync + 'static>(
-    project_index: &Arc<ProjectIndex>,
     llm: &LLM,
     options: &GraderOptions,
     system_prompt: String,
@@ -159,7 +156,11 @@ pub async fn drive_agent_loop<T: Send + Sync + 'static>(
     tools: ToolBox,
     attempt: &AttemptHandle<T>,
 ) -> Result<usize> {
-    let memory = project_index.build_link_memory()?;
+    // No memory injection here: every drive_agent_loop caller
+    // (VerdictGrader, SeverityGrader, ReviewGrader, MergeAgent) grades from
+    // its prompt payload alone and registers no memory tools, so attaching
+    // the contract memory catalog + its 6 tool schemas only burned
+    // 8K-25K input tokens per step.
 
     let cache_key = format!("{}-{}", options.cache_key, cache_key_suffix);
     let debug_prefix = options
@@ -167,14 +168,7 @@ pub async fn drive_agent_loop<T: Send + Sync + 'static>(
         .as_ref()
         .map(|p| format!("{p}-{cache_key_suffix}"));
 
-    let mut agent = Agent::with_memory(
-        system_prompt,
-        tools,
-        cache_key,
-        &memory,
-        &spec_memory_criteria(),
-    )
-    .await;
+    let mut agent = Agent::new(system_prompt, tools, cache_key);
 
     let mut truncation = knowdit_kg::agent_retry::TruncationRetry::default();
     let mut step = truncation

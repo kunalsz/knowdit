@@ -455,7 +455,9 @@ impl SetCallSequenceTool {
                         project_step_count += 1;
                         readonly_project_step_count += 1;
                     }
-                    Some(CallableReachability::ExternalMutating | CallableReachability::Unknown) => {
+                    Some(
+                        CallableReachability::ExternalMutating | CallableReachability::Unknown,
+                    ) => {
                         project_step_count += 1;
                     }
                 }
@@ -661,7 +663,11 @@ impl CommitSpecificationTool {
                 None => {
                     return Ok(format!(
                         "error: related_finding_id is required — name the pack hint this spec relates to (valid ids: {}). Use the anchor hint id for an issue unrelated to any single hint. Draft unchanged.",
-                        self.pack_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(", ")
+                        self.pack_ids
+                            .iter()
+                            .map(|id| id.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     ));
                 }
                 Some(id) if self.pack_ids.contains(&id) => id,
@@ -669,7 +675,11 @@ impl CommitSpecificationTool {
                     return Ok(format!(
                         "error: related_finding_id={} is not a hint in this pack (valid ids: {}). Draft unchanged.",
                         id,
-                        self.pack_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(", ")
+                        self.pack_ids
+                            .iter()
+                            .map(|id| id.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     ));
                 }
             }
@@ -928,7 +938,23 @@ impl ReadFunctionSourceTool {
         let mut out = String::new();
         let mut found = false;
 
+        // Containers to search: each named contract, plus — when the contract
+        // itself declares no such function — its ancestors, so a method that
+        // is inherited (not redeclared) is still found.
+        let mut containers: Vec<(i32, Option<String>)> = Vec::new();
         for cid in self.project.lookup_contract(&args.contract) {
+            containers.push((cid, None));
+            let declares = self
+                .project
+                .contract(cid)
+                .is_some_and(|c| c.functions.iter().any(|f| f.name.to_lowercase() == target));
+            if !declares {
+                for anc in self.project.inheritance_graph.ancestors_of(cid) {
+                    containers.push((anc, Some(args.contract.clone())));
+                }
+            }
+        }
+        for (cid, inherited_by) in containers {
             if let Some(contract) = self.project.contract(cid) {
                 for f in contract
                     .functions
@@ -936,6 +962,9 @@ impl ReadFunctionSourceTool {
                     .filter(|f| f.name.to_lowercase() == target)
                 {
                     found = true;
+                    if let Some(derived) = &inherited_by {
+                        out.push_str(&format!("(inherited by `{derived}`)\n"));
+                    }
                     out.push_str(&format!(
                         "## `{}::{}({})` @ {}:{} (id={})\n",
                         contract.name,
@@ -1252,6 +1281,24 @@ mod grounding_tests {
         assert!(idx.contract_has_function("IERC20", "transfer")); // interface
         assert!(!idx.contract_has_function("Vault", "ghost"));
         assert!(!idx.contract_has_function("Ghost", "x"));
+    }
+
+    #[tokio::test]
+    async fn read_function_source_finds_inherited_method() {
+        let tool = ReadFunctionSourceTool {
+            project: project_index(),
+        };
+        // `pause` is declared on Base only; Vault inherits it.
+        let out = tool
+            .invoke(ReadFunctionSourceArgs {
+                contract: "Vault".to_string(),
+                function: "pause".to_string(),
+            })
+            .await
+            .unwrap();
+        assert!(out.contains("Base::pause"), "got: {out}");
+        assert!(out.contains("inherited by `Vault`"), "got: {out}");
+        assert!(!out.contains("no function named"), "got: {out}");
     }
 
     #[tokio::test]
@@ -1753,7 +1800,28 @@ mod grounding_tests {
                         Some("pub fn ix_deposit() {}"),
                     ),
                 ],
+                // NOT a #[program] module: even the bare `pub fn` here is a
+                // crate-internal helper, not a CPI-invocable instruction.
                 description: None,
+            },
+        );
+        contracts.insert(
+            4,
+            Contract {
+                id: 4,
+                name: "solana_program_mod".to_string(),
+                relative_file_path: PathBuf::from("programs/prog/src/entrypoints.rs"),
+                chunk: chunk(),
+                functions: vec![func_src(
+                    40,
+                    "ix_deposit",
+                    "programs/prog/src/entrypoints.rs",
+                    Some("pub fn ix_deposit(ctx: Context<IxDeposit>) -> Result<()> {}"),
+                )],
+                // The analyzer stamps #[program] modules with this exact
+                // description; `classify_rust_signature` gates instruction
+                // reachability on it.
+                description: Some("Solana #[program] entrypoint module".to_string()),
             },
         );
         let idx = Arc::new(ProjectIndex::build(
@@ -1783,17 +1851,21 @@ mod grounding_tests {
                 }],
             })
             .await?;
-        assert!(r.starts_with("error:") && r.contains("lookup_call_graph"), "{r}");
+        assert!(
+            r.starts_with("error:") && r.contains("lookup_call_graph"),
+            "{r}"
+        );
         assert!(draft.snapshot().await.sequence.is_empty());
 
-        // 2. Reject private / pub(crate) Rust functions.
-        for fn_name in ["priv_helper", "crate_helper"] {
+        // 2. Reject private / pub(crate) Rust functions, and plain-module
+        // `pub fn`s (Q-06b: only #[program]-module fns are invocable).
+        for fn_name in ["priv_helper", "crate_helper", "ix_deposit"] {
             let r = tool
                 .invoke(SetCallSequenceArgs {
                     steps: vec![CallStepArg {
                         contract: "solana_prog".to_string(),
                         function: fn_name.to_string(),
-                        intention: "bad non-pub rust".to_string(),
+                        intention: "bad non-invocable rust".to_string(),
                     }],
                 })
                 .await?;
@@ -1834,7 +1906,7 @@ mod grounding_tests {
                         intention: "mutate via inherited public".to_string(),
                     },
                     CallStepArg {
-                        contract: "solana_prog".to_string(),
+                        contract: "solana_program_mod".to_string(),
                         function: "ix_deposit".to_string(),
                         intention: "rust pub instruction".to_string(),
                     },

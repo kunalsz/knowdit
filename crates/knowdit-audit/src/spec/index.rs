@@ -52,13 +52,23 @@ impl CallableReachability {
         }
     }
 
-    pub(crate) fn classify_function(function: &Function, container_kind: ContainerKind) -> Self {
+    pub(crate) fn classify_function(
+        function: &Function,
+        container_kind: ContainerKind,
+        container_is_program_module: bool,
+    ) -> Self {
         let Some(source) = function.content.as_deref() else {
             return Self::Unknown;
         };
-        match function.relative_file_path.extension().and_then(|e| e.to_str()) {
+        match function
+            .relative_file_path
+            .extension()
+            .and_then(|e| e.to_str())
+        {
             Some("rs") => match knowdit_rust::extract_function_signature(source) {
-                Ok(Some(sig)) => Self::classify_rust_signature(&sig, container_kind),
+                Ok(Some(sig)) => {
+                    Self::classify_rust_signature(&sig, container_kind, container_is_program_module)
+                }
                 _ => Self::Unknown,
             },
             Some("move") => Self::Unknown,
@@ -69,16 +79,37 @@ impl CallableReachability {
         }
     }
 
-    fn classify_rust_signature(sig: &str, container_kind: ContainerKind) -> Self {
+    /// True when a contract container was produced from a Rust `#[program]`
+    /// module (see `RustContainerKind::ProgramModule`). Only its `pub fn`s
+    /// are CPI-invocable SBF instructions.
+    fn is_program_module_description(description: Option<&str>) -> bool {
+        description.is_some_and(|d| d.contains("#[program] entrypoint module"))
+    }
+
+    fn classify_rust_signature(
+        sig: &str,
+        container_kind: ContainerKind,
+        container_is_program_module: bool,
+    ) -> Self {
         if container_kind == ContainerKind::Interface {
             return Self::ExternalMutating;
         }
         let trimmed = sig.trim_start();
-        if let Some(after_pub) = trimmed.strip_prefix("pub")
-            && after_pub.starts_with(char::is_whitespace)
-            && !after_pub.trim_start().starts_with('(')
-        {
-            return Self::ExternalMutating;
+        let is_bare_pub_fn = trimmed.strip_prefix("pub").is_some_and(|after_pub| {
+            after_pub.starts_with(char::is_whitespace) && !after_pub.trim_start().starts_with('(')
+        });
+        if is_bare_pub_fn {
+            // A bare `pub fn` is only an SBF instruction entry when it lives
+            // in the `#[program]` module. Helper modules and impls use
+            // `pub fn` for crate-internal reuse all the time — treating
+            // those as externally invocable made Solana specs target
+            // un-invocable internal Rust functions. `pub extern` (C ABI)
+            // stays external everywhere: it is a real FFI boundary
+            // regardless of container.
+            if container_is_program_module || trimmed.starts_with("pub extern") {
+                return Self::ExternalMutating;
+            }
+            return Self::NonExternal;
         }
         Self::NonExternal
     }
@@ -92,7 +123,8 @@ impl CallableReachability {
         match keyword {
             "constructor" | "modifier" => Self::NonExternal,
             "receive" | "fallback" => {
-                let specifiers = Self::solidity_top_level_specifiers(&trimmed[leading_end..], false);
+                let specifiers =
+                    Self::solidity_top_level_specifiers(&trimmed[leading_end..], false);
                 let is_readonly = specifiers
                     .iter()
                     .any(|tok| matches!(tok.as_str(), "view" | "pure" | "constant"));
@@ -450,7 +482,8 @@ impl ProjectIndex {
     /// inherits — a function named `function` (case-insensitive).
     #[cfg(test)]
     pub(crate) fn contract_has_function(&self, contract: &str, function: &str) -> bool {
-        self.classify_sequence_callable(contract, function).is_some()
+        self.classify_sequence_callable(contract, function)
+            .is_some()
     }
 
     /// Classify `(contract, function)` across `contract`, its transitive
@@ -463,9 +496,9 @@ impl ProjectIndex {
     ) -> Option<CallableReachability> {
         let target = function.trim().to_lowercase();
         let mut combined: Option<CallableReachability> = None;
-        let mut fold_fn = |f: &Function, kind: ContainerKind| {
+        let mut fold_fn = |f: &Function, kind: ContainerKind, is_program_module: bool| {
             if f.name.to_lowercase() == target {
-                let reach = CallableReachability::classify_function(f, kind);
+                let reach = CallableReachability::classify_function(f, kind, is_program_module);
                 combined = Some(match combined {
                     Some(prev) => prev.merge_overload(reach),
                     None => reach,
@@ -475,19 +508,24 @@ impl ProjectIndex {
 
         for cid in self.lookup_contract(contract) {
             if let Some(c) = self.contract(cid) {
+                let is_program_module =
+                    CallableReachability::is_program_module_description(c.description.as_deref());
                 for f in &c.functions {
-                    fold_fn(f, ContainerKind::Contract);
+                    fold_fn(f, ContainerKind::Contract, is_program_module);
                 }
             }
             for ancestor_id in self.inheritance_graph.ancestors_of(cid) {
                 if let Some(anc) = self.contract(ancestor_id) {
+                    let anc_is_program_module = CallableReachability::is_program_module_description(
+                        anc.description.as_deref(),
+                    );
                     for f in &anc.functions {
-                        fold_fn(f, ContainerKind::Contract);
+                        fold_fn(f, ContainerKind::Contract, anc_is_program_module);
                     }
                 }
                 if let Some(iface) = self.interface(ancestor_id) {
                     for f in &iface.functions {
-                        fold_fn(f, ContainerKind::Interface);
+                        fold_fn(f, ContainerKind::Interface, false);
                     }
                 }
             }
@@ -495,7 +533,7 @@ impl ProjectIndex {
         for iid in self.lookup_interface(contract) {
             if let Some(iface) = self.interface(iid) {
                 for f in &iface.functions {
-                    fold_fn(f, ContainerKind::Interface);
+                    fold_fn(f, ContainerKind::Interface, false);
                 }
             }
         }
@@ -628,6 +666,9 @@ impl ProjectIndex {
             if Self::is_non_production_path(&contract.relative_file_path) {
                 continue;
             }
+            let is_program_module = CallableReachability::is_program_module_description(
+                contract.description.as_deref(),
+            );
             for function in &contract.functions {
                 if Self::is_non_production_path(&function.relative_file_path) {
                     continue;
@@ -635,8 +676,11 @@ impl ProjectIndex {
                 if !stateful_fn_ids.contains(&function.id) {
                     continue;
                 }
-                if CallableReachability::classify_function(function, ContainerKind::Contract)
-                    != CallableReachability::ExternalMutating
+                if CallableReachability::classify_function(
+                    function,
+                    ContainerKind::Contract,
+                    is_program_module,
+                ) != CallableReachability::ExternalMutating
                 {
                     continue;
                 }
@@ -668,11 +712,7 @@ impl ProjectIndex {
         for sem in semantics {
             for func in &sem.functions {
                 let raw_name = func.name.trim();
-                let bare_name = raw_name
-                    .split('(')
-                    .next()
-                    .unwrap_or(raw_name)
-                    .trim();
+                let bare_name = raw_name.split('(').next().unwrap_or(raw_name).trim();
                 if bare_name.is_empty() {
                     continue;
                 }
@@ -683,10 +723,8 @@ impl ProjectIndex {
                     .rsplit_once("::")
                     .or_else(|| bare_name.split_once('.'))
                 {
-                    covered_pairs.insert((
-                        qual_c.trim().to_lowercase(),
-                        qual_f.trim().to_lowercase(),
-                    ));
+                    covered_pairs
+                        .insert((qual_c.trim().to_lowercase(), qual_f.trim().to_lowercase()));
                 } else {
                     covered_unqualified.insert(bare_name.to_lowercase());
                 }
@@ -776,7 +814,10 @@ impl ProjectIndex {
 
     fn extract_clean_signature(&self, function: &Function) -> String {
         if let Some(source) = function.content.as_deref() {
-            let extracted = if function.relative_file_path.extension().and_then(|e| e.to_str())
+            let extracted = if function
+                .relative_file_path
+                .extension()
+                .and_then(|e| e.to_str())
                 == Some("rs")
             {
                 knowdit_rust::extract_function_signature(source)
@@ -1271,13 +1312,13 @@ mod tests {
             StorageGraph::default(),
             InheritanceGraph::default(),
         );
-        let lookup = index.render_contract_lookup(
-            index.contract(1).expect("contract 1"),
-            Some("withdraw"),
-        );
+        let lookup =
+            index.render_contract_lookup(index.contract(1).expect("contract 1"), Some("withdraw"));
         assert!(lookup.contains("```rust\n"));
         let mem = index.render_contract_memory(index.contract(1).expect("contract 1"));
-        assert!(mem.contains("`pub fn withdraw(ctx: Context<Withdraw>, amount: u64) -> Result<()>`"));
+        assert!(
+            mem.contains("`pub fn withdraw(ctx: Context<Withdraw>, amount: u64) -> Result<()>`")
+        );
     }
 
     #[test]
@@ -1324,11 +1365,12 @@ mod tests {
             }
         "#;
 
-        let analysis = knowdit_rust::RustStaticAnalyzer::analyze(&[knowdit_rust::RustSourceInput {
-            relative_path: PathBuf::from("programs/vault/src/lib.rs"),
-            content: src.to_string(),
-        }])
-        .expect("analyze anchor vault");
+        let analysis =
+            knowdit_rust::RustStaticAnalyzer::analyze(&[knowdit_rust::RustSourceInput {
+                relative_path: PathBuf::from("programs/vault/src/lib.rs"),
+                content: src.to_string(),
+            }])
+            .expect("analyze anchor vault");
 
         let index = ProjectIndex::build(
             analysis.call_graph.call_graph,
@@ -1360,16 +1402,19 @@ mod tests {
             end_line: 3,
             end_column: 0,
         };
-        let sol_fn = |id: i32, name: &str, path: &str, content: Option<&str>, calls: Vec<FunctionCall>| Function {
-            id,
-            name: name.to_string(),
-            args: String::new(),
-            relative_file_path: PathBuf::from(path),
-            loc,
-            content: content.map(str::to_string),
-            calls,
-            description: None,
-        };
+        let sol_fn =
+            |id: i32, name: &str, path: &str, content: Option<&str>, calls: Vec<FunctionCall>| {
+                Function {
+                    id,
+                    name: name.to_string(),
+                    args: String::new(),
+                    relative_file_path: PathBuf::from(path),
+                    loc,
+                    content: content.map(str::to_string),
+                    calls,
+                    description: None,
+                }
+            };
 
         // Contract 1: BaseVault with public mutating `withdraw` + internal `_accrue` (writes state var 1).
         // Contract 2: Vault inherits BaseVault, has external `deposit` -> calls `_accrue`,
@@ -1543,7 +1588,46 @@ mod tests {
                         Vec::new(),
                     ),
                 ],
+                // NOT a #[program] module: its bare `pub fn`s are internal
+                // helpers, not CPI-invocable SBF instructions.
                 description: None,
+            },
+        );
+        contracts.insert(
+            5,
+            Contract {
+                id: 5,
+                name: "rust_program_mod".to_string(),
+                relative_file_path: PathBuf::from("programs/prog/src/entrypoints.rs"),
+                chunk: FileChunk {
+                    loc,
+                    content: String::new(),
+                },
+                functions: vec![
+                    sol_fn(
+                        50,
+                        "deposit",
+                        "programs/prog/src/entrypoints.rs",
+                        Some("pub fn deposit(ctx: Context<Deposit>, amt: u64) -> Result<()> { Self::apply(&mut ctx.accounts.vault, amt); Ok(()) }"),
+                        vec![FunctionCall {
+                            id: 6,
+                            from_id: 50,
+                            to_id: 51,
+                            description: None,
+                        }],
+                    ),
+                    sol_fn(
+                        51,
+                        "apply",
+                        "programs/prog/src/entrypoints.rs",
+                        Some("fn apply(vault: &mut u64, amt: u64) {}"),
+                        Vec::new(),
+                    ),
+                ],
+                // The analyzer stamps #[program] modules with this exact
+                // description; `classify_rust_signature` uses it to gate
+                // which `pub fn`s count as CPI-invocable instructions.
+                description: Some("Solana #[program] entrypoint module".to_string()),
             },
         );
 
@@ -1575,6 +1659,12 @@ mod tests {
                 },
                 FunctionStateVariable {
                     function_id: 41,
+                    state_variable_id: 1,
+                    is_write: true,
+                    description: None,
+                },
+                FunctionStateVariable {
+                    function_id: 51,
                     state_variable_id: 1,
                     is_write: true,
                     description: None,
@@ -1633,9 +1723,11 @@ mod tests {
             index.classify_sequence_callable("Vault", "noBody"),
             Some(CallableReachability::Unknown)
         );
+        // Plain-module `pub fn`s are internal helpers, NOT SBF instructions
+        // (Q-06b): they are only CPI-invocable from the #[program] module.
         assert_eq!(
             index.classify_sequence_callable("rust_prog", "execute"),
-            Some(CallableReachability::ExternalMutating)
+            Some(CallableReachability::NonExternal)
         );
         assert_eq!(
             index.classify_sequence_callable("rust_prog", "crate_helper"),
@@ -1645,9 +1737,20 @@ mod tests {
             index.classify_sequence_callable("rust_prog", "priv_helper"),
             Some(CallableReachability::NonExternal)
         );
+        // Inside the #[program] module the `pub fn` IS an instruction entry.
+        assert_eq!(
+            index.classify_sequence_callable("rust_program_mod", "deposit"),
+            Some(CallableReachability::ExternalMutating)
+        );
+        assert_eq!(
+            index.classify_sequence_callable("rust_program_mod", "apply"),
+            Some(CallableReachability::NonExternal)
+        );
 
-        // Stateful external entrypoints: BaseVault.withdraw, Vault.deposit, Vault.receive, rust_prog.execute
-        // (excludes internal/view/constructor/modifier/Unknown and src/mocks/MockVault.sol).
+        // Stateful external entrypoints: BaseVault.withdraw, Vault.deposit,
+        // Vault.receive, rust_program_mod.deposit (excludes
+        // internal/view/constructor/modifier/Unknown, plain-module Rust
+        // helpers, and src/mocks/MockVault.sol).
         let entrypoints = index.stateful_external_entrypoints();
         let names: Vec<(String, String)> = entrypoints
             .iter()
@@ -1659,10 +1762,17 @@ mod tests {
                 ("BaseVault".to_string(), "withdraw".to_string()),
                 ("Vault".to_string(), "deposit".to_string()),
                 ("Vault".to_string(), "receive".to_string()),
-                ("rust_prog".to_string(), "execute".to_string()),
+                ("rust_program_mod".to_string(), "deposit".to_string()),
             ]
         );
-        assert_eq!(entrypoints[1].written_state_vars, vec!["assets".to_string()]);
+        assert_eq!(
+            entrypoints[1].written_state_vars,
+            vec!["assets".to_string()]
+        );
+        assert_eq!(
+            entrypoints[3].written_state_vars,
+            vec!["assets".to_string()]
+        );
 
         // Inheritance-aware coverage: covering `Vault.withdraw` covers `BaseVault.withdraw` too!
         let semantics = vec![ExtractedSemantic {
@@ -1686,7 +1796,7 @@ mod tests {
             vec![
                 ("Vault".to_string(), "deposit".to_string()),
                 ("Vault".to_string(), "receive".to_string()),
-                ("rust_prog".to_string(), "execute".to_string()),
+                ("rust_program_mod".to_string(), "deposit".to_string()),
             ]
         );
     }

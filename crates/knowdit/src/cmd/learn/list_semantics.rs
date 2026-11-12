@@ -29,7 +29,7 @@ impl ListSemanticsArgs {
                 println!("  Definition: {}", node.definition);
                 println!(
                     "  Description: {}",
-                    &node.description[..node.description.len().min(200)]
+                    truncate_utf8_safe(&node.description, 200)
                 );
                 if !funcs.is_empty() {
                     println!("  Functions:");
@@ -42,4 +42,18 @@ impl ListSemanticsArgs {
         }
         Ok(())
     }
+}
+
+/// UTF-8-safe prefix cut. Byte-slicing `&s[..min(len, max)]` panics when the
+/// cut lands inside a multi-byte char — KG descriptions routinely carry
+/// em-dashes / arrows / CJK.
+fn truncate_utf8_safe(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }

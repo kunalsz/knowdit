@@ -59,11 +59,17 @@ pub const DEFAULT_MAX_TRUNCATION_RETRIES: usize = 3;
 /// Phrased as an observation plus an instruction, and deliberately explicit
 /// that nothing was executed — the model must not assume its partial tool call
 /// took effect.
+///
+/// The bound is a small BATCH of tool calls per turn, not a single call:
+/// "at most one" turned one truncated 100+-call batch into 100+ sequential
+/// turns, each re-paying the full input tokens (a ~100x cost amplification).
+/// Emitting ~10-15 concise calls per turn halves the per-turn payload and
+/// drains a large batch in a handful of turns.
 pub const TRUNCATION_NUDGE: &str = "Your previous response was cut off because it exceeded the \
      provider's maximum output length for a single response, so NOTHING from it was executed or \
-     recorded. Retry now and keep the response substantially shorter: put any long explanation or \
-     memory content into a separate, later tool call, emit at most one tool call this turn, and \
-     continue the task from exactly where you left off.";
+     recorded. Retry now: emit the next 10-15 tool calls this turn, keeping each tool call and \
+     any explanation concise; put long content into a separate, later turn. Prioritize the most \
+     important calls first and continue the task from exactly where you left off.";
 
 /// User-role nudge appended after a provider returned no choice at all.
 ///
@@ -129,15 +135,13 @@ pub fn is_transient_transport(err: &LLMYError) -> bool {
     match err {
         // A billing cap, filtered response or bad tool call is deterministic:
         // retrying only burns budget.
-        LLMYError::Billing { .. }
-        | LLMYError::Filtered(_)
-        | LLMYError::IncorrectToolCall(..) => false,
+        LLMYError::Billing { .. } | LLMYError::Filtered(_) | LLMYError::IncorrectToolCall(..) => {
+            false
+        }
         LLMYError::IO(_) => true,
         _ => {
             let text = err.to_string().to_lowercase();
-            TRANSIENT_TRANSPORT_NEEDLES
-                .iter()
-                .any(|n| text.contains(n))
+            TRANSIENT_TRANSPORT_NEEDLES.iter().any(|n| text.contains(n))
         }
     }
 }
@@ -162,8 +166,7 @@ pub fn is_transient_transport(err: &LLMYError) -> bool {
 /// Callers still use [`is_output_length`] to tell "output cap exhausted" apart
 /// from other failures when they abandon gracefully.
 pub fn is_retryable(err: &LLMYError) -> bool {
-    matches!(err, LLMYError::OutputLength | LLMYError::EmptyChoice)
-        || is_transient_transport(err)
+    matches!(err, LLMYError::OutputLength | LLMYError::EmptyChoice) || is_transient_transport(err)
 }
 
 /// The nudge to append for a given retryable error. Truncation, empty-choice
@@ -203,12 +206,12 @@ fn transport_backoff(consecutive: usize) -> Option<std::time::Duration> {
 /// them chasing the wrong fix.
 pub fn exhaustion_reason(err: &LLMYError, consecutive: usize) -> String {
     match err {
-        LLMYError::EmptyChoice => format!(
-            "provider returned an empty choice {consecutive} times in a row"
-        ),
-        LLMYError::OutputLength => format!(
-            "response truncated by the provider output cap {consecutive} times in a row"
-        ),
+        LLMYError::EmptyChoice => {
+            format!("provider returned an empty choice {consecutive} times in a row")
+        }
+        LLMYError::OutputLength => {
+            format!("response truncated by the provider output cap {consecutive} times in a row")
+        }
         // A transport failure says nothing about the output cap — reporting it
         // as truncation would send the operator to `--llm-max-completion-tokens`
         // when the provider gateway is actually down.
@@ -303,8 +306,8 @@ impl TruncationRetry {
                     // Transport failures get a delay before the re-issue (the
                     // upstream is briefly unavailable); truncation/empty-choice
                     // retry immediately, since those are sampling problems.
-                    if let Some(delay) = transport_backoff(self.consecutive)
-                        .filter(|_| is_transient_transport(&err))
+                    if let Some(delay) =
+                        transport_backoff(self.consecutive).filter(|_| is_transient_transport(&err))
                     {
                         tracing::warn!(
                             "agent step failed with a transient transport error ({}/{} \
@@ -353,8 +356,8 @@ impl TruncationRetry {
                 if self.record_failure().is_err() {
                     return Err(err);
                 }
-                if let Some(delay) = transport_backoff(self.consecutive)
-                    .filter(|_| is_transient_transport(&err))
+                if let Some(delay) =
+                    transport_backoff(self.consecutive).filter(|_| is_transient_transport(&err))
                 {
                     tracing::warn!(
                         "agent's first step failed with a transient transport error ({}/{} \
@@ -511,13 +514,17 @@ mod tests {
     /// Deterministic verdicts must NOT be retried — retrying only burns budget.
     #[test]
     fn deterministic_failures_are_not_transport() {
-        assert!(!is_transient_transport(&LLMYError::Filtered("policy".into())));
+        assert!(!is_transient_transport(&LLMYError::Filtered(
+            "policy".into()
+        )));
         assert!(!is_transient_transport(&LLMYError::OutputLength));
         assert!(!is_transient_transport(&LLMYError::EmptyChoice));
         // A model-not-found is a config error, not a blip.
-        assert!(!TRANSIENT_TRANSPORT_NEEDLES
-            .iter()
-            .any(|n| "model 'x' is not supported".contains(n)));
+        assert!(
+            !TRANSIENT_TRANSPORT_NEEDLES
+                .iter()
+                .any(|n| "model 'x' is not supported".contains(n))
+        );
     }
 
     /// Transport retries back off (the upstream is briefly unavailable);
@@ -525,12 +532,27 @@ mod tests {
     #[test]
     fn transport_backoff_grows_then_caps() {
         assert_eq!(transport_backoff(0), None);
-        assert_eq!(transport_backoff(1), Some(std::time::Duration::from_secs(2)));
-        assert_eq!(transport_backoff(2), Some(std::time::Duration::from_secs(4)));
-        assert_eq!(transport_backoff(3), Some(std::time::Duration::from_secs(8)));
-        assert_eq!(transport_backoff(4), Some(std::time::Duration::from_secs(16)));
+        assert_eq!(
+            transport_backoff(1),
+            Some(std::time::Duration::from_secs(2))
+        );
+        assert_eq!(
+            transport_backoff(2),
+            Some(std::time::Duration::from_secs(4))
+        );
+        assert_eq!(
+            transport_backoff(3),
+            Some(std::time::Duration::from_secs(8))
+        );
+        assert_eq!(
+            transport_backoff(4),
+            Some(std::time::Duration::from_secs(16))
+        );
         // Held at the cap rather than growing without bound.
-        assert_eq!(transport_backoff(9), Some(std::time::Duration::from_secs(16)));
+        assert_eq!(
+            transport_backoff(9),
+            Some(std::time::Duration::from_secs(16))
+        );
     }
 
     /// Telling the model to shorten its response after a transport failure
@@ -559,6 +581,10 @@ mod tests {
     fn nudge_tells_the_model_nothing_executed() {
         // The model must not assume its truncated tool call took effect.
         assert!(TRUNCATION_NUDGE.contains("NOTHING"));
-        assert!(TRUNCATION_NUDGE.contains("shorter"));
+        // The retry asks for a bounded BATCH of calls per turn, never
+        // "one tool call" — that turned a single truncation into 100+
+        // sequential round-trips (C-02).
+        assert!(TRUNCATION_NUDGE.contains("10-15 tool calls"));
+        assert!(!TRUNCATION_NUDGE.contains("at most one tool call"));
     }
 }

@@ -53,11 +53,18 @@ Synthesize ONE Solidity test file containing a single
 **deterministically reproduces the attack** described by
 `spec.sequence`. There is NO Foundry handler, NO `invariant_…`
 function, NO fuzzer. You drive every step yourself, then assert
-post_attack reachability with the magic-prefix `require`:
+that the post-attack state must NOT be reachable with the
+magic-prefix `require`:
 
 ```solidity
-require(<post_attack_condition>, "{marker} <one-line why this means the bug>");
+require(!<post_attack_condition>, "{marker} <one-line why this means the bug>");
 ```
+
+POLARITY MATTERS: `require` asserts the property that holds on a
+SAFE contract. If the attack reproduces, the condition is false,
+the `require` REVERTS — and the revert carries the marker, which
+is exactly how the orchestrator records the violation. On a safe
+contract the require holds and the test passes (exit 0, no marker).
 
 The orchestrator recognises this exact prefix as a real PoC
 violation (distinct from a random revert). Without the prefix
@@ -149,8 +156,11 @@ contract Test_{spec_id} is Test {{
         //
         // After the last sequence call, evaluate post_attack:
         bool post_attack_reached = /* compute from spec.post_attack */;
+        // Assert the SAFE property: `!post_attack_reached` holds on a
+        // safe contract (test passes). If the attack reproduced, this
+        // reverts WITH the marker → orchestrator records the violation.
         require(
-            post_attack_reached,
+            !post_attack_reached,
             "{marker} <one-line: what was supposed to hold and what is broken>"
         );
     }}
@@ -175,9 +185,13 @@ contract Test_{spec_id} is Test {{
    you must issue, in order, with the contract/function/caller as
    named. Don't drop steps — fix the harness instead.
 
-5. **The post_attack assertion is your gate.** Pick a condition
-   derived directly from `spec.post_attack`:
-   - "balance drained": `require(victim.balance() < expected_min, "{marker} drained ...");`
+5. **The post_attack assertion is your gate — polarity matters.**
+   `require(<safe_condition>, "{marker} …")` must assert the property
+   that holds on a SAFE contract: the require then reverts — carrying
+   the marker — exactly when the attack reproduced, and the test passes
+   on a safe contract. Pick the safe condition directly from
+   `spec.post_attack`:
+   - "balance drained": `require(victim.balance() >= expected_min, "{marker} drained ...");`
    - "invariant broken": `require(invariant_holds(), "{marker} invariant ... broke");`
    - "unauthorized access": `require(!auth_check(), "{marker} unauthorized ... succeeded");`
    The free-form reason after the prefix is the one-liner the reflect
@@ -203,9 +217,11 @@ contract Test_{spec_id} is Test {{
 - The PoC entry point MUST start with `test_` and MUST NOT start
   with `invariant_` (that would route through the fuzzer).
 - The post-attack assertion MUST use exactly
-  `require(<cond>, "{marker} <reason>")`. Use this prefix ONLY for
-  the post-attack assertion — other reverts in your test should use
-  distinct messages.
+  `require(<safe_condition>, "{marker} <reason>")` where
+  `<safe_condition>` holds on a safe contract (so the marker-bearing
+  revert fires only when the attack reproduced). Use this prefix ONLY
+  for the post-attack assertion — other reverts in your test should
+  use distinct messages.
 - All imports MUST use the project's remappings — never `../contracts/...`.
 - Don't declare "done" in chat. The orchestrator decides when to stop.
 - Harness is written to: `{harness_dir}` (absolute path on disk).

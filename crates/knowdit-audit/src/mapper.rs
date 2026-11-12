@@ -272,8 +272,17 @@ impl KnowledgeMapper {
         dedup_keep_strongest(&mut matches);
 
         // Pass 2: widen to remaining categories for any extracts still
-        // unmatched after pass 1.
-        let pass1_matched_ids: BTreeSet<i32> = matches.iter().map(|m| m.extract_id).collect();
+        // unmatched after pass 1. "Unmatched" means lacking a High/Medium
+        // edge: the forced per-candidate emit contract has the model emit a
+        // Low row for every (extract, historical) pair it saw, so counting
+        // any match row would mark every extract matched and this widening
+        // would be dead code — while Low-only extracts are dropped
+        // downstream by gen-specs.
+        let pass1_matched_ids: BTreeSet<i32> = matches
+            .iter()
+            .filter(|m| matches!(m.strength, MatchStrength::High | MatchStrength::Medium))
+            .map(|m| m.extract_id)
+            .collect();
         let unmatched_after_pass1: Vec<(i32, &ExtractedSemantic)> = extracted_with_id
             .iter()
             .filter(|(id, _)| !pass1_matched_ids.contains(id))
@@ -616,7 +625,8 @@ async fn run_one_batch(
         secondary_categories,
     );
 
-    let response: MatchResponse = prompt_match_response(llm, system_prompt, &user_prompt, cache_key, label).await?;
+    let response: MatchResponse =
+        prompt_match_response(llm, system_prompt, &user_prompt, cache_key, label).await?;
 
     let valid_historical_ids: BTreeSet<i32> = batch.iter().map(|c| c.canonical.id).collect();
 
@@ -793,8 +803,8 @@ async fn prompt_match_response(
 
         // The model sometimes wraps the object in a ```json fence even
         // though the prompt asks for bare JSON.
-        let body = llmy::client::filters::strip_markdown_fence(&body)
-            .unwrap_or_else(|| body.clone());
+        let body =
+            llmy::client::filters::strip_markdown_fence(&body).unwrap_or_else(|| body.clone());
         let entries = salvage_match_entries(&repair_match_json(&body));
 
         if entries.is_empty() {
@@ -803,7 +813,10 @@ async fn prompt_match_response(
             // candidate for one retry — but if the model insists on
             // returning nothing, the right outcome is an empty match set
             // plus a loud warning, not aborting a multi-hour pass.
-            last_err = Some(format!("response yielded no match entries ({} chars)", body.len()));
+            last_err = Some(format!(
+                "response yielded no match entries ({} chars)",
+                body.len()
+            ));
             if body.len() > UNUSABLE_DUMP_MAX_CHARS {
                 let dump = std::env::temp_dir().join(format!(
                     "knowdit-mapper-unparseable-{}.txt",
@@ -846,7 +859,9 @@ async fn prompt_match_response(
             "{label}: model returned no match entries on {NETWORK_RETRY_ATTEMPTS} \
              consecutive attempts; continuing with an empty match set"
         );
-        return Ok(MatchResponse { matches: Vec::new() });
+        return Ok(MatchResponse {
+            matches: Vec::new(),
+        });
     }
     Err(color_eyre::eyre::eyre!(
         "mapper request failed after {NETWORK_RETRY_ATTEMPTS} attempts: {}",
@@ -951,9 +966,25 @@ fn repair_match_json(body: &str) -> String {
     while i < bytes.len() {
         let c = bytes[i];
 
+        // Multi-byte UTF-8: copy the whole char verbatim. Every structural
+        // character this scanner reasons about is ASCII, and UTF-8
+        // continuation bytes (>= 0x80) can never collide with them, so
+        // decoding at a byte offset here is boundary-safe. Pushing the raw
+        // byte as a char instead turns every —/→/≥ in evidence text into
+        // Latin-1 mojibake that then corrupts semantic_matched rows.
+        if c >= 0x80 {
+            let ch = body[i..].chars().next().expect("utf-8 lead byte decodes");
+            out.push(ch);
+            i += ch.len_utf8();
+            continue;
+        }
+
         if in_string {
             // Inside a string: copy verbatim until the closing quote.
-            if c == b'\\' && i + 1 < bytes.len() {
+            // JSON escape sequences are ASCII; slicing two bytes only when
+            // the escaped byte is ASCII avoids a char-boundary panic when
+            // a `\` happens to precede a multi-byte char.
+            if c == b'\\' && i + 1 < bytes.len() && bytes[i + 1].is_ascii() {
                 out.push_str(&body[i..i + 2]);
                 i += 2;
                 continue;
@@ -969,13 +1000,10 @@ fn repair_match_json(body: &str) -> String {
         // Outside a string. A key starts at `"` or, when the model has
         // dropped the opening quote, at a bare `{`/`,` followed by a key.
         let starts_bare = c == b'{' || c == b',';
-        let key_start =
-            (c == b'"' || (starts_bare && i + 1 < bytes.len())).then_some(i + 1);
+        let key_start = (c == b'"' || (starts_bare && i + 1 < bytes.len())).then_some(i + 1);
 
         if let Some(start) = key_start
-            && let Some(kw) = KEYS
-                .iter()
-                .find(|kw| body[start..].starts_with(*kw))
+            && let Some(kw) = KEYS.iter().find(|kw| body[start..].starts_with(*kw))
         {
             let after = start + kw.len();
             let rest = &body[after..];
@@ -1071,7 +1099,10 @@ fn neutralise_stray_quotes(body: &str) -> String {
             rest = after;
             continue;
         };
-        let digits: String = after_colon.chars().take_while(|c| c.is_ascii_digit()).collect();
+        let digits: String = after_colon
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
         if digits.is_empty() {
             out.push('"');
             rest = after;
@@ -1362,17 +1393,25 @@ mod tests {
     fn repairs_key_typos_model_emits_in_long_responses() {
         let cases = [
             // `=` separator with the closing quote dropped.
-            (r#"{"matches":[{"extract_id":3,"historical_id=24,"strength":"Low","evidence":"x"}]}"#,
-             r#"{"matches":[{"extract_id":3,"historical_id":24,"strength":"Low","evidence":"x"}]}"#),
+            (
+                r#"{"matches":[{"extract_id":3,"historical_id=24,"strength":"Low","evidence":"x"}]}"#,
+                r#"{"matches":[{"extract_id":3,"historical_id":24,"strength":"Low","evidence":"x"}]}"#,
+            ),
             // `=` separator with both quotes dropped.
-            (r#"{"matches":[{"extract_id=3,"historical_id":24,"strength":"Low","evidence":"x"}]}"#,
-             r#"{"matches":[{"extract_id":3,"historical_id":24,"strength":"Low","evidence":"x"}]}"#),
+            (
+                r#"{"matches":[{"extract_id=3,"historical_id":24,"strength":"Low","evidence":"x"}]}"#,
+                r#"{"matches":[{"extract_id":3,"historical_id":24,"strength":"Low","evidence":"x"}]}"#,
+            ),
             // Closing quote dropped before the colon.
-            (r#"{"matches":[{"extract_id":27,"historical_id:15,"strength":"Low","evidence":"x"}]}"#,
-             r#"{"matches":[{"extract_id":27,"historical_id":15,"strength":"Low","evidence":"x"}]}"#),
+            (
+                r#"{"matches":[{"extract_id":27,"historical_id:15,"strength":"Low","evidence":"x"}]}"#,
+                r#"{"matches":[{"extract_id":27,"historical_id":15,"strength":"Low","evidence":"x"}]}"#,
+            ),
             // Opening quote dropped on the first key of an object.
-            (r#"{"matches":[{extract_id=3,"historical_id":24,"strength":"Low","evidence":"x"}]}"#,
-             r#"{"matches":[{"extract_id":3,"historical_id":24,"strength":"Low","evidence":"x"}]}"#),
+            (
+                r#"{"matches":[{extract_id=3,"historical_id":24,"strength":"Low","evidence":"x"}]}"#,
+                r#"{"matches":[{"extract_id":3,"historical_id":24,"strength":"Low","evidence":"x"}]}"#,
+            ),
         ];
         for (input, expected) in cases {
             assert_eq!(repair_match_json(input), expected, "input: {input}");
@@ -1403,8 +1442,24 @@ mod tests {
     /// Valid JSON must pass through byte-identical.
     #[test]
     fn repair_is_identity_on_valid_json() {
-        let input = r#"{"matches":[{"extract_id":1,"historical_id":2,"strength":"Low","evidence":"e"}]}"#;
+        let input =
+            r#"{"matches":[{"extract_id":1,"historical_id":2,"strength":"Low","evidence":"e"}]}"#;
         assert_eq!(repair_match_json(input), input);
+    }
+
+    #[test]
+    fn repair_match_json_preserves_multibyte_utf8() {
+        let body = r#"{"matches":[{"extract_id":1,"historical_id":2,"strength":"Low","evidence":"caps — fee → 5% ≥ x"}]}"#;
+        let out = repair_match_json(body);
+        assert!(out.contains("caps — fee → 5% ≥ x"), "mojibake: {out}");
+        assert!(serde_json::from_str::<serde_json::Value>(&out).is_ok());
+    }
+
+    #[test]
+    fn repair_match_json_backslash_before_multibyte_char_does_not_panic() {
+        let body = "{\"matches\":[{\"evidence\":\"a \\—b\"}]}";
+        let out = repair_match_json(body);
+        assert!(out.contains('—'));
     }
 }
 
@@ -1414,19 +1469,55 @@ mod real_capture_tests {
 
     /// (label, response body as the model emitted it, entries expected back)
     const CAPTURES: [(&str, &str, usize); 10] = [
-        ("equals_with_value_quote", r##"{"matches":[{"extract_id="36","historical_id":23,"strength":"Low","evidence":"vault price manipulation; unrelated"}]}"##, 1),
-        ("equals_no_quotes", r##"{"matches":[{extract_id=3,"historical_id":24,"strength":"Medium","evidence":"both maintain segregated collateral accounting"}]}"##, 1),
-        ("equals_closing_dropped", r##"{"matches":[{"extract_id":4,"historical_id=15,"strength":"Low","evidence":"unbounded mint; unrelated"}]}"##, 1),
-        ("colon_closing_dropped", r##"{"matches":[{"extract_id":27,"historical_id:15,"strength":"Low","evidence":"unbounded mint; project seed floor prevents drawdown"}]}"##, 1),
-        ("garbled_fragment_between", r##"{"matches":[{"extract_id":2,"historical_id":3,"strength":"Low","evidence":"a"},{"extract_id=2":0}, {"extract_id":2,"historical_id":6,"strength":"Low","evidence":"b"}]}"##, 2),
-        ("fenced", "```json\n{\"matches\":[{\"extract_id\":1,\"historical_id=45,\"strength\":\"Low\",\"evidence\":\"reward hack\"}]}\n```", 1),
-        ("clean", r#"{"matches":[{"extract_id":1,"historical_id":45,"strength":"Low","evidence":"no overlap"}]}"#, 1),
+        (
+            "equals_with_value_quote",
+            r##"{"matches":[{"extract_id="36","historical_id":23,"strength":"Low","evidence":"vault price manipulation; unrelated"}]}"##,
+            1,
+        ),
+        (
+            "equals_no_quotes",
+            r##"{"matches":[{extract_id=3,"historical_id":24,"strength":"Medium","evidence":"both maintain segregated collateral accounting"}]}"##,
+            1,
+        ),
+        (
+            "equals_closing_dropped",
+            r##"{"matches":[{"extract_id":4,"historical_id=15,"strength":"Low","evidence":"unbounded mint; unrelated"}]}"##,
+            1,
+        ),
+        (
+            "colon_closing_dropped",
+            r##"{"matches":[{"extract_id":27,"historical_id:15,"strength":"Low","evidence":"unbounded mint; project seed floor prevents drawdown"}]}"##,
+            1,
+        ),
+        (
+            "garbled_fragment_between",
+            r##"{"matches":[{"extract_id":2,"historical_id":3,"strength":"Low","evidence":"a"},{"extract_id=2":0}, {"extract_id":2,"historical_id":6,"strength":"Low","evidence":"b"}]}"##,
+            2,
+        ),
+        (
+            "fenced",
+            "```json\n{\"matches\":[{\"extract_id\":1,\"historical_id=45,\"strength\":\"Low\",\"evidence\":\"reward hack\"}]}\n```",
+            1,
+        ),
+        (
+            "clean",
+            r#"{"matches":[{"extract_id":1,"historical_id":45,"strength":"Low","evidence":"no overlap"}]}"#,
+            1,
+        ),
         // `"evidence":null` is valid JSON but was not a String. This aborted
         // the whole mapping pass with "invalid type: null, expected a string"
         // until the entry fields became `Value`.
-        ("null_evidence", r#"{"matches":[{"extract_id":1,"historical_id":2,"strength":"Low","evidence":null}]}"#, 1),
+        (
+            "null_evidence",
+            r#"{"matches":[{"extract_id":1,"historical_id":2,"strength":"Low","evidence":null}]}"#,
+            1,
+        ),
         // A non-string `strength` must not fail the batch either.
-        ("numeric_strength", r#"{"matches":[{"extract_id":1,"historical_id":2,"strength":3,"evidence":"some reason here"}]}"#, 1),
+        (
+            "numeric_strength",
+            r#"{"matches":[{"extract_id":1,"historical_id":2,"strength":3,"evidence":"some reason here"}]}"#,
+            1,
+        ),
         // `{"matches":[]}` must be a warning-and-continue, not an abort —
         // observed live batch 60/457 when the provider was degraded.
         ("empty_array", r#"{"matches":[]}"#, 0),
@@ -1435,11 +1526,15 @@ mod real_capture_tests {
     #[test]
     fn every_captured_corruption_parses_with_all_entries_intact() {
         for (label, raw, expected) in CAPTURES {
-            let body = llmy::client::filters::strip_markdown_fence(raw)
-                .unwrap_or_else(|| raw.to_string());
+            let body =
+                llmy::client::filters::strip_markdown_fence(raw).unwrap_or_else(|| raw.to_string());
             let repaired = repair_match_json(&body);
             let entries = salvage_match_entries(&repaired);
-            assert_eq!(entries.len(), expected, "{label}: wrong entry count salvaged");
+            assert_eq!(
+                entries.len(),
+                expected,
+                "{label}: wrong entry count salvaged"
+            );
             let parsed: MatchResponse = MatchResponse {
                 matches: entries
                     .into_iter()
@@ -1463,7 +1558,10 @@ mod real_capture_tests {
                 assert!(m.extract_id > 0, "{label}: lost extract_id");
                 assert!(m.historical_id > 0, "{label}: lost historical_id");
                 assert!(
-                    m.evidence.as_ref().and_then(|v| v.as_str()).is_some_and(|e| !e.is_empty()),
+                    m.evidence
+                        .as_ref()
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|e| !e.is_empty()),
                     "{label}: lost evidence"
                 );
             }
@@ -1487,7 +1585,11 @@ mod truncation_tests {
             {"extract_id":1,"hist"#;
         let repaired = repair_match_json(body);
         let entries = salvage_match_entries(&repaired);
-        assert_eq!(entries.len(), 2, "complete entries before the cut must survive");
+        assert_eq!(
+            entries.len(),
+            2,
+            "complete entries before the cut must survive"
+        );
         assert_eq!(entries[1]["historical_id"], 3);
     }
 

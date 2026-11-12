@@ -244,7 +244,6 @@ impl MergeAgent {
         let cache_suffix = format!("merge-r{:06}{cache_disc}", input.reflection_id);
         let system_prompt = super::prompt::merge_system(&self.language_prompt_prefix);
         let steps = drive_agent_loop(
-            &self.project_index,
             &self.llm,
             &self.options,
             system_prompt,

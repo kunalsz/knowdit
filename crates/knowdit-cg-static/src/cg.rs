@@ -410,7 +410,16 @@ impl<'a> CallGraphBuilder<'a> {
             let mut edges: Vec<RepoCall> = Vec::new();
 
             for raw_target in collector.function_call_targets {
-                let Some(&target_function_id) = self.function_id_by_node.get(&raw_target) else {
+                let target_node_id = if self.contract_id_by_node.contains_key(&raw_target) {
+                    match self.constructor_node_by_contract.get(&raw_target) {
+                        Some(&ctor) => ctor,
+                        None => continue,
+                    }
+                } else {
+                    raw_target
+                };
+                let Some(&target_function_id) = self.function_id_by_node.get(&target_node_id)
+                else {
                     continue;
                 };
                 if target_function_id == function_id || !emitted.insert(target_function_id) {
@@ -550,9 +559,22 @@ impl Visitor for CallSiteCollector {
 }
 
 fn function_call_target(function_call: &FunctionCall) -> Option<NodeID> {
-    match &function_call.expression {
+    expression_call_target(&function_call.expression)
+}
+
+fn expression_call_target(expr: &Expression) -> Option<NodeID> {
+    use foundry_compilers_artifacts::ast::TypeName;
+    match expr {
         Expression::Identifier(identifier) => identifier.referenced_declaration,
         Expression::MemberAccess(member) => member.referenced_declaration,
+        Expression::FunctionCallOptions(fco) => expression_call_target(&fco.expression),
+        Expression::NewExpression(new_expr) => match &new_expr.type_name {
+            TypeName::UserDefinedTypeName(udt) => Some(udt.referenced_declaration),
+            _ => None,
+        },
+        Expression::TupleExpression(te) if te.components.len() == 1 => te.components[0]
+            .as_ref()
+            .and_then(|inner| expression_call_target(inner)),
         _ => None,
     }
 }

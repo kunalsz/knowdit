@@ -155,7 +155,6 @@ impl SeverityGrader {
             .wrap_err("severity grader: failed to serialize SeverityInput")?;
         let cache_suffix = format!("severity-r{:06}-s{:06}", input.run_id, input.spec_id);
         let steps = drive_agent_loop(
-            &self.project_index,
             &self.llm,
             &self.options,
             // The language prefix is prepended to the system

@@ -570,7 +570,11 @@ impl<B: HarnessBackend + 'static> RegenRunner<B> {
             "codegen regen complete"
         );
         Ok(RegenChildren {
-            child_spec_ids: Vec::new(),
+            // Keep the parent spec active for the next cycle so the pending
+            // reflection written against `outcome.new_code_gen_id` (same
+            // spec) gets dispatched instead of stranding the regenerated
+            // harness with a never-graded verdict.
+            child_spec_ids: vec![r.spec_id],
             child_code_gen_ids: vec![outcome.new_code_gen_id],
         })
     }
@@ -638,7 +642,13 @@ impl<B: HarnessBackend + 'static> RegenRunner<B> {
         };
 
         // Phase 2: agent → new code_gen for the in-memory spec.
-        let synthetic_spec_id = -(r.reflection_id);
+        // The synthetic id is interpolated into harness identifiers
+        // (`contract Test_{id}` / `fn test_spec_{id}`) and filenames, so it
+        // must be positive: a negative id produces guaranteed compile
+        // errors. The 1e9 offset keeps it collision-free against real
+        // auto-increment spec ids; the spec row persisted by
+        // `write_full_spec_regen` gets its real id there.
+        let synthetic_spec_id = IN_MEMORY_SPEC_ID_BASE.saturating_add(r.reflection_id);
         let codegen: CodegenRegenInMemory = self
             .harness
             .codegen_for_in_memory_spec(
@@ -761,6 +771,10 @@ struct RegenChildren {
     child_spec_ids: Vec<i32>,
     child_code_gen_ids: Vec<i32>,
 }
+
+/// Base offset for in-memory spec ids during spec-regen codegen. See
+/// `spec_regen` for why the id must stay positive.
+const IN_MEMORY_SPEC_ID_BASE: i32 = 1_000_000_000;
 
 /// Bundle of state the spec_regen path looks up once at the top of
 /// each pending row, so the body of `spec_regen` reads as a linear

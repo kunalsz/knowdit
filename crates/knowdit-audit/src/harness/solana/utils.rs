@@ -352,6 +352,42 @@ pub(super) fn truncate_str(s: &str, max: usize) -> String {
     format!("{} … [{} bytes truncated]", &s[..end], s.len() - end)
 }
 
+/// UTF-8-safe head+tail truncation for persisted run output. Under the
+/// `max` budget the FIRST 3/4 bytes are kept (compile header, progress) and
+/// the LAST 1/4 bytes are kept verbatim (the counterexample / assertion
+/// revert forge appends at the very end), with the elided middle replaced by
+/// a marker. Head-only truncation destroys the failure tail, which is the
+/// only part graders read via their 4K tail slices.
+pub(super) fn truncate_str_head_tail(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let tail_len = (max / 4).max(1);
+    let head_len = max - tail_len;
+    let mut head_end = head_len;
+    while head_end > 0 && !s.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    let tail_start = s.len() - tail_len;
+    let mut tail_start = tail_start;
+    while tail_start < s.len() && !s.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    let elided = if tail_start > head_end {
+        tail_start - head_end
+    } else {
+        // Degenerate (max too small for a head+tail split): fall back to
+        // head-only truncation.
+        return truncate_str(s, max);
+    };
+    format!(
+        "{}\n… [{} bytes truncated] …\n{}",
+        &s[..head_end],
+        elided,
+        &s[tail_start..]
+    )
+}
+
 /// UTF-8-safe suffix tail (`n` bytes) returned in agent tool feedback.
 pub(super) fn tail_str(s: &str, n: usize) -> String {
     if s.len() <= n {
@@ -393,11 +429,12 @@ mod tests {
         std::fs::write(tmp.path().join("programs/vault/src/lib.rs"), lib_src)
             .expect("write lib.rs");
 
-        let analysis = knowdit_rust::RustStaticAnalyzer::analyze(&[knowdit_rust::RustSourceInput {
-            relative_path: PathBuf::from("programs/vault/src/lib.rs"),
-            content: lib_src.to_string(),
-        }])
-        .expect("analyze");
+        let analysis =
+            knowdit_rust::RustStaticAnalyzer::analyze(&[knowdit_rust::RustSourceInput {
+                relative_path: PathBuf::from("programs/vault/src/lib.rs"),
+                content: lib_src.to_string(),
+            }])
+            .expect("analyze");
         let index = ProjectIndex::build(
             analysis.call_graph.call_graph,
             StorageGraph::default(),
@@ -413,8 +450,9 @@ mod tests {
             Some("solana_vault")
         );
         assert!(
-            conv.discriminators_table()
-                .contains("instruction `solana_vault::withdraw` => `[183, 18, 70, 156, 148, 109, 161, 34]`"),
+            conv.discriminators_table().contains(
+                "instruction `solana_vault::withdraw` => `[183, 18, 70, 156, 148, 109, 161, 34]`"
+            ),
             "got discriminators:\n{}",
             conv.discriminators_table()
         );

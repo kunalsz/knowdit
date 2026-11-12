@@ -11,8 +11,8 @@ use llmy::agent::{LLMYError, tool};
 use llmy::client::client::LLM;
 use llmy::client::model::OpenAIModel;
 use schemars::JsonSchema;
-use sha2::{Digest, Sha256};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
@@ -39,9 +39,12 @@ pub struct FindingLinkDecision {
 
 /// Concrete evidence justifying one finding↔semantic link.
 ///
-/// Under the v2 "forced per-candidate emit" contract (plan_link.md §6.1),
-/// the agent must emit one LinkEvidence per candidate semantic shown,
-/// each tagged with a `strength` label from `{High, Medium, Low}`.
+/// Emit one entry ONLY for each candidate semantic that is genuinely
+/// related to the finding — typically a handful of High/Medium rows.
+/// Do NOT emit an entry for every candidate shown: unrelated candidates
+/// simply stay out of the list (an empty list is a valid "no link"
+/// decision). Low is reserved for plausible-but-weak matches worth
+/// recording, not a default for everything you skimmed.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct LinkEvidence {
     /// `Candidate ID` (e.g. `sem-12`) from the prompt's "Candidate
@@ -1333,18 +1336,60 @@ fn filter_link_candidates(
             (&finding.finding.exploits, 0.5),
         ] {
             for token in link_tokens(text) {
+                if is_link_stopword(&token) {
+                    continue;
+                }
                 *query.entry(token).or_insert(0.0) += weight;
             }
         }
     }
-    let mut ranked = nodes
+    // BM25-style scoring, not raw term counts (Q-07): a token's
+    // contribution is query-weight × IDF × saturating TF. Raw counts let
+    // "the"/"and"/"with" and boilerplate-heavy descriptions dominate the
+    // global ranking once the corpus exceeds a few hundred semantics,
+    // dropping >50% of the relevant canonicals from the candidate list.
+    let n_docs = nodes.len() as f64;
+    let node_tfs: Vec<HashMap<String, u32>> = nodes
+        .iter()
+        .map(|node| {
+            let mut tf = HashMap::<String, u32>::new();
+            for token in link_tokens(&format!(
+                "{} {} {}",
+                node.name, node.definition, node.description
+            )) {
+                if is_link_stopword(&token) {
+                    continue;
+                }
+                *tf.entry(token).or_insert(0) += 1;
+            }
+            tf
+        })
+        .collect();
+    // Document frequency of each query token across the candidate corpus.
+    let mut df: HashMap<&str, u32> = HashMap::new();
+    for tf in &node_tfs {
+        for token in query.keys() {
+            if tf.contains_key(token.as_str()) {
+                *df.entry(token.as_str()).or_insert(0) += 1;
+            }
+        }
+    }
+    // Classic BM25 IDF: near-zero for tokens present in (almost) every
+    // candidate, log-growing for rare ones.
+    let idf = |token: &str| -> f64 {
+        let df = df.get(token).copied().unwrap_or(0) as f64;
+        ((n_docs - df + 0.5) / (df + 0.5) + 1.0).ln()
+    };
+    let mut ranked = node_tfs
         .iter()
         .enumerate()
-        .map(|(index, node)| {
+        .map(|(index, tf)| {
             let mut score = 0.0;
-            for token in link_tokens(&format!("{} {} {}", node.name, node.definition, node.description)) {
-                if let Some(weight) = query.get(&token) {
-                    score += *weight;
+            for (token, &count) in tf {
+                if let Some(&weight) = query.get(token.as_str()) {
+                    let count = count as f64;
+                    let tf_norm = count / (count + 1.2);
+                    score += weight * idf(token) * tf_norm;
                 }
             }
             (score, index)
@@ -1452,8 +1497,100 @@ fn link_tokens(text: &str) -> impl Iterator<Item = String> + '_ {
         .map(|token| token.to_ascii_lowercase())
 }
 
+/// Pure function words excluded from the candidate-router query/scoring.
+/// Deliberately conservative: only words that never carry mechanism signal.
+/// Domain words that overlap with function words in compound tokens
+/// ("overflow", "underflow", "setRole") stay intact — `link_tokens` splits
+/// on non-alphanumerics, so compounds are never split into these.
+fn is_link_stopword(token: &str) -> bool {
+    matches!(
+        token,
+        "the"
+            | "and"
+            | "for"
+            | "that"
+            | "with"
+            | "this"
+            | "from"
+            | "are"
+            | "was"
+            | "were"
+            | "not"
+            | "can"
+            | "all"
+            | "any"
+            | "but"
+            | "has"
+            | "have"
+            | "had"
+            | "which"
+            | "when"
+            | "will"
+            | "would"
+            | "could"
+            | "should"
+            | "may"
+            | "might"
+            | "must"
+            | "than"
+            | "then"
+            | "them"
+            | "they"
+            | "their"
+            | "there"
+            | "these"
+            | "those"
+            | "into"
+            | "onto"
+            | "about"
+            | "after"
+            | "before"
+            | "because"
+            | "been"
+            | "being"
+            | "does"
+            | "each"
+            | "such"
+            | "some"
+            | "also"
+            | "more"
+            | "most"
+            | "other"
+            | "same"
+            | "only"
+            | "its"
+            | "his"
+            | "her"
+            | "him"
+            | "she"
+            | "you"
+            | "your"
+            | "our"
+            | "who"
+            | "what"
+            | "where"
+            | "why"
+            | "how"
+            | "while"
+            | "within"
+            | "without"
+            | "out"
+            | "own"
+            | "again"
+            | "once"
+            | "here"
+            | "both"
+            | "very"
+            | "just"
+            | "even"
+    )
+}
+
 fn dot_vectors(lhs: &[f32], rhs: &[f32]) -> f64 {
-    lhs.iter().zip(rhs).map(|(left, right)| f64::from(*left) * f64::from(*right)).sum()
+    lhs.iter()
+        .zip(rhs)
+        .map(|(left, right)| f64::from(*left) * f64::from(*right))
+        .sum()
 }
 
 async fn build_finding_link_contexts(
@@ -1819,9 +1956,12 @@ struct EmitFindingLinkDecisionTool {
 static QUOTED_SPAN_RE: std::sync::LazyLock<regex::Regex> =
     std::sync::LazyLock::new(|| regex::Regex::new(r#""([^"]+)"#).expect("literal regex"));
 
-/// Lowercase, straighten curly quotes, and collapse whitespace so verbatim-
-/// quote membership survives line wrapping and case drift between the prompt
-/// rendering and the model's copy of it.
+/// Lowercase, straighten curly quotes, strip markdown backticks, and
+/// collapse whitespace so verbatim-quote membership survives line wrapping,
+/// case drift, AND backtick drift between the prompt rendering and the
+/// model's copy of it. The model routinely drops or adds `` ` `` around
+/// code identifiers when quoting, which previously rejected genuine High
+/// evidence over formatting alone.
 fn normalize_for_quote_match(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut last_space = false;
@@ -1829,6 +1969,7 @@ fn normalize_for_quote_match(s: &str) -> String {
         let c = match c {
             '\u{201C}' | '\u{201D}' => '"',
             '\u{2018}' | '\u{2019}' => '\'',
+            '`' => continue,
             c => c,
         };
         if c.is_whitespace() {
@@ -2552,7 +2693,9 @@ pub async fn retro_link_pending_semantics(
             )
             .await?
     {
-        tracing::info!("Retro-link checkpoints do not match the current queue/options; restarting batches");
+        tracing::info!(
+            "Retro-link checkpoints do not match the current queue/options; restarting batches"
+        );
         db.clear_extraction_chunks(RETRO_LINK_CHECKPOINT_KEY, RETRO_LINK_CHECKPOINT_STAGE)
             .await?;
         checkpoint_rows.clear();
@@ -2563,7 +2706,9 @@ pub async fn retro_link_pending_semantics(
             .enumerate()
             .all(|(idx, row)| row.chunk_idx == idx as i32);
     if !checkpoints_valid {
-        tracing::warn!("Retro-link checkpoint rows are incomplete or non-contiguous; restarting batches");
+        tracing::warn!(
+            "Retro-link checkpoint rows are incomplete or non-contiguous; restarting batches"
+        );
         db.clear_extraction_chunks(RETRO_LINK_CHECKPOINT_KEY, RETRO_LINK_CHECKPOINT_STAGE)
             .await?;
         checkpoint_rows.clear();
@@ -2681,7 +2826,7 @@ pub async fn retro_link_pending_semantics(
             .await?;
             total_inserted += inserted;
             tracing::info!(
-                "Retro-link batch {} inserted {} new semantic_finding_link row(s)",
+                "Retro-link batch {} applied {} semantic_finding_link row(s) (new or strength-upgraded)",
                 next_commit_idx + 1,
                 inserted
             );
@@ -2699,7 +2844,7 @@ pub async fn retro_link_pending_semantics(
     db.clear_extraction_chunks(RETRO_LINK_CHECKPOINT_KEY, RETRO_LINK_CHECKPOINT_STAGE)
         .await?;
     tracing::info!(
-        "Retro-link complete: {} new link(s) total, cleared {} row(s) from pending_semantic queue",
+        "Retro-link complete: {} new-or-upgraded link(s) total, cleared {} row(s) from pending_semantic queue",
         total_inserted,
         cleared
     );
@@ -3187,5 +3332,49 @@ mod tests {
             ),
             "unexpected error: {error}"
         );
+    }
+
+    /// Stopwords in the finding text must not drive ranking: the node that
+    /// shares only "the/and/with" boilerplate loses to the one sharing a
+    /// real mechanism term.
+    #[test]
+    fn candidate_filter_ignores_stopwords() {
+        // Realistic corpus size: BM25 IDF only has signal when the
+        // candidate pool is much larger than the handful of matches.
+        let mut nodes = vec![];
+        let mut a = sample_semantic_node(1, "the and with this that", DeFiCategory::Dexes);
+        a.description = "the and with this that from are was the and with".to_string();
+        nodes.push(a);
+        let mut b = sample_semantic_node(2, "malformed input", DeFiCategory::Dexes);
+        b.description = "validation".to_string();
+        nodes.push(b);
+        for i in 3..60 {
+            nodes.push(sample_semantic_node(
+                i,
+                &format!("filler{i} ledger"),
+                DeFiCategory::Lending,
+            ));
+        }
+        let mut finding = sample_finding(1);
+        finding.finding.title = "the and with this that malformed input".to_string();
+        finding.finding.root_cause = "the and with malformed input".to_string();
+        let selected = filter_link_candidates(nodes, &[finding], 1, None);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].id, 2);
+    }
+
+    #[test]
+    fn quote_match_normalization_strips_backticks() {
+        assert_eq!(
+            normalize_for_quote_match("calls `withdraw()` twice"),
+            normalize_for_quote_match("calls withdraw() twice")
+        );
+    }
+
+    #[test]
+    fn is_link_stopword_keeps_domain_terms() {
+        assert!(is_link_stopword("the"));
+        assert!(!is_link_stopword("overflow"));
+        assert!(!is_link_stopword("reentrancy"));
     }
 }

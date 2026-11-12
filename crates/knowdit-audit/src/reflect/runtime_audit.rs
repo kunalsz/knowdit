@@ -36,7 +36,13 @@ pub fn run(summary: &ForgeTestSummary, spec: &AuditSpecification) -> AuditOutcom
         };
     }
     let rate = summary.revert_rate();
-    if summary.total_calls > 0 && rate >= HIGH_REVERT_RATE {
+    // The ≥95% revert-rate rule is a fuzzer-health check for handler mode.
+    // A deterministic PoC that reverts IS the violation signal (one unit
+    // test, one revert, carrying the marker) — not a wedged fuzzer. It used
+    // to stay under this rule only because its single test execution was
+    // never counted; now that unit tests count as calls, the rule must
+    // explicitly skip deterministic runs.
+    if summary.total_calls > 0 && !summary.deterministic_test_failure && rate >= HIGH_REVERT_RATE {
         return AuditOutcome::Fail {
             gate: GateKind::Static,
             reason: format!(

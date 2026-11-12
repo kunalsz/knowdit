@@ -225,10 +225,7 @@ pub enum SolanaBackendKind {
         mem_max_bytes: u64,
     },
     #[cfg(target_os = "linux")]
-    Docker {
-        image: String,
-        mem_max_bytes: u64,
-    },
+    Docker { image: String, mem_max_bytes: u64 },
 }
 
 /// Capabilities probed once at [`SolanaBackend::new`] time.
@@ -712,8 +709,8 @@ fn test_knowdit_solana_preflight() {
 
         let generated_lock = preflight_dir.join("Cargo.lock");
         if generated_lock.is_file() {
-            let _ = tokio::fs::copy(&generated_lock, self.harness_dir.join(".knowdit-seed.lock"))
-                .await;
+            let _ =
+                tokio::fs::copy(&generated_lock, self.harness_dir.join(".knowdit-seed.lock")).await;
         }
         if let Err(err) = tokio::fs::remove_dir_all(&preflight_dir).await {
             tracing::warn!(
@@ -898,7 +895,9 @@ fn test_knowdit_solana_preflight() {
                     .stdout(std::process::Stdio::piped())
                     .stderr(std::process::Stdio::piped())
                     .spawn()
-                    .wrap_err_with(|| format!("failed to spawn `{} {:?}`", binary.display(), args))?;
+                    .wrap_err_with(|| {
+                        format!("failed to spawn `{} {:?}`", binary.display(), args)
+                    })?;
                 Ok(SolanaHandle::LocalDirect { child: Some(child) })
             }
             #[cfg(target_os = "linux")]
@@ -927,13 +926,13 @@ fn test_knowdit_solana_preflight() {
                     .stdout(std::process::Stdio::piped())
                     .stderr(std::process::Stdio::piped())
                     .spawn()
-                    .wrap_err_with(|| format!("failed to spawn `{} {:?}`", binary.display(), args))?;
+                    .wrap_err_with(|| {
+                        format!("failed to spawn `{} {:?}`", binary.display(), args)
+                    })?;
                 if let Some(pid) = child.id()
                     && let Err(err) = scoped.add_pid(pid)
                 {
-                    tracing::warn!(
-                        "SolanaRunner: failed to attach pid {pid} to cgroup: {err}"
-                    );
+                    tracing::warn!("SolanaRunner: failed to attach pid {pid} to cgroup: {err}");
                 }
                 Ok(SolanaHandle::LocalCgroup {
                     child: Some(child),
@@ -1121,12 +1120,27 @@ impl Drop for SolanaHandle {
             #[cfg(target_os = "linux")]
             Self::LocalCgroup { .. } => {}
             #[cfg(target_os = "linux")]
-            Self::Docker { container_name, .. } => {
-                let _ = std::process::Command::new("docker")
-                    .args(["kill", container_name.as_str()])
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .spawn();
+            Self::Docker {
+                child,
+                container_name,
+            } => {
+                // Same contract as `ForgeHandle::Docker`: the foreground
+                // `docker run` CLI exits with the container, so skip the
+                // kill entirely after a normal wait (child taken) and only
+                // reap via a detached thread on the abnormal paths —
+                // otherwise every invocation leaks a zombie PID.
+                if child.is_some() {
+                    if let Ok(mut killer) = std::process::Command::new("docker")
+                        .args(["kill", container_name.as_str()])
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .spawn()
+                    {
+                        std::thread::spawn(move || {
+                            let _ = killer.wait();
+                        });
+                    }
+                }
             }
         }
     }

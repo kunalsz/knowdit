@@ -5,9 +5,10 @@ use std::{
 
 use color_eyre::eyre::{ContextCompat, WrapErr, ensure};
 use foundry_compilers_artifacts::ast::{
-    AssignmentOperator, Block, BlockOrStatement, ContractDefinitionPart, Expression,
-    ExpressionOrVariableDeclarationStatement, FunctionDefinition, ModifierDefinition, Mutability,
-    SourceLocation, SourceUnitPart, Statement, StorageLocation, UnaryOperator, VariableDeclaration,
+    AssemblyReferenceSuffix, AssignmentOperator, Block, BlockOrStatement, ContractDefinitionPart,
+    Expression, ExpressionOrVariableDeclarationStatement, FunctionDefinition, ModifierDefinition,
+    Mutability, SourceLocation, SourceUnitPart, Statement, StorageLocation, UnaryOperator,
+    VariableDeclaration,
 };
 use knowdit_repo_model::{
     cg::{FileChunk, FileLocation},
@@ -418,10 +419,18 @@ impl<'a> FunctionWalker<'a> {
                     self.walk_block(&clause.block);
                 }
             }
-            Statement::PlaceholderStatement(_)
-            | Statement::Break(_)
-            | Statement::Continue(_)
-            | Statement::InlineAssembly(_) => {}
+            Statement::PlaceholderStatement(_) | Statement::Break(_) | Statement::Continue(_) => {}
+            Statement::InlineAssembly(ia) => {
+                for ext_ref in &ia.external_references {
+                    // Yul can only touch the referenced declaration's slot /
+                    // offset / length, so a `.slot` reference is write-capable
+                    // (`sstore(x.slot, v)`) while `.offset` / `.length` and
+                    // function references are pure reads.
+                    let is_write =
+                        matches!(ext_ref.suffix, None | Some(AssemblyReferenceSuffix::Slot));
+                    self.touch(ext_ref.declaration as isize, is_write, true);
+                }
+            }
         }
     }
 
@@ -456,6 +465,15 @@ impl<'a> FunctionWalker<'a> {
                 }
             }
             Expression::Assignment(asg) => {
+                if let Expression::Identifier(ident) = &asg.lhs
+                    && let Some(lhs_id) = ident.referenced_declaration
+                    && !self.state_var_id_by_node.contains_key(&lhs_id)
+                {
+                    let rhs_targets = self.resolve_storage_alias(&asg.rhs);
+                    if !rhs_targets.is_empty() {
+                        self.aliases.entry(lhs_id).or_default().extend(rhs_targets);
+                    }
+                }
                 let compound = !matches!(asg.operator, AssignmentOperator::Assign);
                 self.walk_expression(&asg.lhs, true, compound);
                 self.walk_expression(&asg.rhs, false, true);

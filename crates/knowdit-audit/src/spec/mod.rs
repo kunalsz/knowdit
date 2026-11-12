@@ -22,8 +22,8 @@ use color_eyre::eyre::{Result, WrapErr};
 use itertools::Itertools;
 use knowdit_kg_model::ExtractedSemantic;
 use knowdit_repo_model::{
-    HistoricalSemanticRecord, LinkCandidate, LinkResumeState, MatchStrength, PackHint, RepoDatabase,
-    SemanticMatchSet, repo::SpecificationRecord,
+    HistoricalSemanticRecord, LinkCandidate, LinkResumeState, MatchStrength, PackHint,
+    RepoDatabase, SemanticMatchSet, repo::SpecificationRecord,
 };
 use llmy::agent::{LLMYError, StepResult};
 use llmy::client::client::LLM;
@@ -38,18 +38,18 @@ use crate::types::AuditSpecification;
 
 mod backend;
 mod index;
+pub mod novelty;
 mod pack;
 mod prompt;
 mod tools;
-pub mod novelty;
 pub mod viability;
 pub use backend::SpecBackend;
 pub use index::{CallableReachability, ProjectIndex, StatefulEntrypoint};
+pub(crate) use pack::{PackMember, pack_fingerprint, select_pack};
 use prompt::{
     build_pair_system_prompt, build_pair_user_prompt, build_regen_prompt_extension,
     build_system_prompt, build_user_prompt,
 };
-pub(crate) use pack::{pack_fingerprint, select_pack, PackMember};
 pub(crate) use tools::{
     LookupCallGraphTool, LookupStateVariableXrefsTool, ReadContractSourceTool,
     ReadFunctionSourceTool,
@@ -969,7 +969,10 @@ impl SpecRuntime {
             .collect();
         // Move historicals into the index instead of cloning them; the source
         // `Vec` is dropped here.
-        let SemanticMatchSet { historicals, matches } = match_set;
+        let SemanticMatchSet {
+            historicals,
+            matches,
+        } = match_set;
         let historical_by_id: BTreeMap<i32, HistoricalSemanticRecord> = historicals
             .into_iter()
             .map(|record| (record.semantic.id, record))
@@ -1048,7 +1051,10 @@ impl SpecRuntime {
             inheritance_graph,
         ));
 
-        let SemanticMatchSet { historicals, matches } = match_set;
+        let SemanticMatchSet {
+            historicals,
+            matches,
+        } = match_set;
         let historical_by_id: BTreeMap<i32, HistoricalSemanticRecord> = historicals
             .into_iter()
             .map(|record| (record.semantic.id, record))
@@ -1090,10 +1096,7 @@ impl SpecRuntime {
         finding_id: i32,
     ) -> Option<&knowdit_repo_model::HistoricalLinkedFinding> {
         let idx = *self.findings_index.get(&(historical_id, finding_id))?;
-        self.historical_by_id
-            .get(&historical_id)?
-            .findings
-            .get(idx)
+        self.historical_by_id.get(&historical_id)?.findings.get(idx)
     }
 
     /// Materialize one compact candidate into a full [`LinkInput`]. Returns
@@ -1279,10 +1282,7 @@ impl PreparedLinkPlan {
     /// Build the plan for one invocation. Returns `None` when there is nothing
     /// to process (empty project, no matches, or every candidate filtered /
     /// already built).
-    pub async fn prepare(
-        repo: &RepoDatabase,
-        options: &SpecGenOptions,
-    ) -> Result<Option<Self>> {
+    pub async fn prepare(repo: &RepoDatabase, options: &SpecGenOptions) -> Result<Option<Self>> {
         let runtime = match SpecRuntime::load(repo).await? {
             Some(rt) => rt,
             None => return Ok(None),
@@ -1303,8 +1303,7 @@ impl PreparedLinkPlan {
                 .collect()
             }
             SpecGranularity::Pair => {
-                let candidates =
-                    prepare_pair_candidates(repo, &runtime, options).await?;
+                let candidates = prepare_pair_candidates(repo, &runtime, options).await?;
                 select_pending_pairs(candidates, options)
             }
         };
@@ -1412,10 +1411,7 @@ impl PreparedLinkPlan {
             .sum();
         Self {
             runtime,
-            pending: candidates
-                .into_iter()
-                .map(PendingWork::Finding)
-                .collect(),
+            pending: candidates.into_iter().map(PendingWork::Finding).collect(),
             planned_total,
             matched_extract_count,
             historical_finding_total,
@@ -1785,8 +1781,7 @@ async fn prepare_pair_candidates(
             );
         }
         let pair_id = (draft.extract_id, draft.historical_id);
-        let mut pre_committed_spec_ids =
-            partial_ids.get(&pair_id).cloned().unwrap_or_default();
+        let mut pre_committed_spec_ids = partial_ids.get(&pair_id).cloned().unwrap_or_default();
         pre_committed_spec_ids.sort_unstable();
         pre_committed_spec_ids.dedup();
         candidates.push(PairCandidate {
@@ -1987,7 +1982,10 @@ fn select_pending_with_runtime(
     let mut buckets: BTreeMap<(u8, u8), BTreeMap<i32, Vec<LinkCandidate>>> = BTreeMap::new();
     for candidate in candidates {
         buckets
-            .entry((candidate.match_strength.rank(), candidate.link_strength.rank()))
+            .entry((
+                candidate.match_strength.rank(),
+                candidate.link_strength.rank(),
+            ))
             .or_default()
             .entry(candidate.key.extract_id)
             .or_default()
@@ -2073,10 +2071,8 @@ fn select_pending_with_runtime(
                                 }
                             }
                             if let Some(cap) = per_e_cap {
-                                let count = per_e
-                                    .get(&candidate.key.extract_id)
-                                    .copied()
-                                    .unwrap_or(0);
+                                let count =
+                                    per_e.get(&candidate.key.extract_id).copied().unwrap_or(0);
                                 if count >= cap {
                                     continue;
                                 }
@@ -2352,23 +2348,23 @@ impl PlannedLinkWork {
         } else {
             options.max_agent_steps
         };
-        let tool_box = draft.build_tool_box(
-            project_index,
-            max_specs,
-            pack_ids.clone(),
-            link.finding_id,
-        );
+        let tool_box =
+            draft.build_tool_box(project_index, max_specs, pack_ids.clone(), link.finding_id);
 
         let (cache_key, debug_prefix) = if pair_mode {
             // Pair runs key on the pair identity + pack fingerprint: changing
             // `--gen-specs-pack-size` (or the underlying edges) changes the
             // fingerprint, so a cached run can never be replayed against a
-            // different prompt.
+            // different prompt. The ordinal is deliberately NOT part of the
+            // cache key — it shifts whenever resume/scheduling reorders
+            // links, which would invalidate every cached agent conversation
+            // mid-run; the (extract, historical) identity is unique already.
+            // The ordinal stays in the debug prefix for log correlation.
             let fingerprint = pack_fingerprint(&pack_ids);
             (
                 format!(
-                    "{}-pair{:04}-e{}-h{}-fp{}",
-                    options.cache_key, link_serial, link.extract_id, link.historical_id, fingerprint
+                    "{}-pair-e{}-h{}-fp{}",
+                    options.cache_key, link.extract_id, link.historical_id, fingerprint
                 ),
                 options.debug_prefix.as_ref().map(|prefix| {
                     format!(
@@ -2380,8 +2376,8 @@ impl PlannedLinkWork {
         } else {
             (
                 format!(
-                    "{}-link{:04}-e{}-h{}-f{}",
-                    options.cache_key, link_serial, link.extract_id, link.historical_id, link.finding_id
+                    "{}-link-e{}-h{}-f{}",
+                    options.cache_key, link.extract_id, link.historical_id, link.finding_id
                 ),
                 options.debug_prefix.as_ref().map(|prefix| {
                     format!(
@@ -2536,9 +2532,9 @@ impl PlannedLinkWork {
                     );
                     let mut guard = draft.0.lock().await;
                     guard.final_status.get_or_insert(LinkSpecStatus::Abandoned);
-                    guard.abort_reason.get_or_insert_with(|| {
-                        format!("{reason} (last at step {steps})")
-                    });
+                    guard
+                        .abort_reason
+                        .get_or_insert_with(|| format!("{reason} (last at step {steps})"));
                     break;
                 }
                 Err(err) => {
@@ -2729,7 +2725,10 @@ mod planner_tests {
         // an operator reading the log can tell how far the agent got.
         let rendered = format!("{report:#}");
         assert!(rendered.contains("step 40"), "got: {rendered}");
-        assert!(rendered.contains("reach output length limit"), "got: {rendered}");
+        assert!(
+            rendered.contains("reach output length limit"),
+            "got: {rendered}"
+        );
     }
 
     /// A failure from *before* the step loop (memory build, initial step) has
@@ -2938,15 +2937,15 @@ mod planner_tests {
             "precondition: this id misses the registry and reports a zero window"
         );
 
-        let threshold = knowdit_kg_model::context_budget(
-            model.config.max_input(),
-            DEFAULT_COMPACT_RATIO,
-        );
+        let threshold =
+            knowdit_kg_model::context_budget(model.config.max_input(), DEFAULT_COMPACT_RATIO);
         assert!(
             threshold > 10_000,
             "compact threshold must be far above zero for an unknown model, got {threshold}"
         );
-        assert!(knowdit_kg_model::using_fallback_window(model.config.max_input()));
+        assert!(knowdit_kg_model::using_fallback_window(
+            model.config.max_input()
+        ));
     }
 }
 
@@ -3277,7 +3276,11 @@ mod planner_db_tests {
             batches += 1;
             all_keys.extend(got.iter().map(|l| l.key()));
         }
-        assert_eq!(all_keys.len(), 10, "every selected key emitted exactly once");
+        assert_eq!(
+            all_keys.len(),
+            10,
+            "every selected key emitted exactly once"
+        );
         let unique: HashSet<LinkKey> = all_keys.iter().copied().collect();
         assert_eq!(unique.len(), 10, "no duplicate keys");
         assert_eq!(plan.remaining(), 0, "plan terminated");
@@ -3294,10 +3297,7 @@ mod planner_db_tests {
             &temp.repo,
             &[extract("e1"), extract("e2")],
             vec![historical(100, &links), historical(200, &links)],
-            vec![
-                (1, 100, MatchStrength::High),
-                (2, 200, MatchStrength::High),
-            ],
+            vec![(1, 100, MatchStrength::High), (2, 200, MatchStrength::High)],
         )
         .await;
 
@@ -3334,10 +3334,7 @@ mod planner_db_tests {
                 historical(100, &[(1, LinkStrength::High), (2, LinkStrength::High)]),
                 historical(200, &[(4, LinkStrength::High)]),
             ],
-            vec![
-                (1, 100, MatchStrength::High),
-                (1, 200, MatchStrength::High),
-            ],
+            vec![(1, 100, MatchStrength::High), (1, 200, MatchStrength::High)],
         )
         .await;
 
@@ -3522,10 +3519,7 @@ mod planner_db_tests {
                 historical(500, &[(7, LinkStrength::Low)]),
                 historical(600, &[(7, LinkStrength::Low)]),
             ],
-            vec![
-                (1, 500, MatchStrength::Low),
-                (1, 600, MatchStrength::Low),
-            ],
+            vec![(1, 500, MatchStrength::Low), (1, 600, MatchStrength::Low)],
         )
         .await;
 
@@ -3567,7 +3561,11 @@ mod planner_db_tests {
             .unwrap();
         let total = plan.planned_total();
         let mut seen: HashSet<LinkKey> = HashSet::new();
-        while let Some(link) = plan.take_batch(NonZeroUsize::new(1).unwrap()).into_iter().next() {
+        while let Some(link) = plan
+            .take_batch(NonZeroUsize::new(1).unwrap())
+            .into_iter()
+            .next()
+        {
             assert!(seen.insert(link.key()), "key emitted twice");
         }
         assert_eq!(seen.len(), total);
@@ -3651,7 +3649,9 @@ mod planner_db_tests {
         .await;
         let mut runtime = SpecRuntime::load(&temp.repo).await.unwrap().unwrap();
         runtime.historical_by_id.insert(100, big_historical(100, n));
-        runtime.match_strength_by_pair.insert((1, 100), MatchStrength::High);
+        runtime
+            .match_strength_by_pair
+            .insert((1, 100), MatchStrength::High);
         runtime.rebuild_findings_index();
 
         let candidates: Vec<LinkCandidate> = (0..n)
@@ -3858,7 +3858,10 @@ mod planner_db_tests {
             .await
             .expect("terminal ids");
         assert!(terminal.contains(&ids[0]));
-        assert!(!terminal.contains(&ids[1]), "sibling without codegen stays pending");
+        assert!(
+            !terminal.contains(&ids[1]),
+            "sibling without codegen stays pending"
+        );
 
         // Pair-scoped spec read: only this pair's rows, id-ascending.
         let pair_specs = repo
@@ -3868,11 +3871,12 @@ mod planner_db_tests {
         assert_eq!(pair_specs.len(), 2);
         assert_eq!(pair_specs[0].id, ids[0]);
         assert_eq!(pair_specs[1].id, ids[1]);
-        assert!(repo
-            .load_pair_specifications(1, 999)
-            .await
-            .expect("other pair")
-            .is_empty());
+        assert!(
+            repo.load_pair_specifications(1, 999)
+                .await
+                .expect("other pair")
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -3923,7 +3927,10 @@ mod planner_db_tests {
         // Anchor mirrors pack[0] so every triple-keyed consumer stays valid.
         assert_eq!(link.pack[0].finding_id, link.finding_id);
         assert_eq!(link.pre_committed_spec_ids, partial_ids);
-        assert_eq!(link.pack[0].finding_rendered_description, "finding 3 description");
+        assert_eq!(
+            link.pack[0].finding_rendered_description,
+            "finding 3 description"
+        );
     }
 
     #[tokio::test]
@@ -4090,8 +4097,8 @@ mod planner_db_tests {
     async fn fair_plan_orders_intra_pair_by_severity_and_mmr() -> Result<()> {
         let temp = temp_repo().await;
         let repo = &temp.repo;
-        let make_finding = |id: i32, sev: FindingSeverity, title: &str, rc: &str| {
-            HistoricalLinkedFinding {
+        let make_finding =
+            |id: i32, sev: FindingSeverity, title: &str, rc: &str| HistoricalLinkedFinding {
                 finding: knowdit_kg_model::db::audit_finding::Model {
                     id,
                     title: title.to_string(),
@@ -4107,8 +4114,7 @@ mod planner_db_tests {
                 rendered_description: String::new(),
                 rendered_patterns: String::new(),
                 rendered_exploits: String::new(),
-            }
-        };
+            };
         let hist = HistoricalSemanticRecord {
             semantic: knowdit_kg_model::db::semantic_node::Model {
                 id: 100,
@@ -4157,8 +4163,7 @@ mod planner_db_tests {
         let mut plan = PreparedLinkPlan::prepare(repo, &SpecGenOptions::default())
             .await?
             .ok_or_else(|| color_eyre::eyre::eyre!("expected plan"))?;
-        let batch_sz = NonZeroUsize::new(10)
-            .ok_or_else(|| color_eyre::eyre::eyre!("nonzero"))?;
+        let batch_sz = NonZeroUsize::new(10).ok_or_else(|| color_eyre::eyre::eyre!("nonzero"))?;
         let batch = plan.take_batch(batch_sz);
         let ordered_fids: Vec<i32> = batch.iter().map(|l| l.finding_id).collect();
         // f2 (High, lowest id) anchors; f4 (distinct oracle mechanism) beats f3 (paraphrase of f2).
@@ -4216,8 +4221,7 @@ mod planner_db_tests {
         let mut plan_after_transient = PreparedLinkPlan::prepare(repo, &pair_opts)
             .await?
             .ok_or_else(|| color_eyre::eyre::eyre!("expected pair plan"))?;
-        let one = NonZeroUsize::new(1)
-            .ok_or_else(|| color_eyre::eyre::eyre!("nonzero"))?;
+        let one = NonZeroUsize::new(1).ok_or_else(|| color_eyre::eyre::eyre!("nonzero"))?;
         let first_wave = plan_after_transient.take_batch(one);
         let first_pack: Vec<i32> = first_wave[0].pack.iter().map(|h| h.finding_id).collect();
         assert_eq!(
@@ -4252,7 +4256,11 @@ mod planner_db_tests {
             retry_abandoned: true,
             ..pair_opts
         };
-        assert!(PreparedLinkPlan::prepare(repo, &retry_opts).await?.is_some());
+        assert!(
+            PreparedLinkPlan::prepare(repo, &retry_opts)
+                .await?
+                .is_some()
+        );
         Ok(())
     }
 }

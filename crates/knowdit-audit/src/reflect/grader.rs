@@ -176,7 +176,6 @@ impl VerdictGrader {
             .wrap_err("verdict grader: failed to serialize VerdictInput")?;
         let cache_suffix = format!("verdict-r{:06}-s{:06}", input.run_id, input.spec_id);
         let steps = drive_agent_loop(
-            &self.project_index,
             &self.llm,
             &self.options,
             // The language prefix is prepended to the system

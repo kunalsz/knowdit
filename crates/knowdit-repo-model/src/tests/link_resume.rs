@@ -150,18 +150,22 @@ async fn partial_when_specs_but_no_codegen() {
 }
 
 #[tokio::test]
-async fn built_when_any_spec_has_codegen() {
+async fn partial_returns_only_unfuzzed_specs_and_built_when_all_specs_have_resumable_codegen() {
     let temp = temp_db().await;
     insert_extract(&temp.repo, 1).await;
     insert_historical(&temp.repo, 100).await;
     let s1 = insert_spec(&temp.repo, 1, 100, 7).await;
-    let _s2 = insert_spec(&temp.repo, 1, 100, 7).await;
-    // One spec out of two has a code_gen — the link is "Built" from
-    // streamloop's perspective. Standalone reflect / regen will handle
-    // the other.
+    let s2 = insert_spec(&temp.repo, 1, 100, 7).await;
+    // When only s1 has a Completed code_gen (e.g. run interrupted mid-link),
+    // s2 MUST remain in Partial so it is not silently orphaned on resume.
     insert_code_gen(&temp.repo, s1).await;
     let state = temp.repo.link_resume_state(1, 100, 7).await.unwrap();
-    assert_eq!(state, LinkResumeState::Built);
+    assert_eq!(state, LinkResumeState::Partial { spec_ids: vec![s2] });
+
+    // Once s2 also finishes with a resumable status, the link flips to Built.
+    insert_code_gen(&temp.repo, s2).await;
+    let state_after = temp.repo.link_resume_state(1, 100, 7).await.unwrap();
+    assert_eq!(state_after, LinkResumeState::Built);
 }
 
 #[tokio::test]
@@ -230,9 +234,16 @@ async fn sibling_historicals_get_independent_states() {
         }
     );
 
-    // If only the H=100 side gets a code_gen, ONLY that side flips to
-    // Built; the H=200 side stays Partial.
+    // If ALL specs on the H=100 side get a resumable code_gen, ONLY that side
+    // flips to Built; when only one of two has a code_gen, the remaining spec stays Partial.
     insert_code_gen(&temp.repo, h100_specs[0]).await;
+    assert_eq!(
+        temp.repo.link_resume_state(1, 100, 7).await.unwrap(),
+        LinkResumeState::Partial {
+            spec_ids: vec![h100_specs[1]]
+        }
+    );
+    insert_code_gen(&temp.repo, h100_specs[1]).await;
     assert_eq!(
         temp.repo.link_resume_state(1, 100, 7).await.unwrap(),
         LinkResumeState::Built
@@ -621,7 +632,7 @@ async fn skipped_viability_and_terminal_specifications_behavior() -> color_eyre:
     assert!(resumable.contains(&s_dup));
     assert!(resumable.contains(&s_skip));
 
-    // ...but load_terminal_specifications returns ONLY canonical Completed specs,
+    // ...but load_terminal_specifications returns ONLY canonical Completed/StepsExhausted specs,
     // annotated with is_valid_finding.
     let terminals = temp.repo.load_terminal_specifications().await?;
     assert_eq!(terminals.len(), 2);
@@ -629,6 +640,33 @@ async fn skipped_viability_and_terminal_specifications_behavior() -> color_eyre:
     assert!(!terminals[0].is_valid_finding);
     assert_eq!(terminals[1].spec.id, s_valid);
     assert!(terminals[1].is_valid_finding);
+    Ok(())
+}
+
+/// Specs whose only codegen ended `StepsExhausted` (secure function, nothing
+/// found) are terminal for novelty purposes: otherwise every later link
+/// re-fuzzes the identical spec.
+#[tokio::test]
+async fn terminal_specifications_include_steps_exhausted() -> color_eyre::eyre::Result<()> {
+    let temp = temp_db().await;
+    insert_extract(&temp.repo, 1).await;
+    insert_historical(&temp.repo, 100).await;
+    let s = insert_spec(&temp.repo, 1, 100, 7).await;
+    code_gen_model::Entity::insert(code_gen_model::ActiveModel {
+        spec_id: Set(s),
+        harness_relative_path: Set(String::new()),
+        harness_source: Set(String::new()),
+        status: Set(CodeGenStatus::StepsExhausted),
+        final_reason: Set(String::new()),
+        agent_steps: Set(0),
+        ..Default::default()
+    })
+    .exec(temp.repo.connection())
+    .await?;
+    let terminals = temp.repo.load_terminal_specifications().await?;
+    assert_eq!(terminals.len(), 1);
+    assert_eq!(terminals[0].spec.id, s);
+    assert!(!terminals[0].is_valid_finding);
     Ok(())
 }
 

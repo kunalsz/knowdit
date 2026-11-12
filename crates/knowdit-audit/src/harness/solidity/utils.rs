@@ -302,6 +302,16 @@ impl From<crate::harness::forge_json::SuiteMap> for ForgeTestSummary {
                 if let Some(stats) = tr.invariant_stats() {
                     summary.total_calls += stats.calls;
                     summary.total_reverts += stats.reverts;
+                } else if !tr.is_setup_failure(test_name) && tr.status != TestStatus::Skipped {
+                    // Unit / fuzz / table tests carry no invariant stats but
+                    // DID execute. Count one call (plus one revert on
+                    // failure) so deterministic PoCs report calls > 0
+                    // instead of tripping the zero-call [NO-OP] path and
+                    // being excluded from coverage eligibility.
+                    summary.total_calls += 1;
+                    if tr.status == TestStatus::Failure {
+                        summary.total_reverts += 1;
+                    }
                 }
                 if tr.is_setup_failure(test_name) {
                     summary.setup_failed = true;
@@ -623,6 +633,42 @@ pub(super) fn truncate_str(s: &str, max: usize) -> String {
     format!("{} … [{} bytes truncated]", &s[..end], s.len() - end)
 }
 
+/// UTF-8-safe head+tail truncation for persisted run output. Under the
+/// `max` budget the FIRST 3/4 bytes are kept (compile header, progress) and
+/// the LAST 1/4 bytes are kept verbatim (the counterexample / assertion
+/// revert forge appends at the very end), with the elided middle replaced by
+/// a marker. Head-only truncation destroys the failure tail, which is the
+/// only part graders read via their 4K tail slices.
+pub(super) fn truncate_str_head_tail(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let tail_len = (max / 4).max(1);
+    let head_len = max - tail_len;
+    let mut head_end = head_len;
+    while head_end > 0 && !s.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    let raw_tail_start = s.len() - tail_len;
+    let mut tail_start = raw_tail_start;
+    while tail_start < s.len() && !s.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    let elided = if tail_start > head_end {
+        tail_start - head_end
+    } else {
+        // Degenerate (max too small for a head+tail split): fall back to
+        // head-only truncation.
+        return truncate_str(s, max);
+    };
+    format!(
+        "{}\n… [{} bytes truncated] …\n{}",
+        &s[..head_end],
+        elided,
+        &s[tail_start..]
+    )
+}
+
 /// Last `~n` bytes of `s` with a "…[N bytes earlier]" marker — only used
 /// when assembling agent-facing tool feedback. The cut is snapped UP to the
 /// nearest UTF-8 char boundary so slicing forge trace output (which contains
@@ -681,5 +727,17 @@ mod truncate_tests {
         let s = "┗━┛";
         assert_eq!(tail_str(s, 1_000), s);
         assert_eq!(truncate_str(s, 1_000), s);
+    }
+
+    #[test]
+    fn head_tail_keeps_failure_tail_and_stays_utf8_safe() {
+        use super::truncate_str_head_tail;
+        let s = format!("{}COUNTEREXAMPLE_TAIL", "┗".repeat(2_000));
+        let out = truncate_str_head_tail(&s, 400);
+        assert!(out.ends_with("COUNTEREXAMPLE_TAIL"));
+        assert!(out.contains("bytes truncated"));
+        assert!(out.len() < s.len());
+        // Under budget: untouched.
+        assert_eq!(truncate_str_head_tail("short", 400), "short");
     }
 }

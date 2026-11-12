@@ -121,7 +121,9 @@ impl FuzzRuntime {
     ) -> Option<LinkInput> {
         let extract = self.extracted_by_id.get(&extract_id)?;
         let record = self.historical_by_id.get(&historical_id)?;
-        let strength = *self.match_strength_by_pair.get(&(extract_id, historical_id))?;
+        let strength = *self
+            .match_strength_by_pair
+            .get(&(extract_id, historical_id))?;
         LinkInput::materialize_exact(
             LinkKey {
                 extract_id,
@@ -182,7 +184,10 @@ async fn match_set_for(
 
     // Move historicals into the index (no clone); build the (E, H) strength
     // index for exact materialization.
-    let SemanticMatchSet { historicals, matches } = match_set;
+    let SemanticMatchSet {
+        historicals,
+        matches,
+    } = match_set;
     let historical_by_id: BTreeMap<i32, HistoricalSemanticRecord> = historicals
         .into_iter()
         .map(|record| (record.semantic.id, record))
@@ -377,7 +382,6 @@ struct RestartSnapshot {
 struct AgentLoopState {
     kind: HarnessKind,
     spec_id: i32,
-    harness_dir: PathBuf,
     options: FuzzOptions,
     project_index: Arc<ProjectIndex>,
     spec_arc: Arc<AuditSpecification>,
@@ -437,7 +441,6 @@ impl AgentLoopState {
         Ok(Self {
             kind,
             spec_id,
-            harness_dir: harness_dir.to_path_buf(),
             options: options.clone(),
             project_index: project_index.clone(),
             spec_arc: Arc::new(spec.clone()),
@@ -694,10 +697,7 @@ impl AgentLoopState {
                     } else {
                         String::new()
                     };
-                    return AttemptOutcome::AgentError(format!(
-                        "step {}: {e}{hint}",
-                        *total_steps
-                    ));
+                    return AttemptOutcome::AgentError(format!("step {}: {e}{hint}", *total_steps));
                 }
             };
             *total_steps += 1;
@@ -772,7 +772,10 @@ impl AgentLoopState {
             .harness_filename
             .as_deref()
             .map(|f| {
-                let abs = self.harness_dir.join(f);
+                // The write tool lands harness files in the per-spec scratch
+                // dir, not the shared harness_dir — joining harness_dir here
+                // persisted a broken relative path in the DB.
+                let abs = self.per_spec_dir.join(f);
                 abs.strip_prefix(&self.options.repo_root)
                     .map(|p| p.to_string_lossy().into_owned())
                     .unwrap_or_else(|_| abs.to_string_lossy().into_owned())
@@ -987,8 +990,7 @@ impl SolidityHarnessGenerator {
 
         let mut tasks: Vec<FuzzTask> = Vec::with_capacity(pending.len());
         for p in pending {
-            let Some(link) =
-                runtime.materialize_link(p.semantic_id, p.historical_id, p.finding_id)
+            let Some(link) = runtime.materialize_link(p.semantic_id, p.historical_id, p.finding_id)
             else {
                 skipped_no_link += 1;
                 continue;

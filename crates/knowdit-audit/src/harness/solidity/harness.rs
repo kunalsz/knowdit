@@ -35,6 +35,13 @@ pub(super) fn build_system_prompt(
     };
     let spec_json =
         serde_json::to_string_pretty(spec).unwrap_or_else(|_| "<unserializable>".into());
+    // KV-cache ordering (C-05): the run/project-static bulk (role, task
+    // framing, conventions, output shape, methodology, hard rules) comes
+    // FIRST so the provider's prefix cache stays warm across specs and
+    // restarts; the per-spec assignment (semantics, finding, spec JSON,
+    // spec_id, harness_dir) comes LAST. The skeleton and rules below use
+    // generic `<spec_id>` placeholders; the concrete values live in the
+    // assignment section.
     format!(
         r#"You are the Foundry Fuzzing Harness Generator agent for a knowledge-driven
 smart-contract auditing pipeline.
@@ -58,38 +65,15 @@ You receive both results back in the same tool response. Keep iterating
 post_attack violation** (`violated=true`). The orchestrator stops the loop
 on violation, on step-budget exhaustion, or on conversation-window
 exhaustion (a fresh agent is then restarted with a short summary of your
-last run).{coverage_via_ir_note}
-
-## Project DeFi semantic
-- id: {extract_id}
-- name: {extract_name}
-- definition: {extract_definition}
-- description: {extract_description}
-
-## Historical DeFi semantic
-- id: {historical_id}
-- name: {historical_name}
-- definition: {historical_definition}
-
-## Historical finding (use as topic context for the invariant)
-- id: {finding_id}
-- title: {finding_title}
-- root_cause: {finding_root_cause}
-- description: {finding_description}
-
-## AuditSpecification (spec_id={spec_id})
-
-```json
-{spec_json}
-```
+last run).
 
 ## Project Foundry conventions (USE THESE — copy/adapt the import paths)
 
-The harness file lives at `{harness_dir}/Test_{spec_id}.t.sol` (a per-spec
-subdirectory; concurrent specs each get their own dir so they don't share
-a compile graph). The forge subprocess runs from the project repository
-root. **Use the project's own remappings — do NOT write `../contracts/...`
-style imports**, they will not resolve.
+The harness file lives under the per-spec harness directory given in the
+assignment section below (concurrent specs each get their own dir so they
+don't share a compile graph). The forge subprocess runs from the project
+repository root. **Use the project's own remappings — do NOT write
+`../contracts/...` style imports**, they will not resolve.
 
 **Pragma**: copy the EXACT pragma from the sample test below (e.g.
 `pragma solidity ^0.8.24;`). Mismatched pragmas trigger
@@ -121,7 +105,8 @@ Excerpt of one existing test's imports:
 
 # Output shape
 
-Write ONE `.sol` file with this skeleton:
+Write ONE `.sol` file with this skeleton (`<spec_id>` is your numeric
+assignment id from the assignment section):
 
 ```solidity
 // SPDX-License-Identifier: UNLICENSED
@@ -134,7 +119,7 @@ contract HandlerFor_<SemanticName> is Test {{
     // ghost variables / clamping as the Foundry handler pattern demands
 }}
 
-contract Test_{spec_id} is Test {{
+contract Test_<spec_id> is Test {{
     HandlerFor_<...> internal handler;
 
     function setUp() public {{
@@ -184,7 +169,7 @@ contract Test_{spec_id} is Test {{
    - `list_test_files()` / `read_file(file_path=...)` — survey patterns
    - `lookup_call_graph` / `read_function_source` — confirm signatures
    - `write_harness_file(filename, content)` — emit/overwrite the .sol
-   - `run_forge(match_contract="Test_{spec_id}")` — the orchestrator
+   - `run_forge(match_contract="Test_<spec_id>")` — the orchestrator
      runs `forge test` and (when the test exited 0 with calls > 0) auto-
      runs `forge coverage`.
    - Parse the result; compile error → fix; setUp revert → fix; calls=0
@@ -192,13 +177,41 @@ contract Test_{spec_id} is Test {{
 
 # Hard rules
 
-- Harness filename MUST be a basename like `Test_{spec_id}.t.sol`.
-- The test contract name MUST be `Test_{spec_id}` so you can pass it to
-  `--match-contract`.
+- Harness filename MUST be a basename like `Test_<spec_id>.t.sol` with
+  `<spec_id>` replaced by your assignment's numeric spec id.
+- The test contract name MUST be `Test_<spec_id>` (same substitution) so
+  you can pass it to `--match-contract`.
 - All imports MUST use the project's remappings — never `../contracts/...`.
 - Don't declare "done" in chat. The orchestrator decides when to stop.
-- Harness is written to: `{harness_dir}` (absolute path on disk).
-"#,
+
+## Harness assignment (spec_id={spec_id}, harness_dir={harness_dir})
+
+Harness files are written to: `{harness_dir}` (absolute path on disk, a
+per-spec subdirectory of the project harness root).
+
+### Project DeFi semantic
+- id: {extract_id}
+- name: {extract_name}
+- definition: {extract_definition}
+- description: {extract_description}
+
+### Historical DeFi semantic
+- id: {historical_id}
+- name: {historical_name}
+- definition: {historical_definition}
+
+### Historical finding (use as topic context for the invariant)
+- id: {finding_id}
+- title: {finding_title}
+- root_cause: {finding_root_cause}
+- description: {finding_description}
+
+### AuditSpecification (spec_id={spec_id})
+
+```json
+{spec_json}
+```
+{coverage_via_ir_note}"#,
         extract_id = link.extract_id,
         extract_name = link.extract.name,
         extract_definition = link.extract.definition.trim(),
@@ -236,6 +249,7 @@ contract Test_{spec_id} is Test {{
         } else {
             conv.sample_test_imports().to_string()
         },
+        coverage_via_ir_note = coverage_via_ir_note,
     )
 }
 

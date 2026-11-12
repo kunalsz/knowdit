@@ -217,7 +217,6 @@ impl ReviewGrader {
             .wrap_err("review agent: failed to serialize ReviewInput")?;
         let cache_suffix = format!("review-r{:06}-s{:06}", input.run_id, input.spec_id);
         let steps = drive_agent_loop(
-            &self.project_index,
             &self.llm,
             &self.options,
             review_system(&self.language_prompt_prefix, self.scope_override.as_deref()),

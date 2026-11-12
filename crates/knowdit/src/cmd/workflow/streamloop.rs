@@ -1063,7 +1063,24 @@ impl<B: HarnessBackend + Clone + 'static> LinkContext<B> {
         let (children, child_code_gens) = self
             .regen_active_specs(ordinal, cycle, active_spec_ids, drain, &scopes.regen)
             .await?;
-        code_gen_ids.extend(child_code_gens);
+        code_gen_ids.extend(child_code_gens.iter().copied());
+        // Regen-produced codegens (codegen_regen rewrites the same spec's
+        // harness; spec_regen commits a Completed codegen for the child
+        // spec) never re-enter the fuzz path — `fuzz_one_existing_spec`
+        // skips specs that already hold a resumable codegen. Reflecting
+        // them HERE is what turns regen output into graded verdicts;
+        // otherwise every exploit found during IncompleteStep /
+        // IncompleteSpecification regen is silently dropped.
+        if !child_code_gens.is_empty() {
+            self.reflect_produced_codegens(
+                ordinal,
+                cycle,
+                &child_code_gens,
+                drain,
+                &scopes.reflect,
+            )
+            .await?;
+        }
         tracing::info!(
             "[streamloop link {ordinal:04}] cycle {cycle}/{}: finished — {} spec(s) feed into next cycle ({} total)",
             self.max_inner_cycles,
@@ -1415,12 +1432,8 @@ impl RunUsageReport {
     /// Compute `run_total` = profile + extract + mapper + the aggregate
     /// per-link `link_total` (never a sum over possibly-truncated detail rows).
     pub(crate) fn finalize_total(&mut self) {
-        self.run_total = PhaseUsage::sum([
-            &self.profile,
-            &self.extract,
-            &self.mapper,
-            &self.link_total,
-        ]);
+        self.run_total =
+            PhaseUsage::sum([&self.profile, &self.extract, &self.mapper, &self.link_total]);
     }
 
     /// Write to `<output_folder>/usage/run_usage.json` (atomic tmp+rename).
@@ -1546,7 +1559,9 @@ impl<B: HarnessBackend + Clone + 'static> LinkScheduler<B> {
                 if let Ok(mut slot) = self.phase.lock() {
                     *slot = format!("link {ordinal:04}/{total} (active={})", tasks.len());
                 }
-                self.memory.links_active.store(tasks.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                self.memory
+                    .links_active
+                    .store(tasks.len() as u64, std::sync::atomic::Ordering::Relaxed);
                 tasks.spawn(async move { ctx.run_link(work).await });
                 launched += 1;
             }
@@ -1555,8 +1570,12 @@ impl<B: HarnessBackend + Clone + 'static> LinkScheduler<B> {
             };
             match joined {
                 Ok(Ok(tally)) => {
-                    self.memory.links_done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    self.memory.steps.fetch_add(tally.specs as u64, std::sync::atomic::Ordering::Relaxed);
+                    self.memory
+                        .links_done
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    self.memory
+                        .steps
+                        .fetch_add(tally.specs as u64, std::sync::atomic::Ordering::Relaxed);
                     stats.processed_links += 1;
                     stats.built_specs += tally.specs;
                     if tally.abandoned {

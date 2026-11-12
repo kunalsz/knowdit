@@ -30,7 +30,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 use super::utils::{
-    AttemptHandle, ForgeTestSummary, RecordedRun, parse_lcov, tail_str, truncate_str,
+    AttemptHandle, ForgeTestSummary, RecordedRun, parse_lcov, tail_str, truncate_str_head_tail,
 };
 use crate::harness::forge::ForgeRunner;
 use crate::types::AuditSpecification;
@@ -126,8 +126,12 @@ impl RunForgeTool {
             runs: self.test_runs as i64,
             forge_args: test_argv.clone(),
             exit_code: test_out.exit_code,
-            stdout: truncate_str(&test_out.stdout, 200_000),
-            stderr: truncate_str(&test_out.stderr, 200_000),
+            // Head+tail, not head-only: `-vvvvvv` runs reach 10-400 MB and
+            // the counterexample / assertion revert sit at the very end —
+            // graders slice the LAST 4K of this field, so head-only
+            // truncation showed them bytes ~196K..200K of mid-setup noise.
+            stdout: truncate_str_head_tail(&test_out.stdout, 200_000),
+            stderr: truncate_str_head_tail(&test_out.stderr, 200_000),
             duration_ms: test_out.duration_ms,
             violated: test_summary.violated,
             sequence: test_summary.counterexample_json.clone(),
@@ -152,7 +156,11 @@ impl RunForgeTool {
         let (source_hash, cached_hit) = {
             let guard = self.attempt.0.lock().await;
             let hash = guard.source_sha256();
-            let hit = match (hash, guard.last_covered_source_sha256, &guard.cached_gate2_verdict) {
+            let hit = match (
+                hash,
+                guard.last_covered_source_sha256,
+                &guard.cached_gate2_verdict,
+            ) {
                 (Some(h), Some(prev), Some(cached_verdict)) if h == prev => {
                     Some((cached_verdict.clone(), guard.last_coverage_row_count))
                 }
@@ -163,8 +171,7 @@ impl RunForgeTool {
 
         let eligible_for_coverage = test_gate_verdict.is_none()
             && !test_out.timed_out
-            && (test_summary.violated
-                || (test_out.exit_code == 0 && test_summary.total_calls > 0));
+            && (test_summary.violated || (test_out.exit_code == 0 && test_summary.total_calls > 0));
         let run_coverage = eligible_for_coverage && cached_hit.is_none();
 
         let mut cov_summary: Option<CoverageBlockBundle> = None;
@@ -207,8 +214,8 @@ impl RunForgeTool {
                         runs: self.coverage_runs as i64,
                         forge_args: cov_argv.clone(),
                         exit_code: out.exit_code,
-                        stdout: truncate_str(&out.stdout, 200_000),
-                        stderr: truncate_str(&out.stderr, 200_000),
+                        stdout: truncate_str_head_tail(&out.stdout, 200_000),
+                        stderr: truncate_str_head_tail(&out.stderr, 200_000),
                         duration_ms: out.duration_ms,
                         violated: false,
                         sequence: None,
@@ -226,12 +233,26 @@ impl RunForgeTool {
             }
         }
 
+        // Gate enforcement: a violated run only terminates the loop when
+        // BOTH inline gates passed. Gate 1 failure = `test_gate_verdict`;
+        // Gate 2 failure comes from this run's coverage block, or from the
+        // cached verdict when coverage was skipped for an unchanged source
+        // hash. Broken / mocked / disjoint harnesses therefore keep
+        // iterating instead of terminating early and flooding the graders.
+        let gate2_failed = match &cov_summary {
+            Some(block) => block.gate_verdict.is_some(),
+            None => cached_hit
+                .as_ref()
+                .is_some_and(|(verdict, _)| verdict.is_some()),
+        };
+        let violation_accepted =
+            test_summary.violated && test_gate_verdict.is_none() && !gate2_failed;
         let mut state = self.attempt.0.lock().await;
         state.runs.push(RecordedRun {
             record: test_record.clone(),
             coverage_idx: None,
         });
-        if test_summary.violated {
+        if violation_accepted {
             state.violation_observed = true;
         }
         state.last_test_calls = test_summary.total_calls.max(0) as u64;
@@ -254,8 +275,7 @@ impl RunForgeTool {
                 state.cached_gate2_verdict = Some(block.gate_verdict.clone());
                 state.last_coverage_row_count = block.coverage.len();
             }
-        } else if eligible_for_coverage
-            && let Some((ref cached_verdict, cached_rows)) = cached_hit
+        } else if eligible_for_coverage && let Some((ref cached_verdict, cached_rows)) = cached_hit
         {
             state.last_gate_passed = cached_verdict.is_none() && cached_rows > 0;
         } else {
@@ -273,10 +293,26 @@ impl RunForgeTool {
             } else {
                 "invariant counter-example produced"
             };
-            sections.push(format!(
-                "[SUCCESS — violation observed] {kind}. The orchestrator will terminate after \
-                 this turn."
-            ));
+            if violation_accepted {
+                sections.push(format!(
+                    "[SUCCESS — violation observed] {kind}. The orchestrator will terminate after \
+                     this turn."
+                ));
+            } else if test_gate_verdict.is_some() {
+                sections.push(
+                    "[VIOLATION REJECTED BY GATE 1] Your run reported a violation, but Gate 1 \
+                     failed (see the gate verdict above). Fix the harness and call run_forge \
+                     again."
+                        .to_string(),
+                );
+            } else {
+                sections.push(
+                    "[VIOLATION REJECTED BY GATE 2] Your run reported a violation, but Gate 2 \
+                     coverage failed (see the gate verdict above). Fix the harness and call \
+                     run_forge again."
+                        .to_string(),
+                );
+            }
         } else if test_summary.total_calls == 0 && !test_summary.deterministic_test_failure {
             sections.push(
                 "[NO-OP] forge test ran but produced 0 calls AND no deterministic test_… revert. \
@@ -324,9 +360,7 @@ impl RunForgeTool {
                 "--- forge coverage stdout (last 4K) ---\n{}",
                 tail_str(&block.record.stdout, 4_000)
             ));
-        } else if eligible_for_coverage
-            && let Some((cached_verdict, cached_rows)) = &cached_hit
-        {
+        } else if eligible_for_coverage && let Some((cached_verdict, cached_rows)) = &cached_hit {
             if let Some(v) = cached_verdict {
                 sections.push(v.clone());
             }
@@ -441,9 +475,20 @@ pub(super) struct ListTestFilesTool {
 
 /// Vendored / build-output directory names skipped during the
 /// `list_test_files` scan. Hardcoded because they're project-tooling
-/// conventions (npm, foundry, hardhat), not knowdit knobs.
-const LIST_TEST_FILES_SKIP_DIRS: &[&str] =
-    &["node_modules", "lib", "out", "cache", "artifacts", ".git"];
+/// conventions (npm, foundry, hardhat), not knowdit knobs. Includes
+/// knowdit's own harness directory (`<repo>/test/knowdit_harness`): it
+/// lives under `test/`, so leaving it in would expose prior LLM harnesses
+/// as "existing project tests" and later agents would imitate their
+/// hallucinated setUp() patterns.
+const LIST_TEST_FILES_SKIP_DIRS: &[&str] = &[
+    "node_modules",
+    "lib",
+    "out",
+    "cache",
+    "artifacts",
+    ".git",
+    "knowdit_harness",
+];
 
 /// File extensions the `list_test_files` scan collects. Anything the
 /// agent might want to imitate when authoring a harness setUp(): solidity
@@ -664,14 +709,23 @@ fi
         tokio::fs::write(&mode_file, "clean_pass").await?;
         let out2 = tool.invoke(args.clone()).await?;
         assert!(out2.contains("ok: forge coverage"), "{out2}");
-        assert_eq!(tokio::fs::read_to_string(&cov_counter).await?.lines().count(), 1);
+        assert_eq!(
+            tokio::fs::read_to_string(&cov_counter)
+                .await?
+                .lines()
+                .count(),
+            1
+        );
         assert!(attempt.snapshot().await.last_gate_passed);
 
         // 3. Second clean pass with UNCHANGED `.sol` SHA-256 -> skips `forge coverage`!
         let out3 = tool.invoke(args.clone()).await?;
         assert!(out3.contains("SHA-256 unchanged"), "{out3}");
         assert_eq!(
-            tokio::fs::read_to_string(&cov_counter).await?.lines().count(),
+            tokio::fs::read_to_string(&cov_counter)
+                .await?
+                .lines()
+                .count(),
             1,
             "unchanged .sol must reuse cached Gate 2 verdict without spawning forge coverage"
         );
@@ -685,7 +739,10 @@ fi
         let out4 = tool.invoke(args).await?;
         assert!(out4.contains("[SUCCESS — violation observed]"), "{out4}");
         assert_eq!(
-            tokio::fs::read_to_string(&cov_counter).await?.lines().count(),
+            tokio::fs::read_to_string(&cov_counter)
+                .await?
+                .lines()
+                .count(),
             2,
             "uncovered violated .sol must run fast coverage once so reflect retains LCOV rows"
         );

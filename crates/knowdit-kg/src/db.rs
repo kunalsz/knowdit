@@ -2969,6 +2969,18 @@ impl HistoricalDatabase {
             if finding_is_processed && !include_unlinked {
                 continue;
             }
+            // Folded raw (merged into a canonical finding): the canonical
+            // already renders every folded variant in its own description
+            // cards, so linking the raw separately is a second LLM pass over
+            // the same mechanism with zero recall gain (~40% of all findings
+            // on large KGs). The canonical carries the family through both
+            // `link` and `retro-link`; the raw is marked link-complete
+            // alongside its canonical by `mark_finding_link_complete`.
+            // Applies even under `include_unlinked`: a forced re-link
+            // re-links the canonical, which re-covers the raw.
+            if canonical_id != finding.id {
+                continue;
+            }
 
             let taxonomy = finding_category_by_id.get(&finding.id).ok_or_else(|| {
                 KgError::other(format!("Finding {} is missing taxonomy", finding.id))
@@ -3039,6 +3051,11 @@ impl HistoricalDatabase {
     /// the `finding_link_status` row so downstream consumers start
     /// seeing the finding's links. No-op if the row already exists
     /// (resume-safe).
+    ///
+    /// Also marks the findings folded (merged) into `finding_id` as
+    /// link-complete in the same transaction: folded raws are skipped by
+    /// [`Self::list_findings_for_linking`] (their canonical renders their
+    /// variants), so completing the canonical completes the family.
     pub async fn mark_finding_link_complete(&self, finding_id: i32) -> Result<()> {
         let txn = self.db.begin().await?;
         let existing = finding_link_status::Entity::find_by_id(finding_id)
@@ -3050,6 +3067,25 @@ impl HistoricalDatabase {
             })
             .exec(&txn)
             .await?;
+        }
+        let folded_raw_ids: Vec<i32> = finding_merge::Entity::find()
+            .filter(finding_merge::Column::ToFindingId.eq(finding_id))
+            .all(&txn)
+            .await?
+            .into_iter()
+            .map(|merge| merge.from_finding_id)
+            .collect();
+        for raw_id in folded_raw_ids {
+            let raw_existing = finding_link_status::Entity::find_by_id(raw_id)
+                .one(&txn)
+                .await?;
+            if raw_existing.is_none() {
+                finding_link_status::Entity::insert(finding_link_status::ActiveModel {
+                    audit_finding_id: Set(raw_id),
+                })
+                .exec(&txn)
+                .await?;
+            }
         }
         txn.commit().await?;
         Ok(())
@@ -3600,16 +3636,33 @@ impl HistoricalDatabase {
                 .filter(semantic_finding_link::Column::AuditFindingId.eq(edge.audit_finding_id))
                 .one(&txn)
                 .await?;
-            if already.is_none() {
-                semantic_finding_link::Entity::insert(semantic_finding_link::ActiveModel {
-                    semantic_node_id: Set(edge.semantic_node_id),
-                    audit_finding_id: Set(edge.audit_finding_id),
-                    strength: Set(edge.strength),
-                    evidence: Set(edge.evidence.clone()),
-                })
-                .exec(&txn)
-                .await?;
-                inserted += 1;
+            match already {
+                None => {
+                    semantic_finding_link::Entity::insert(semantic_finding_link::ActiveModel {
+                        semantic_node_id: Set(edge.semantic_node_id),
+                        audit_finding_id: Set(edge.audit_finding_id),
+                        strength: Set(edge.strength),
+                        evidence: Set(edge.evidence.clone()),
+                    })
+                    .exec(&txn)
+                    .await?;
+                    inserted += 1;
+                }
+                Some(existing_row) => {
+                    // Strongest-strength wins, same rule as
+                    // `upsert_finding_link_rows`: a retro-discovered High /
+                    // Medium link must UPGRADE the stale Low row instead of
+                    // being dropped, or retro-linked canonicals stay stuck
+                    // at Low forever. Equal-or-weaker incoming edges keep
+                    // the existing row (no per-cycle downgrade).
+                    if edge.strength.rank() > existing_row.strength.rank() {
+                        let mut active: semantic_finding_link::ActiveModel = existing_row.into();
+                        active.strength = Set(edge.strength);
+                        active.evidence = Set(edge.evidence.clone());
+                        active.update(&txn).await?;
+                        inserted += 1;
+                    }
+                }
             }
         }
         txn.commit().await?;
@@ -8228,12 +8281,10 @@ INSERT INTO `demo` (`value`) VALUES ('backslash \' quote');
 
         // Delete two Solana subcategories to simulate opening a pre-upgrade kg.db.
         finding_category::Entity::delete_many()
-            .filter(
-                finding_category::Column::Name.is_in([
-                    "Missing Signer or Account Owner Validation",
-                    "Stale Account State Read After CPI",
-                ]),
-            )
+            .filter(finding_category::Column::Name.is_in([
+                "Missing Signer or Account Owner Validation",
+                "Stale Account State Read After CPI",
+            ]))
             .exec(&db.db)
             .await
             .expect("delete simulated new subcategories");
@@ -8244,7 +8295,9 @@ INSERT INTO `demo` (`value`) VALUES ('backslash \' quote');
             .expect("query reduced rows");
         assert_eq!(reduced.len(), FINDING_TAXONOMY.len() - 2);
 
-        db.init().await.expect("re-init backfills missing subcategories");
+        db.init()
+            .await
+            .expect("re-init backfills missing subcategories");
         let backfilled = finding_category::Entity::find()
             .all(&db.db)
             .await
@@ -8268,6 +8321,70 @@ INSERT INTO `demo` (`value`) VALUES ('backslash \' quote');
             .expect("query rows after second init");
         assert_eq!(after_second.len(), FINDING_TAXONOMY.len());
 
+        drop(db);
+        cleanup_test_db(&path);
+    }
+
+    #[tokio::test]
+    async fn append_semantic_finding_links_upgrades_weaker_rows_only() {
+        let (db, path) = create_test_db().await;
+        let node = semantic_node::Entity::insert(semantic_node::ActiveModel {
+            name: Set("n".to_string()),
+            category: Set(DeFiCategory::Others),
+            definition: Set("d".to_string()),
+            description: Set("d".to_string()),
+            ..Default::default()
+        })
+        .exec(&db.db)
+        .await
+        .unwrap()
+        .last_insert_id;
+        let finding = audit_finding::Entity::insert(audit_finding::ActiveModel {
+            title: Set("f".to_string()),
+            severity: Set(audit_finding::FindingSeverity::High),
+            root_cause: Set("rc".to_string()),
+            description: Set("d".to_string()),
+            patterns: Set("p".to_string()),
+            exploits: Set("e".to_string()),
+            ..Default::default()
+        })
+        .exec(&db.db)
+        .await
+        .unwrap()
+        .last_insert_id;
+        let edge = |strength, evidence: &str| LinkEdge {
+            semantic_node_id: node,
+            audit_finding_id: finding,
+            strength,
+            evidence: evidence.to_string(),
+        };
+        assert_eq!(
+            db.append_semantic_finding_links(&[edge(LinkStrength::Low, "weak")])
+                .await
+                .unwrap(),
+            1
+        );
+        // Upgrade Low -> High counts and rewrites the row.
+        assert_eq!(
+            db.append_semantic_finding_links(&[edge(LinkStrength::High, "strong")])
+                .await
+                .unwrap(),
+            1
+        );
+        // A later weaker edge must NOT downgrade.
+        assert_eq!(
+            db.append_semantic_finding_links(&[edge(LinkStrength::Low, "weak again")])
+                .await
+                .unwrap(),
+            0
+        );
+        let row = semantic_finding_link::Entity::find()
+            .one(&db.db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.strength, LinkStrength::High);
+        assert_eq!(row.evidence, "strong");
         drop(db);
         cleanup_test_db(&path);
     }

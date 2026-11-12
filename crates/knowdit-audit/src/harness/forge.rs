@@ -37,8 +37,7 @@ static PREFLIGHT_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// Lossy UTF-8 conversion that reuses the buffer when it is already valid
 /// (the common case) instead of allocating and copying a second copy.
 fn bytes_into_string(bytes: Vec<u8>) -> String {
-    String::from_utf8(bytes)
-        .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
+    String::from_utf8(bytes).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }
 
 fn tail_utf8(s: &str, max_bytes: usize) -> &str {
@@ -165,9 +164,9 @@ impl ForgeSlotPool {
         };
         let work_dir_owned = work_dir.to_path_buf();
         let paths = cell
-            .get_or_try_init(|| async move {
-                Self::init_slot_on_disk(&work_dir_owned, slot_idx).await
-            })
+            .get_or_try_init(
+                || async move { Self::init_slot_on_disk(&work_dir_owned, slot_idx).await },
+            )
             .await?;
         Ok(paths.clone())
     }
@@ -1052,16 +1051,35 @@ impl Drop for ForgeHandle {
                 // declaration order; no manual sequencing needed.
             }
             #[cfg(target_os = "linux")]
-            ForgeHandle::Docker { container_name, .. } => {
-                // Killing the docker CLI client (tokio kill_on_drop) does
-                // NOT reliably propagate to the daemon-managed container,
-                // so explicitly tell dockerd to kill it. SIGKILL is
-                // `docker kill`'s default. Best-effort, fire-and-forget.
-                let _ = std::process::Command::new("docker")
-                    .args(["kill", container_name.as_str()])
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .spawn();
+            ForgeHandle::Docker {
+                child,
+                container_name,
+            } => {
+                // The foreground `docker run` CLI exits together with the
+                // container, so after a normal `wait_with_output` (child
+                // taken + reaped) the container is already gone — spawning
+                // `docker kill` here would only leak a never-reaped
+                // `<defunct>` PID per invocation. Only kill on the
+                // abnormal-exit paths (timeout / cancellation) where the
+                // child is still alive.
+                if child.is_some() {
+                    // Killing the docker CLI client (tokio kill_on_drop) does
+                    // NOT reliably propagate to the daemon-managed container,
+                    // so explicitly tell dockerd to kill it. SIGKILL is
+                    // `docker kill`'s default. Best-effort, fire-and-forget —
+                    // but reaped on a detached thread so Drop never leaks a
+                    // zombie either.
+                    if let Ok(mut killer) = std::process::Command::new("docker")
+                        .args(["kill", container_name.as_str()])
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .spawn()
+                    {
+                        std::thread::spawn(move || {
+                            let _ = killer.wait();
+                        });
+                    }
+                }
             }
         }
     }
@@ -1127,7 +1145,8 @@ mod lock_timeout_tests {
         let waited = started.elapsed();
 
         assert!(
-            err.to_string().contains("waiting for the shared forge slot pool"),
+            err.to_string()
+                .contains("waiting for the shared forge slot pool"),
             "unexpected error: {err}"
         );
         assert!(
@@ -1173,7 +1192,10 @@ mod lock_timeout_tests {
 
         // Seed `.knowdit-forge-slots/template/{out,cache}` to verify lazy slot cloning.
         let tpl_out = work_dir.join(FORGE_SLOTS_DIR).join("template").join("out");
-        let tpl_cache = work_dir.join(FORGE_SLOTS_DIR).join("template").join("cache");
+        let tpl_cache = work_dir
+            .join(FORGE_SLOTS_DIR)
+            .join("template")
+            .join("cache");
         tokio::fs::create_dir_all(&tpl_out).await?;
         tokio::fs::create_dir_all(&tpl_cache).await?;
         tokio::fs::write(tpl_out.join("Seeded.json"), b"{\"abi\":[]}").await?;

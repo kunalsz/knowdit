@@ -649,10 +649,7 @@ impl RepoDatabase {
                 .exec(&txn)
                 .await
                 .wrap_err_with(|| {
-                    format!(
-                        "failed to append project semantic function {}",
-                        function_id
-                    )
+                    format!("failed to append project semantic function {}", function_id)
                 })?;
             }
         }
@@ -2032,9 +2029,7 @@ impl RepoDatabase {
 
         // Variant notes: only this canonical's merged children matter.
         let sem_notes: Vec<String> = historical_semantic_merge_model::Entity::find()
-            .filter(
-                historical_semantic_merge_model::Column::ToSemanticId.eq(historical_id),
-            )
+            .filter(historical_semantic_merge_model::Column::ToSemanticId.eq(historical_id))
             .all(&self.db)
             .await
             .wrap_err("failed to load historical_semantic_merge rows")?
@@ -2106,32 +2101,33 @@ impl RepoDatabase {
         let findings = link_rows
             .into_iter()
             .filter_map(|link| {
-                findings_by_id.get(&link.historical_finding_id).cloned().map(|finding| {
-                    let (dn, pn, xn) = finding_notes
-                        .get(&finding.id)
-                        .unwrap_or(&no_notes);
-                    HistoricalLinkedFinding {
-                        rendered_description: render_with_variants(
-                            &finding.description,
-                            dn,
-                            variant_render_cap,
-                        ),
-                        rendered_patterns: render_with_variants(
-                            &finding.patterns,
-                            pn,
-                            variant_render_cap,
-                        ),
-                        rendered_exploits: render_with_variants(
-                            &finding.exploits,
-                            xn,
-                            variant_render_cap,
-                        ),
-                        raw_children: Vec::new(),
-                        finding,
-                        strength: link.strength,
-                        evidence: link.evidence,
-                    }
-                })
+                findings_by_id
+                    .get(&link.historical_finding_id)
+                    .cloned()
+                    .map(|finding| {
+                        let (dn, pn, xn) = finding_notes.get(&finding.id).unwrap_or(&no_notes);
+                        HistoricalLinkedFinding {
+                            rendered_description: render_with_variants(
+                                &finding.description,
+                                dn,
+                                variant_render_cap,
+                            ),
+                            rendered_patterns: render_with_variants(
+                                &finding.patterns,
+                                pn,
+                                variant_render_cap,
+                            ),
+                            rendered_exploits: render_with_variants(
+                                &finding.exploits,
+                                xn,
+                                variant_render_cap,
+                            ),
+                            raw_children: Vec::new(),
+                            finding,
+                            strength: link.strength,
+                            evidence: link.evidence,
+                        }
+                    })
             })
             .collect();
 
@@ -2359,6 +2355,7 @@ impl RepoDatabase {
     pub async fn insert_specification(&self, record: &SpecificationRecord) -> Result<i32> {
         let inserted = specification_model::Entity::insert(specification_model::ActiveModel {
             semantic_id: Set(record.semantic_id),
+            historical_id: Set(record.historical_id),
             finding_id: Set(record.finding_id),
             specification: Set(record.specification_json.clone()),
             ..Default::default()
@@ -2480,22 +2477,22 @@ impl RepoDatabase {
             let run_id = run_inserted.last_insert_id;
 
             if let Some(entries) = coverage_per_run.get(idx) {
-                for entry in entries {
-                    line_coverage_model::Entity::insert(line_coverage_model::ActiveModel {
+                for chunk in entries.chunks(500) {
+                    let models = chunk.iter().map(|entry| line_coverage_model::ActiveModel {
                         run_id: Set(run_id),
                         relative_contract_path: Set(entry.relative_contract_path.clone()),
                         line_number: Set(entry.line_number),
                         hit_count: Set(entry.hit_count),
                         ..Default::default()
-                    })
-                    .exec(&txn)
-                    .await
-                    .wrap_err_with(|| {
-                        format!(
-                            "failed to insert line_coverage for regen run_id={run_id} path={}",
-                            entry.relative_contract_path
-                        )
-                    })?;
+                    });
+                    line_coverage_model::Entity::insert_many(models)
+                        .exec(&txn)
+                        .await
+                        .wrap_err_with(|| {
+                            format!(
+                                "failed to batch-insert line_coverage for regen run_id={run_id}"
+                            )
+                        })?;
                 }
             }
         }
@@ -2571,7 +2568,9 @@ impl RepoDatabase {
                 <$entity>::delete_many()
                     .exec(&txn)
                     .await
-                    .wrap_err_with(|| format!("failed to clear {} during regenerate reset", $label))?;
+                    .wrap_err_with(|| {
+                        format!("failed to clear {} during regenerate reset", $label)
+                    })?;
             };
         }
 
@@ -2721,21 +2720,35 @@ impl RepoDatabase {
         }
         let spec_ids: Vec<i32> = specs.iter().map(|s| s.id).collect();
 
-        let any_codegen = code_gen_model::Entity::find()
+        let built_spec_ids: std::collections::HashSet<i32> = code_gen_model::Entity::find()
             .filter(code_gen_model::Column::SpecId.is_in(spec_ids.clone()))
-            .one(&self.db)
+            .filter(code_gen_model::Column::Status.is_in([
+                CodeGenStatus::Completed,
+                CodeGenStatus::Duplicate,
+                CodeGenStatus::SkippedViability,
+            ]))
+            .all(&self.db)
             .await
             .wrap_err_with(|| {
                 format!(
                     "failed to query code_gen rows for specs of ({extract_id}, {historical_id}, {finding_id})"
                 )
             })?
-            .is_some();
+            .into_iter()
+            .map(|r| r.spec_id)
+            .collect();
 
-        Ok(if any_codegen {
+        let remaining_ids: Vec<i32> = spec_ids
+            .into_iter()
+            .filter(|id| !built_spec_ids.contains(id))
+            .collect();
+
+        Ok(if remaining_ids.is_empty() {
             LinkResumeState::Built
         } else {
-            LinkResumeState::Partial { spec_ids }
+            LinkResumeState::Partial {
+                spec_ids: remaining_ids,
+            }
         })
     }
 
@@ -2868,14 +2881,23 @@ impl RepoDatabase {
                         out.insert(*key, state);
                     }
                     Some(ids) => {
-                        if ids.iter().any(|id| built_spec_ids.contains(id)) {
+                        let mut remaining_ids: Vec<i32> = ids
+                            .iter()
+                            .copied()
+                            .filter(|id| !built_spec_ids.contains(id))
+                            .collect();
+                        if remaining_ids.is_empty() {
                             out.insert(*key, LinkResumeState::Built);
                         } else {
-                            // Rows arrive ordered by id ASC, so `ids` is
+                            // Rows arrive ordered by id ASC, so `remaining_ids` is
                             // already ascending; sort defensively anyway.
-                            let mut ids = ids.clone();
-                            ids.sort_unstable();
-                            out.insert(*key, LinkResumeState::Partial { spec_ids: ids });
+                            remaining_ids.sort_unstable();
+                            out.insert(
+                                *key,
+                                LinkResumeState::Partial {
+                                    spec_ids: remaining_ids,
+                                },
+                            );
                         }
                     }
                 }
@@ -2970,14 +2992,17 @@ pub(crate) fn specification_resume_query(
 ///
 /// Selects **only** `spec_id` — never the harness source/path payload. Exposed
 /// as a standalone builder so the projection can be asserted in tests.
-pub(crate) fn codegen_resume_query(
-    spec_ids: Vec<i32>,
-) -> sea_orm::Select<code_gen_model::Entity> {
+pub(crate) fn codegen_resume_query(spec_ids: Vec<i32>) -> sea_orm::Select<code_gen_model::Entity> {
     use sea_orm::{ColumnTrait, QueryFilter, QuerySelect};
     code_gen_model::Entity::find()
         .select_only()
         .column(code_gen_model::Column::SpecId)
         .filter(code_gen_model::Column::SpecId.is_in(spec_ids))
+        .filter(code_gen_model::Column::Status.is_in([
+            CodeGenStatus::Completed,
+            CodeGenStatus::Duplicate,
+            CodeGenStatus::SkippedViability,
+        ]))
 }
 
 /// Projected `abandoned_link` query used by [`RepoDatabase::load_link_resume_states`].
@@ -3128,22 +3153,20 @@ impl RepoDatabase {
             run_ids.push(run_id);
 
             if let Some(entries) = coverage_per_run.get(idx) {
-                for entry in entries {
-                    line_coverage_model::Entity::insert(line_coverage_model::ActiveModel {
+                for chunk in entries.chunks(500) {
+                    let models = chunk.iter().map(|entry| line_coverage_model::ActiveModel {
                         run_id: Set(run_id),
                         relative_contract_path: Set(entry.relative_contract_path.clone()),
                         line_number: Set(entry.line_number),
                         hit_count: Set(entry.hit_count),
                         ..Default::default()
-                    })
-                    .exec(&txn)
-                    .await
-                    .wrap_err_with(|| {
-                        format!(
-                            "failed to insert line_coverage for run_id={run_id} path={}",
-                            entry.relative_contract_path
-                        )
-                    })?;
+                    });
+                    line_coverage_model::Entity::insert_many(models)
+                        .exec(&txn)
+                        .await
+                        .wrap_err_with(|| {
+                            format!("failed to batch-insert line_coverage for run_id={run_id}")
+                        })?;
                 }
             }
         }
@@ -3160,15 +3183,26 @@ impl RepoDatabase {
     pub async fn loaded_completed_code_gen_spec_ids(
         &self,
     ) -> Result<std::collections::HashSet<i32>> {
+        use sea_orm::{ColumnTrait, FromQueryResult, QueryFilter, QuerySelect};
+
+        #[derive(FromQueryResult)]
+        struct SpecIdRow {
+            spec_id: i32,
+        }
+
         let rows = code_gen_model::Entity::find()
+            .select_only()
+            .column(code_gen_model::Column::SpecId)
+            .filter(code_gen_model::Column::Status.is_in([
+                CodeGenStatus::Completed,
+                CodeGenStatus::Duplicate,
+                CodeGenStatus::SkippedViability,
+            ]))
+            .into_model::<SpecIdRow>()
             .all(&self.db)
             .await
             .wrap_err("failed to load code_gen rows for resume index")?;
-        Ok(rows
-            .into_iter()
-            .filter(|row| row.status.counts_as_resumable_skip())
-            .map(|row| row.spec_id)
-            .collect())
+        Ok(rows.into_iter().map(|row| row.spec_id).collect())
     }
 
     /// Specification rows for one `(extract, historical)` pair. The novelty
@@ -3201,7 +3235,8 @@ impl RepoDatabase {
     }
 
     /// Load every canonical validated specification across the repository:
-    /// specs that have at least one `CodeGenStatus::Completed` row (excluding
+    /// specs that have at least one `CodeGenStatus::Completed` or
+    /// `CodeGenStatus::StepsExhausted` row (excluding
     /// `Duplicate` and `SkippedViability` rows as canonical targets), annotated
     /// with whether a `ReflectionResult::ValidFinding` exists for that spec.
     pub async fn load_terminal_specifications(&self) -> Result<Vec<TerminalSpecification>> {
@@ -3215,7 +3250,10 @@ impl RepoDatabase {
         let completed_rows = code_gen_model::Entity::find()
             .select_only()
             .column(code_gen_model::Column::SpecId)
-            .filter(code_gen_model::Column::Status.eq(CodeGenStatus::Completed))
+            .filter(
+                code_gen_model::Column::Status
+                    .is_in([CodeGenStatus::Completed, CodeGenStatus::StepsExhausted]),
+            )
             .into_model::<SpecIdRow>()
             .all(&self.db)
             .await

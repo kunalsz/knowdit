@@ -11,7 +11,7 @@ use serde::Deserialize;
 
 use super::runner::SolanaRunner;
 use super::solana_json::{SolanaCoverageMapper, SolanaParsedOutput};
-use super::utils::{RecordedSolanaRun, SolanaAttemptHandle, tail_str, truncate_str};
+use super::utils::{RecordedSolanaRun, SolanaAttemptHandle, tail_str, truncate_str_head_tail};
 use crate::types::AuditSpecification;
 
 // =============================================================================
@@ -119,13 +119,12 @@ impl RunSolanaTool {
         // Preserve panic / marker diagnostics in `HarnessRunRecord.stdout` as well as
         // `stderr` because downstream `VerdictGrader` / `SeverityGrader` inspect
         // `run.stdout_tail`.
-        let combined_stdout = if test_out.stderr.contains("panicked at")
-            || test_out.stderr.contains("KNOWDIT_")
-        {
-            format!("{}\n--- stderr ---\n{}", test_out.stdout, test_out.stderr)
-        } else {
-            test_out.stdout.clone()
-        };
+        let combined_stdout =
+            if test_out.stderr.contains("panicked at") || test_out.stderr.contains("KNOWDIT_") {
+                format!("{}\n--- stderr ---\n{}", test_out.stdout, test_out.stderr)
+            } else {
+                test_out.stdout.clone()
+            };
 
         let test_record = HarnessRunRecord {
             kind: RunKind::Test,
@@ -133,8 +132,8 @@ impl RunSolanaTool {
             runs: self.test_runs as i64,
             forge_args: test_argv.clone(),
             exit_code: test_out.exit_code,
-            stdout: truncate_str(&combined_stdout, 200_000),
-            stderr: truncate_str(&test_out.stderr, 200_000),
+            stdout: truncate_str_head_tail(&combined_stdout, 200_000),
+            stderr: truncate_str_head_tail(&test_out.stderr, 200_000),
             duration_ms: test_out.duration_ms,
             violated: test_summary.violated,
             sequence: test_summary.counterexample_json.clone(),
@@ -157,17 +156,31 @@ impl RunSolanaTool {
         let mut cov_bundle: Option<SolanaCoverageBundle> = None;
         if should_collect_coverage {
             cov_bundle = Some(
-                self.collect_dual_mode_coverage(&stem, &args, &parsed.executed_instructions, &test_summary)
-                    .await,
+                self.collect_dual_mode_coverage(
+                    &stem,
+                    &args,
+                    &parsed.executed_instructions,
+                    &test_summary,
+                )
+                .await,
             );
         }
 
+        // Gate enforcement: a violated run only terminates when both inline
+        // gates passed — Gate 1 (runtime audit) AND Gate 2 (dual-mode
+        // coverage). Skipping the Gate 2 check let broken / disjoint
+        // harnesses terminate immediately on any violated summary.
+        let gate2_failed = cov_bundle
+            .as_ref()
+            .is_some_and(|bundle| bundle.gate_verdict.is_some());
+        let violation_accepted =
+            test_summary.violated && test_gate_verdict.is_none() && !gate2_failed;
         let mut state = self.attempt.0.lock().await;
         state.runs.push(RecordedSolanaRun {
             record: test_record.clone(),
             coverage_idx: None,
         });
-        if test_summary.violated && test_gate_verdict.is_none() {
+        if violation_accepted {
             state.violation_observed = true;
         }
         state.last_test_calls = test_summary.total_calls.max(0) as u64;
@@ -211,6 +224,13 @@ impl RunSolanaTool {
                 "[VIOLATION REJECTED BY GATE 1] Your test reported a violation, but Gate 1 failed \
                  (e.g. setup_failed, >=95% revert rate, or counterexample calls did not touch \
                  `spec.sequence`). Fix the Gate 1 failure and call `run_solana` again."
+                    .to_string(),
+            );
+        } else if test_summary.violated && gate2_failed {
+            sections.push(
+                "[VIOLATION REJECTED BY GATE 2] Your test reported a violation, but Gate 2 \
+                 coverage failed (see the gate verdict below). Fix the harness and call \
+                 `run_solana` again."
                     .to_string(),
             );
         } else if test_summary.total_calls == 0 && !test_summary.deterministic_test_failure {
@@ -298,7 +318,10 @@ impl RunSolanaTool {
         let mut env = BTreeMap::new();
         env.insert("PROPTEST_CASES".to_string(), cases.max(1).to_string());
         if let Some(s) = seed {
-            env.insert("PROPTEST_RNG_SEED".to_string(), s.unsigned_abs().to_string());
+            env.insert(
+                "PROPTEST_RNG_SEED".to_string(),
+                s.unsigned_abs().to_string(),
+            );
         }
         env
     }
@@ -353,8 +376,8 @@ impl RunSolanaTool {
                             runs: self.coverage_runs as i64,
                             forge_args: cov_argv,
                             exit_code: out.exit_code,
-                            stdout: truncate_str(&out.stdout, 200_000),
-                            stderr: truncate_str(&out.stderr, 200_000),
+                            stdout: truncate_str_head_tail(&out.stdout, 200_000),
+                            stderr: truncate_str_head_tail(&out.stderr, 200_000),
                             duration_ms: out.duration_ms,
                             violated: false,
                             sequence: None,
@@ -556,21 +579,25 @@ edition = "2021"
 "#,
         )
         .expect("write Cargo.toml");
-        std::fs::write(per_spec_dir.join("src/lib.rs"), "pub fn ready() -> bool { true }\n")
-            .expect("write lib.rs");
+        std::fs::write(
+            per_spec_dir.join("src/lib.rs"),
+            "pub fn ready() -> bool { true }\n",
+        )
+        .expect("write lib.rs");
 
-        let analysis = knowdit_rust::RustStaticAnalyzer::analyze(&[knowdit_rust::RustSourceInput {
-            relative_path: PathBuf::from("programs/vault/src/lib.rs"),
-            content: r#"
+        let analysis =
+            knowdit_rust::RustStaticAnalyzer::analyze(&[knowdit_rust::RustSourceInput {
+                relative_path: PathBuf::from("programs/vault/src/lib.rs"),
+                content: r#"
                 #[program]
                 pub mod solana_vault {
                     pub fn deposit(amount: u64) {}
                     pub fn withdraw(amount: u64) {}
                 }
             "#
-            .to_string(),
-        }])
-        .expect("analyze");
+                .to_string(),
+            }])
+            .expect("analyze");
 
         let attempt = SolanaAttemptHandle::new();
         let write_tool = WriteSolanaHarnessFileTool {

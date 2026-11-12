@@ -93,16 +93,25 @@ pub(super) fn build_system_prompt(
             "## Reported finding (validate this specific issue)",
         ),
     };
-    let mut prompt = format!(
+    // KV-cache ordering (C-05): every byte before the `## Link data`
+    // section is static for the whole run (role, task framing, model
+    // rules, tool rules), so the provider's prefix cache stays warm
+    // across links. Per-link text must come LAST; interleaving it ahead
+    // of the static rules busted ~4K-6K tokens of cache per link.
+    let prompt = format!(
         r#"You are the Specification Generator agent for a knowledge-driven {role_label} auditing pipeline.
 
 ## Your task
 
 {task_paragraph}
 
-You operate per-link. The link below stays in your system prompt for the entire run.
+You operate per-link. The link data (project semantic, historical semantic, finding) appears under `## Link data` at the end of this prompt and stays in your system prompt for the entire run.
 
-## Project DeFi semantic (extracted from the current project)
+{SPEC_MODEL_AND_RULES}
+
+## Link data
+
+### Project DeFi semantic (extracted from the current project)
 - id: {extract_id}
 - category: {extract_category}
 - name: {extract_name}
@@ -113,7 +122,7 @@ You operate per-link. The link below stays in your system prompt for the entire 
 Use these as the primary source of truth for `setup.contracts` keys and `sequence` contract/function names. They are real extracted project functions, not conceptual labels:
 {extract_functions}
 
-## Historical DeFi semantic (from the knowledge graph; matched as encompassing the project's semantic)
+### Historical DeFi semantic (from the knowledge graph; matched as encompassing the project's semantic)
 - id: {historical_id}
 - category: {historical_category}
 - name: {historical_name}
@@ -148,8 +157,8 @@ Use these as the primary source of truth for `setup.contracts` keys and `sequenc
         finding_description = link.finding_rendered_description.trim(),
         finding_patterns = link.finding_rendered_patterns.trim(),
         finding_exploits = link.finding_rendered_exploits.trim(),
+        SPEC_MODEL_AND_RULES = SPEC_MODEL_AND_RULES,
     );
-    prompt.push_str(SPEC_MODEL_AND_RULES);
     apply_language_prefix(language_prompt_prefix, prompt)
 }
 
@@ -253,7 +262,6 @@ The `abort_reason` must cite the specific contracts/functions you inspected and 
 - A committed spec must be *defensible*: you can name the project functions in its sequence and the state variables in its invariants. But it does NOT need to be a verbatim reproduction of the historical finding — `related to` is enough.
 "#;
 
-
 /// Per-hint render caps for the pair-mode pack section. Generous enough to
 /// keep every concrete detail a hint carries; tight enough that a 10-hint
 /// pack stays a small fraction of the context window.
@@ -286,13 +294,20 @@ pub(super) fn build_pair_system_prompt(
     let historical = &link.historical;
     let extract_functions = render_extracted_functions(&extract.functions);
     let role_label = pipeline_role_label(language_prompt_prefix);
-    debug_assert!(!link.pack.is_empty(), "pair prompt requires a non-empty pack");
+    debug_assert!(
+        !link.pack.is_empty(),
+        "pair prompt requires a non-empty pack"
+    );
     let task_paragraph = match source {
-        LinkSource::Mapper => "You are given ONE `(project_semantic, historical_semantic)` pair from the Knowledge Mapper together with a **pack of historical findings** — independent write-ups from other projects that the global linker attached to the same historical semantic. They are *topic hints*, drawn from other projects; they likely will not fit the current project verbatim, and several of them may restate the same underlying mechanism. **Your task is to use the whole pack as starting points to look for every plausibly related issue inside the matched project semantic, and emit `AuditSpecification`(s) describing those issues.** A committed spec only needs to be *related* to the hint that seeded it (same root-cause family, same kind of state corruption, same exploit shape, or any concrete generalization/specialization of its mechanism). It does NOT have to be a verbatim reproduction.",
+        LinkSource::Mapper => {
+            "You are given ONE `(project_semantic, historical_semantic)` pair from the Knowledge Mapper together with a **pack of historical findings** — independent write-ups from other projects that the global linker attached to the same historical semantic. They are *topic hints*, drawn from other projects; they likely will not fit the current project verbatim, and several of them may restate the same underlying mechanism. **Your task is to use the whole pack as starting points to look for every plausibly related issue inside the matched project semantic, and emit `AuditSpecification`(s) describing those issues.** A committed spec only needs to be *related* to the hint that seeded it (same root-cause family, same kind of state corruption, same exploit shape, or any concrete generalization/specialization of its mechanism). It does NOT have to be a verbatim reproduction."
+        }
         // Externally-reported findings are concrete claims, not hints; pair
         // granularity is rejected upstream for them. Render the anchor as a
         // single reported finding if this path is ever hit.
-        LinkSource::External => "The anchor finding below was **reported against this exact project** (e.g. by an external audit). **Your task is to emit `AuditSpecification`(s) that reproduce this specific reported issue on the current code**, encoding its reported impact as the post_attack invariant.",
+        LinkSource::External => {
+            "The anchor finding below was **reported against this exact project** (e.g. by an external audit). **Your task is to emit `AuditSpecification`(s) that reproduce this specific reported issue on the current code**, encoding its reported impact as the post_attack invariant."
+        }
     };
     let mut pack_section = String::new();
     for (idx, hint) in link.pack.iter().enumerate() {
@@ -330,16 +345,31 @@ pub(super) fn build_pair_system_prompt(
         }
         prior_section.push('\n');
     }
-    let mut prompt = format!(
+    // KV-cache ordering (C-05): the run-static bulk (role, task framing,
+    // model rules, tool rules, pack-working rules) comes FIRST so the
+    // provider's prefix cache stays warm across pairs; the per-pair data
+    // (semantics, hint pack, prior commits) comes LAST.
+    let prompt = format!(
         r#"You are the Specification Generator agent for a knowledge-driven {role_label} auditing pipeline.
 
 ## Your task
 
 {task_paragraph}
 
-You operate per-pair: this one run covers the whole `(extract, historical)` pair, and the pack below stays in your system prompt for the entire run.
+You operate per-pair: this one run covers the whole `(extract, historical)` pair, and the pair data under `## Pair data` at the end of this prompt stays in your system prompt for the entire run.
 
-## Project DeFi semantic (extracted from the current project)
+## Working with the hint pack
+
+1. **Commit each DISTINCT issue exactly once.** Several hints often restate the same underlying bug from different projects. If two hints describe the same mechanism, one spec covers both — do not commit paraphrases. A fresh spec is justified by a different root cause, a different violated invariant, or a different impact — not by a different wording of the same idea.
+2. **Attribute every spec.** `commit_specification` requires `related_finding_id`: pass the `id` of the hint this spec most closely relates to. If the issue you found is unrelated to any single hint (you found it while exploring the semantic), attribute it to the anchor hint id — never invent an id.
+3. **The pack is a sample, not the syllabus.** The historical semantic carries more findings than this pack shows. After covering what the hints suggest, continue the normal methodology: explore the semantic's full surface area for related issues the pack never hints at.
+4. **Do not abandon just because one hint doesn't apply.** The pack is judged as a whole: only finalize `abandoned` when NO hint (and no related exploration) yields a plausibly related issue, under the strict criteria below.
+
+{SPEC_MODEL_AND_RULES}
+
+## Pair data
+
+### Project DeFi semantic (extracted from the current project)
 - id: {extract_id}
 - category: {extract_category}
 - name: {extract_name}
@@ -350,23 +380,16 @@ You operate per-pair: this one run covers the whole `(extract, historical)` pair
 Use these as the primary source of truth for `setup.contracts` keys and `sequence` contract/function names. They are real extracted project functions, not conceptual labels:
 {extract_functions}
 
-## Historical DeFi semantic (from the knowledge graph; matched as encompassing the project's semantic)
+### Historical DeFi semantic (from the knowledge graph; matched as encompassing the project's semantic)
 - id: {historical_id}
 - category: {historical_category}
 - name: {historical_name}
 - definition: {historical_definition}
 - description: {historical_description}
 
-## Historical finding pack (independent write-ups; use as topic hints, not strict templates)
+### Historical finding pack (independent write-ups; use as topic hints, not strict templates)
 
-{pack_section}{prior_section}## Working with the hint pack
-
-1. **Commit each DISTINCT issue exactly once.** Several hints often restate the same underlying bug from different projects. If two hints describe the same mechanism, one spec covers both — do not commit paraphrases. A fresh spec is justified by a different root cause, a different violated invariant, or a different impact — not by a different wording of the same idea.
-2. **Attribute every spec.** `commit_specification` requires `related_finding_id`: pass the `id` of the hint this spec most closely relates to. If the issue you found is unrelated to any single hint (you found it while exploring the semantic), attribute it to the anchor hint id — never invent an id.
-3. **The pack is a sample, not the syllabus.** The historical semantic carries more findings than this pack shows. After covering what the hints suggest, continue the normal methodology: explore the semantic's full surface area for related issues the pack never hints at.
-4. **Do not abandon just because one hint doesn't apply.** The pack is judged as a whole: only finalize `abandoned` when NO hint (and no related exploration) yields a plausibly related issue, under the strict criteria below.
-
-"#,
+{pack_section}{prior_section}"#,
         extract_id = link.extract_id,
         extract_category = extract.category.as_str(),
         extract_name = extract.name,
@@ -380,8 +403,8 @@ Use these as the primary source of truth for `setup.contracts` keys and `sequenc
         historical_description = link.historical_rendered_description.trim(),
         pack_section = pack_section,
         prior_section = prior_section,
+        SPEC_MODEL_AND_RULES = SPEC_MODEL_AND_RULES,
     );
-    prompt.push_str(SPEC_MODEL_AND_RULES);
     apply_language_prefix(language_prompt_prefix, prompt)
 }
 

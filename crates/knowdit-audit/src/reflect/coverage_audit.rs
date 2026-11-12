@@ -122,16 +122,18 @@ pub fn collect_report(
     let mut hit = 0usize;
     let mut expected = 0usize;
     for step in &spec.sequence {
-        let Some(function) = resolve_function(callgraph, step) else {
+        let candidates = resolve_functions(callgraph, step);
+        if candidates.is_empty() {
             steps.push(StepStatus::Unresolved);
             continue;
-        };
+        }
         expected += 1;
-        let path_key = function.relative_file_path.to_string_lossy().into_owned();
-        let was_hit = by_path
-            .get(&path_key)
-            .map(|covered| covered_intersects(covered, &function))
-            .unwrap_or(false);
+        let was_hit = candidates.iter().any(|function| {
+            let path_key = function.relative_file_path.to_string_lossy().into_owned();
+            by_path
+                .get(&path_key)
+                .is_some_and(|covered| covered_intersects(covered, function))
+        });
         if was_hit {
             hit += 1;
             steps.push(StepStatus::Hit {
@@ -172,34 +174,49 @@ fn group_coverage_by_path(coverage: &[CoverageEntry]) -> BTreeMap<String, Vec<&C
     by_path
 }
 
-fn resolve_function(callgraph: &CallGraph, step: &SuqenceCallStep) -> Option<Function> {
-    if let Some(c) = callgraph
+/// Resolve a sequence step to every concrete function it could execute.
+///
+/// Tiers (first non-empty wins):
+/// 1. Every function named `step.function` in EVERY contract named
+///    `step.contract` — all overloads, and all same-named contracts.
+/// 2. Any contract function with that name. Covers a step naming an
+///    interface (`IPool`) or a derived contract whose method is inherited
+///    from a base: the body lives in some other contract.
+/// 3. Interface declarations, last. They carry no executable lines, so they
+///    can never register LCOV hits; they are only returned so the step is
+///    reported `Missed` instead of `Unresolved` when no implementation
+///    exists in-project.
+///
+/// A step counts as hit when ANY returned candidate intersects covered lines.
+fn resolve_functions(callgraph: &CallGraph, step: &SuqenceCallStep) -> Vec<Function> {
+    let exact: Vec<Function> = callgraph
         .contracts
         .values()
-        .find(|c| c.name == step.contract)
-        && let Some(f) = c.functions.iter().find(|f| f.name == step.function)
-    {
-        return Some(f.clone());
+        .filter(|c| c.name == step.contract)
+        .flat_map(|c| c.functions.iter())
+        .filter(|f| f.name == step.function)
+        .cloned()
+        .collect();
+    if !exact.is_empty() {
+        return exact;
     }
-    if let Some(i) = callgraph
-        .interfaces
-        .values()
-        .find(|i| i.name == step.contract)
-        && let Some(f) = i.functions.iter().find(|f| f.name == step.function)
-    {
-        return Some(f.clone());
-    }
-    // Loose fallback: any function with this name in any contract /
-    // interface, regardless of contract.name. Spec.sequence sometimes
-    // names a contract that's the *interface* (e.g. `IPanopticPool`)
-    // while the actual implementation lives on `PanopticPool`.
-    callgraph
+    let loose: Vec<Function> = callgraph
         .contracts
         .values()
         .flat_map(|c| &c.functions)
-        .chain(callgraph.interfaces.values().flat_map(|i| &i.functions))
-        .find(|f| f.name == step.function)
+        .filter(|f| f.name == step.function)
         .cloned()
+        .collect();
+    if !loose.is_empty() {
+        return loose;
+    }
+    callgraph
+        .interfaces
+        .values()
+        .flat_map(|i| &i.functions)
+        .filter(|f| f.name == step.function)
+        .cloned()
+        .collect()
 }
 
 fn covered_intersects(covered_lines: &[&CoverageEntry], function: &Function) -> bool {
@@ -322,5 +339,99 @@ mod tests {
         assert_eq!(report.expected_fns, 1, "unresolved step excluded");
         assert_eq!(report.hit_fns, 1);
         assert!((report.fidelity - 1.0).abs() < 1e-9);
+    }
+    fn chunk() -> FileChunk {
+        FileChunk {
+            loc: FileLocation {
+                start_line: 1,
+                start_column: 0,
+                end_line: 100,
+                end_column: 0,
+            },
+            content: String::new(),
+        }
+    }
+
+    fn step_spec(contract: &str, function: &str) -> AuditSpecification {
+        let mut spec = fake_spec();
+        spec.sequence = vec![SuqenceCallStep {
+            contract: contract.to_string(),
+            function: function.to_string(),
+            intention: String::new(),
+        }];
+        spec
+    }
+
+    fn hit(path: &str, line: i32) -> Vec<CoverageEntry> {
+        vec![CoverageEntry {
+            relative_contract_path: path.into(),
+            line_number: line,
+            hit_count: 1,
+        }]
+    }
+
+    /// A step naming an interface must resolve to the concrete implementation
+    /// (interface declarations never have LCOV hits).
+    #[test]
+    fn interface_named_step_resolves_to_implementation() {
+        let mut cg = make_callgraph_with_one_function();
+        cg.interfaces.insert(
+            2,
+            knowdit_repo_model::cg::Interface {
+                id: 2,
+                name: "IPool".to_string(),
+                relative_file_path: PathBuf::from("contracts/IPool.sol"),
+                chunk: chunk(),
+                functions: vec![make_function("dispatch", "contracts/IPool.sol", 5, 5)],
+                description: None,
+            },
+        );
+        let report = collect_report(
+            &step_spec("IPool", "dispatch"),
+            &hit("contracts/Pool.sol", 40),
+            &cg,
+        );
+        assert_eq!((report.hit_fns, report.expected_fns), (1, 1));
+    }
+
+    /// Overloads: coverage on the SECOND overload must count.
+    #[test]
+    fn any_overload_hit_counts() {
+        let mut cg = make_callgraph_with_one_function();
+        cg.contracts
+            .get_mut(&1)
+            .unwrap()
+            .functions
+            .push(make_function("dispatch", "contracts/Pool.sol", 60, 80));
+        let report = collect_report(
+            &step_spec("Pool", "dispatch"),
+            &hit("contracts/Pool.sol", 70),
+            &cg,
+        );
+        assert_eq!(report.hit_fns, 1);
+    }
+
+    /// Inherited method: step names the derived contract, the body lives in
+    /// the base contract.
+    #[test]
+    fn inherited_function_resolves_via_base_contract() {
+        let mut cg = make_callgraph_with_one_function();
+        cg.contracts.insert(
+            3,
+            Contract {
+                id: 3,
+                name: "PoolV2".to_string(),
+                relative_file_path: PathBuf::from("contracts/PoolV2.sol"),
+                chunk: chunk(),
+                functions: vec![],
+                description: None,
+            },
+        );
+        let report = collect_report(
+            &step_spec("PoolV2", "dispatch"),
+            &hit("contracts/Pool.sol", 31),
+            &cg,
+        );
+        assert_eq!((report.hit_fns, report.expected_fns), (1, 1));
     }
 }

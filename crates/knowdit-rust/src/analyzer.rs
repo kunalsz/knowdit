@@ -99,7 +99,10 @@ enum ContextFieldBinding {
     /// `Account<'info, Vault>` or `AccountLoader<'info, Vault>`.
     StateStruct(String),
     /// Synthetic `StateVariable` id (e.g. `vault_token.amount`, `user.lamports`).
-    SyntheticVar { sv_id: i32, field_suffix: &'static str },
+    SyntheticVar {
+        sv_id: i32,
+        field_suffix: &'static str,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -124,7 +127,10 @@ struct RecordedCallable {
 #[derive(Debug, Clone)]
 enum LocalAlias {
     StateStruct(String),
-    ContextAccount { context_name: String, account_field: String },
+    ContextAccount {
+        context_name: String,
+        account_field: String,
+    },
 }
 
 /// Pure-Rust AST analyzer over in-scope `.rs` files.
@@ -284,7 +290,10 @@ impl RustStaticAnalyzer {
                                 Self::classify_account_wrapper_type(&field.ty)
                                 && matches!(
                                     wrapper.as_str(),
-                                    "Account" | "AccountLoader" | "ProgramAccount" | "AccountZeroCopy"
+                                    "Account"
+                                        | "AccountLoader"
+                                        | "ProgramAccount"
+                                        | "AccountZeroCopy"
                                 )
                                 && !Self::is_spl_builtin_account(&inner)
                             {
@@ -410,8 +419,9 @@ impl RustStaticAnalyzer {
                     );
                     if let Some((_, trait_path, _)) = &item_impl.trait_
                         && let Some(trait_ident) = trait_path.segments.last()
-                        && let Some(&iid) =
-                            self.interface_id_by_name.get(&trait_ident.ident.to_string())
+                        && let Some(&iid) = self
+                            .interface_id_by_name
+                            .get(&trait_ident.ident.to_string())
                     {
                         self.contract_inherits.insert((cid, iid));
                     }
@@ -507,9 +517,10 @@ impl RustStaticAnalyzer {
 
             if let Some((wrapper, inner)) = Self::classify_account_wrapper_type(&field.ty) {
                 match (wrapper.as_str(), inner.as_deref()) {
-                    ("Account" | "AccountLoader" | "ProgramAccount" | "InterfaceAccount", Some(t))
-                        if Self::is_token_account_type(t) =>
-                    {
+                    (
+                        "Account" | "AccountLoader" | "ProgramAccount" | "InterfaceAccount",
+                        Some(t),
+                    ) if Self::is_token_account_type(t) => {
                         let sv_id = self.alloc_synthetic_state_var(
                             format!("{acct_name}.amount"),
                             "TokenAccount::amount (u64)".to_string(),
@@ -535,9 +546,10 @@ impl RustStaticAnalyzer {
                             field_suffix: "supply",
                         });
                     }
-                    ("Account" | "AccountLoader" | "ProgramAccount" | "AccountZeroCopy", Some(t))
-                        if !Self::is_spl_builtin_account(t) =>
-                    {
+                    (
+                        "Account" | "AccountLoader" | "ProgramAccount" | "AccountZeroCopy",
+                        Some(t),
+                    ) if !Self::is_spl_builtin_account(t) => {
                         referenced_state_structs.insert(t.to_string());
                         bindings.push(ContextFieldBinding::StateStruct(t.to_string()));
                     }
@@ -1283,7 +1295,8 @@ impl RustStaticAnalyzer {
                             reads.insert(sv_id);
                         }
                     }
-                } else if method_name == "try_borrow_mut_lamports" || method_name == "sub_lamports"
+                } else if method_name == "try_borrow_mut_lamports"
+                    || method_name == "sub_lamports"
                     || method_name == "add_lamports"
                 {
                     if let Some(sv_ids) =
@@ -1637,6 +1650,61 @@ impl RustStaticAnalyzer {
                     }
                 }
             }
+            syn::Expr::Unsafe(unsafe_expr) => {
+                // Pinocchio / raw-Syscall code does its CPIs and account
+                // writes inside `unsafe { ... }` — skipping the block
+                // dropped every call and state touch in it.
+                let mut body_aliases = aliases.clone();
+                self.walk_block(
+                    callable,
+                    &unsafe_expr.block,
+                    &mut body_aliases,
+                    outgoing,
+                    seen_targets,
+                    reads,
+                    writes,
+                );
+            }
+            syn::Expr::Closure(closure) => {
+                // IIFE-style closures run inline; walk the body so their
+                // calls/state touches are attributed to the caller.
+                self.walk_expr(
+                    callable,
+                    &closure.body,
+                    false,
+                    aliases,
+                    outgoing,
+                    seen_targets,
+                    reads,
+                    writes,
+                );
+            }
+            syn::Expr::Range(range) => {
+                if let Some(start) = &range.start {
+                    self.walk_expr(
+                        callable,
+                        start,
+                        false,
+                        aliases,
+                        outgoing,
+                        seen_targets,
+                        reads,
+                        writes,
+                    );
+                }
+                if let Some(end) = &range.end {
+                    self.walk_expr(
+                        callable,
+                        end,
+                        false,
+                        aliases,
+                        outgoing,
+                        seen_targets,
+                        reads,
+                        writes,
+                    );
+                }
+            }
             _ => {}
         }
     }
@@ -1662,16 +1730,8 @@ impl RustStaticAnalyzer {
             }
             (
                 Some("token" | "token_interface" | "token_2022" | "associated_token"),
-                "transfer"
-                | "transfer_checked"
-                | "mint_to"
-                | "mint_to_checked"
-                | "burn"
-                | "burn_checked"
-                | "close_account"
-                | "approve"
-                | "revoke"
-                | "create",
+                "transfer" | "transfer_checked" | "mint_to" | "mint_to_checked" | "burn"
+                | "burn_checked" | "close_account" | "approve" | "revoke" | "create",
             ) => {
                 let id = self.ensure_cpi_target("spl_token_cpi", last);
                 return Some((id, Some("CPI".to_string())));
@@ -1712,11 +1772,23 @@ impl RustStaticAnalyzer {
         {
             return Some((id, None));
         }
-        if let Some(candidates) = self.functions_by_name.get(last)
-            && candidates.len() == 1
-            && candidates[0] != callable.function_id
-        {
-            return Some((candidates[0], None));
+        // Anchor `#[program]` delegation: `pub fn deposit(..)` in the
+        // program module delegates to `instructions::deposit(..)` — two
+        // workspace functions share the name and one of them is the caller
+        // itself. Filter the caller out BEFORE counting, so the delegation
+        // resolves to the single remaining candidate instead of failing the
+        // `len == 1` check and dropping the edge.
+        if let Some(candidates) = self.functions_by_name.get(last) {
+            let mut foreign = candidates
+                .iter()
+                .copied()
+                .filter(|&id| id != callable.function_id);
+            let first = foreign.next();
+            if let Some(first) = first
+                && foreign.next().is_none()
+            {
+                return Some((first, None));
+            }
         }
 
         None
@@ -2040,7 +2112,10 @@ impl RustStaticAnalyzer {
             }
             let mut is_mut = false;
             let _ = attr.parse_nested_meta(|meta| {
-                if meta.path.is_ident("mut") || meta.path.is_ident("init") || meta.path.is_ident("close") {
+                if meta.path.is_ident("mut")
+                    || meta.path.is_ident("init")
+                    || meta.path.is_ident("close")
+                {
                     is_mut = true;
                 }
                 // Consume optional `= expr` or `(...)` so remaining metas parse cleanly.
