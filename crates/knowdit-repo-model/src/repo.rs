@@ -29,7 +29,8 @@ use crate::db::r#move::{
 pub use crate::db::reflection::ReflectionResult;
 pub use crate::db::semantic_matched::MatchStrength;
 use crate::db::{
-    code_gen as code_gen_model, code_gen_regen as code_gen_regen_model, contract as contract_model,
+    abandoned_link as abandoned_link_model, code_gen as code_gen_model,
+    code_gen_regen as code_gen_regen_model, contract as contract_model,
     contract_functions as contract_functions_model, contract_inherit as contract_inherit_model,
     contract_variable as contract_variable_model, finding_merge as finding_merge_model,
     finding_review as finding_review_model, function as function_model,
@@ -207,6 +208,7 @@ impl RepoDatabase {
             schema.create_table_from_entity(historical_semantic_finding_link_model::Entity),
             schema.create_table_from_entity(semantic_matched_model::Entity),
             schema.create_table_from_entity(project_metadata_model::Entity),
+            schema.create_table_from_entity(abandoned_link_model::Entity),
             schema.create_table_from_entity(specification_model::Entity),
             schema.create_table_from_entity(code_gen_model::Entity),
             schema.create_table_from_entity(harness_run_model::Entity),
@@ -312,6 +314,20 @@ impl RepoDatabase {
             .execute(&move_ability_uniq)
             .await
             .wrap_err("failed to create UNIQUE index on move_struct_ability")?;
+
+        let abandoned_link_uniq = sea_orm::sea_query::Index::create()
+            .if_not_exists()
+            .name("idx_abandoned_link_ehf")
+            .table(abandoned_link_model::Entity)
+            .col(abandoned_link_model::Column::ExtractId)
+            .col(abandoned_link_model::Column::HistoricalId)
+            .col(abandoned_link_model::Column::FindingId)
+            .unique()
+            .to_owned();
+        self.db
+            .execute(&abandoned_link_uniq)
+            .await
+            .wrap_err("failed to create UNIQUE index on abandoned_link")?;
 
         Ok(())
     }
@@ -574,6 +590,86 @@ impl RepoDatabase {
             .await
             .wrap_err("failed to commit project semantic write transaction")?;
         Ok(())
+    }
+
+    /// Append newly discovered project semantics after existing `project_semantic`
+    /// rows without disturbing existing primary-key IDs `1..=N`. Used by the
+    /// post-extraction orphan-entrypoint pass on resumed databases before
+    /// `semantic_matched` has locked extract IDs.
+    pub async fn append_project_semantics(&self, semantics: &[ExtractedSemantic]) -> Result<()> {
+        if semantics.is_empty() {
+            return Ok(());
+        }
+        let txn = self
+            .db
+            .begin()
+            .await
+            .wrap_err("failed to begin project semantic append transaction")?;
+
+        let last_semantic = project_semantic_model::Entity::find()
+            .order_by_desc(project_semantic_model::Column::Id)
+            .one(&txn)
+            .await
+            .wrap_err("failed to query max project_semantic id")?;
+        let mut next_semantic_id = last_semantic.map_or(1, |row| row.id + 1);
+
+        let last_function = project_semantic_function_model::Entity::find()
+            .order_by_desc(project_semantic_function_model::Column::Id)
+            .one(&txn)
+            .await
+            .wrap_err("failed to query max project_semantic_function id")?;
+        let mut next_function_id = last_function.map_or(1, |row| row.id + 1);
+
+        for semantic in semantics {
+            let semantic_id = next_semantic_id;
+            next_semantic_id += 1;
+            project_semantic_model::Entity::insert(project_semantic_model::ActiveModel {
+                id: Set(semantic_id),
+                name: Set(semantic.name.clone()),
+                category: Set(semantic.category),
+                definition: Set(semantic.definition.clone()),
+                description: Set(semantic.description.clone()),
+            })
+            .exec(&txn)
+            .await
+            .wrap_err_with(|| format!("failed to append project semantic {}", semantic_id))?;
+
+            for function in &semantic.functions {
+                let function_id = next_function_id;
+                next_function_id += 1;
+                project_semantic_function_model::Entity::insert(
+                    project_semantic_function_model::ActiveModel {
+                        id: Set(function_id),
+                        semantic_id: Set(semantic_id),
+                        name: Set(function.name.clone()),
+                        contract: Set(function.contract.clone()),
+                        signature: Set(function.signature.clone()),
+                    },
+                )
+                .exec(&txn)
+                .await
+                .wrap_err_with(|| {
+                    format!(
+                        "failed to append project semantic function {}",
+                        function_id
+                    )
+                })?;
+            }
+        }
+
+        txn.commit()
+            .await
+            .wrap_err("failed to commit project semantic append transaction")?;
+        Ok(())
+    }
+
+    /// True when at least one `semantic_matched` row exists in the project DB.
+    pub async fn has_semantic_matches(&self) -> Result<bool> {
+        Ok(semantic_matched_model::Entity::find()
+            .one(&self.db)
+            .await
+            .wrap_err("failed to check semantic_matched rows")?
+            .is_some())
     }
 
     /// Read the call graph from this project's database.
@@ -2153,6 +2249,14 @@ pub struct LoadedSpecification {
     pub specification_json: String,
 }
 
+/// Loaded specification row paired with whether any reflection confirmed it as a
+/// `ValidFinding`. Used by the project-wide novelty gate.
+#[derive(Debug, Clone)]
+pub struct TerminalSpecification {
+    pub spec: LoadedSpecification,
+    pub is_valid_finding: bool,
+}
+
 /// Resume state of a streamloop link, derived purely from DB rows.
 /// Returned by [`RepoDatabase::link_resume_state`].
 ///
@@ -2160,6 +2264,8 @@ pub struct LoadedSpecification {
 /// dispatch accordingly:
 ///
 /// * [`Self::NotStarted`] — run the gen-spec agent from scratch.
+/// * [`Self::Abandoned`] — agent previously evaluated and explicitly abandoned
+///   this link via `finalize(status="abandoned")`; skip unless retry is forced.
 /// * [`Self::Partial`] — skip gen-spec, feed `spec_ids` straight into
 ///   the fuzz / reflect / regen inner cycle.
 /// * [`Self::Built`] — drop the link end-to-end; nothing more to do
@@ -2168,6 +2274,7 @@ pub struct LoadedSpecification {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LinkResumeState {
     NotStarted,
+    Abandoned,
     Partial { spec_ids: Vec<i32> },
     Built,
 }
@@ -2479,10 +2586,59 @@ impl RepoDatabase {
         clear!(code_gen_model::Entity, "code_gen");
         clear!(report_finding_model::Entity, "report_finding");
         clear!(specification_model::Entity, "specification");
+        clear!(abandoned_link_model::Entity, "abandoned_link");
 
         txn.commit()
             .await
             .wrap_err("failed to commit regenerate reset transaction")?;
+        Ok(())
+    }
+
+    /// Persist explicit agent-finalized abandon decisions for one or more
+    /// `(extract_id, historical_id, finding_id)` link triples in a single
+    /// idempotent transaction.
+    pub async fn record_abandoned_links(&self, keys: &[LinkKey], abort_reason: &str) -> Result<()> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let mut unique: Vec<LinkKey> = keys.to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+
+        let txn = self
+            .db
+            .begin()
+            .await
+            .wrap_err("failed to begin abandoned_link write transaction")?;
+        for key in unique {
+            abandoned_link_model::Entity::insert(abandoned_link_model::ActiveModel {
+                extract_id: Set(key.extract_id),
+                historical_id: Set(key.historical_id),
+                finding_id: Set(key.finding_id),
+                abort_reason: Set(abort_reason.to_string()),
+                ..Default::default()
+            })
+            .on_conflict(
+                sea_orm::sea_query::OnConflict::columns([
+                    abandoned_link_model::Column::ExtractId,
+                    abandoned_link_model::Column::HistoricalId,
+                    abandoned_link_model::Column::FindingId,
+                ])
+                .update_column(abandoned_link_model::Column::AbortReason)
+                .to_owned(),
+            )
+            .exec(&txn)
+            .await
+            .wrap_err_with(|| {
+                format!(
+                    "failed to record abandoned_link for ({}, {}, {})",
+                    key.extract_id, key.historical_id, key.finding_id
+                )
+            })?;
+        }
+        txn.commit()
+            .await
+            .wrap_err("failed to commit abandoned_link write transaction")?;
         Ok(())
     }
 
@@ -2545,7 +2701,23 @@ impl RepoDatabase {
                 )
             })?;
         if specs.is_empty() {
-            return Ok(LinkResumeState::NotStarted);
+            let is_abandoned = abandoned_link_model::Entity::find()
+                .filter(abandoned_link_model::Column::ExtractId.eq(extract_id))
+                .filter(abandoned_link_model::Column::HistoricalId.eq(historical_id))
+                .filter(abandoned_link_model::Column::FindingId.eq(finding_id))
+                .one(&self.db)
+                .await
+                .wrap_err_with(|| {
+                    format!(
+                        "failed to query abandoned_link for ({extract_id}, {historical_id}, {finding_id})"
+                    )
+                })?
+                .is_some();
+            return Ok(if is_abandoned {
+                LinkResumeState::Abandoned
+            } else {
+                LinkResumeState::NotStarted
+            });
         }
         let spec_ids: Vec<i32> = specs.iter().map(|s| s.id).collect();
 
@@ -2597,6 +2769,12 @@ impl RepoDatabase {
         struct CodeGenRow {
             spec_id: i32,
         }
+        #[derive(FromQueryResult)]
+        struct AbandonedRow {
+            extract_id: i32,
+            historical_id: i32,
+            finding_id: i32,
+        }
 
         // 300 triples == 900 bind params, comfortably under the legacy
         // SQLITE_MAX_VARIABLE_NUMBER of 999.
@@ -2621,11 +2799,15 @@ impl RepoDatabase {
             finding_ids.dedup();
             let wanted: std::collections::HashSet<LinkKey> = chunk.iter().copied().collect();
 
-            let rows = specification_resume_query(extract_ids, historical_ids, finding_ids)
-                .into_model::<SpecRow>()
-                .all(&self.db)
-                .await
-                .wrap_err("failed to load specification rows for bulk resume")?;
+            let rows = specification_resume_query(
+                extract_ids.clone(),
+                historical_ids.clone(),
+                finding_ids.clone(),
+            )
+            .into_model::<SpecRow>()
+            .all(&self.db)
+            .await
+            .wrap_err("failed to load specification rows for bulk resume")?;
 
             let mut spec_ids_by_key: HashMap<LinkKey, Vec<i32>> = HashMap::new();
             for row in rows {
@@ -2636,6 +2818,24 @@ impl RepoDatabase {
                 };
                 if wanted.contains(&key) {
                     spec_ids_by_key.entry(key).or_default().push(row.id);
+                }
+            }
+
+            let abandoned_rows =
+                abandoned_link_resume_query(extract_ids, historical_ids, finding_ids)
+                    .into_model::<AbandonedRow>()
+                    .all(&self.db)
+                    .await
+                    .wrap_err("failed to load abandoned_link rows for bulk resume")?;
+            let mut abandoned_keys: BTreeSet<LinkKey> = BTreeSet::new();
+            for row in abandoned_rows {
+                let key = LinkKey {
+                    extract_id: row.extract_id,
+                    historical_id: row.historical_id,
+                    finding_id: row.finding_id,
+                };
+                if wanted.contains(&key) {
+                    abandoned_keys.insert(key);
                 }
             }
 
@@ -2660,7 +2860,12 @@ impl RepoDatabase {
             for key in chunk {
                 match spec_ids_by_key.get(key) {
                     None => {
-                        out.insert(*key, LinkResumeState::NotStarted);
+                        let state = if abandoned_keys.contains(key) {
+                            LinkResumeState::Abandoned
+                        } else {
+                            LinkResumeState::NotStarted
+                        };
+                        out.insert(*key, state);
                     }
                     Some(ids) => {
                         if ids.iter().any(|id| built_spec_ids.contains(id)) {
@@ -2773,6 +2978,26 @@ pub(crate) fn codegen_resume_query(
         .select_only()
         .column(code_gen_model::Column::SpecId)
         .filter(code_gen_model::Column::SpecId.is_in(spec_ids))
+}
+
+/// Projected `abandoned_link` query used by [`RepoDatabase::load_link_resume_states`].
+///
+/// Selects **only** `(extract_id, historical_id, finding_id)` so bulk resume
+/// reads never fetch `abort_reason` text payloads.
+pub(crate) fn abandoned_link_resume_query(
+    extract_ids: Vec<i32>,
+    historical_ids: Vec<i32>,
+    finding_ids: Vec<i32>,
+) -> sea_orm::Select<abandoned_link_model::Entity> {
+    use sea_orm::{ColumnTrait, QueryFilter, QuerySelect};
+    abandoned_link_model::Entity::find()
+        .select_only()
+        .column(abandoned_link_model::Column::ExtractId)
+        .column(abandoned_link_model::Column::HistoricalId)
+        .column(abandoned_link_model::Column::FindingId)
+        .filter(abandoned_link_model::Column::ExtractId.is_in(extract_ids))
+        .filter(abandoned_link_model::Column::HistoricalId.is_in(historical_ids))
+        .filter(abandoned_link_model::Column::FindingId.is_in(finding_ids))
 }
 
 // ---------------------------------------------------------------------------
@@ -2973,6 +3198,77 @@ impl RepoDatabase {
                 specification_json: row.specification,
             })
             .collect())
+    }
+
+    /// Load every canonical validated specification across the repository:
+    /// specs that have at least one `CodeGenStatus::Completed` row (excluding
+    /// `Duplicate` and `SkippedViability` rows as canonical targets), annotated
+    /// with whether a `ReflectionResult::ValidFinding` exists for that spec.
+    pub async fn load_terminal_specifications(&self) -> Result<Vec<TerminalSpecification>> {
+        use sea_orm::{ColumnTrait, FromQueryResult, QueryFilter, QueryOrder, QuerySelect};
+
+        #[derive(FromQueryResult)]
+        struct SpecIdRow {
+            spec_id: i32,
+        }
+
+        let completed_rows = code_gen_model::Entity::find()
+            .select_only()
+            .column(code_gen_model::Column::SpecId)
+            .filter(code_gen_model::Column::Status.eq(CodeGenStatus::Completed))
+            .into_model::<SpecIdRow>()
+            .all(&self.db)
+            .await
+            .wrap_err("failed to load completed code_gen spec_ids")?;
+        if completed_rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let completed_ids: Vec<i32> = completed_rows
+            .into_iter()
+            .map(|r| r.spec_id)
+            .collect::<BTreeSet<i32>>()
+            .into_iter()
+            .collect();
+
+        const SPEC_ID_CHUNK: usize = 900;
+        let mut valid_spec_ids: BTreeSet<i32> = BTreeSet::new();
+        for chunk in completed_ids.chunks(SPEC_ID_CHUNK) {
+            let valid_rows = reflection_model::Entity::find()
+                .select_only()
+                .column(reflection_model::Column::SpecId)
+                .filter(reflection_model::Column::SpecId.is_in(chunk.to_vec()))
+                .filter(reflection_model::Column::Result.eq(ReflectionResult::ValidFinding))
+                .into_model::<SpecIdRow>()
+                .all(&self.db)
+                .await
+                .wrap_err("failed to load valid_finding spec_ids for terminal specifications")?;
+            valid_spec_ids.extend(valid_rows.into_iter().map(|r| r.spec_id));
+        }
+
+        let mut out: Vec<TerminalSpecification> = Vec::with_capacity(completed_ids.len());
+        for chunk in completed_ids.chunks(SPEC_ID_CHUNK) {
+            let spec_rows = specification_model::Entity::find()
+                .filter(specification_model::Column::Id.is_in(chunk.to_vec()))
+                .order_by_asc(specification_model::Column::Id)
+                .all(&self.db)
+                .await
+                .wrap_err("failed to load terminal specification rows")?;
+            for row in spec_rows {
+                let is_valid_finding = valid_spec_ids.contains(&row.id);
+                out.push(TerminalSpecification {
+                    spec: LoadedSpecification {
+                        id: row.id,
+                        semantic_id: row.semantic_id,
+                        historical_id: row.historical_id,
+                        finding_id: row.finding_id,
+                        specification_json: row.specification,
+                    },
+                    is_valid_finding,
+                });
+            }
+        }
+        out.sort_by_key(|item| item.spec.id);
+        Ok(out)
     }
 
     /// Clear every fuzzing-related table. Used by `--regenerate`.

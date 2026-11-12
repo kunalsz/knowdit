@@ -1,6 +1,7 @@
 //! SeaORM entity definitions for every table the project database holds. Pure value types
 //! (call graph, storage graph, etc.) live one level up; this module is purely the shape of
 //! rows in `sqlite`/`mysql` storage.
+pub mod abandoned_link;
 pub mod code_gen;
 pub mod code_gen_regen;
 pub mod contract;

@@ -32,5 +32,5 @@ pub use repo::{
     MatchStrength, PendingReflection, ProjectComponent, ProjectProfile, ProjectSubsystem,
     RawFindingMember, ReflectionRecord, ReflectionResult, ReflectionWipeStats, RegenEventRecord,
     RepoDatabase, ReportFindingSeed, ReviewSeverity, ReviewedFinding, RunKind, SemanticMatch,
-    SemanticMatchSet, ValidFindingRecord,
+    SemanticMatchSet, TerminalSpecification, ValidFindingRecord,
 };

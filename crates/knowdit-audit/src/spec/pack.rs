@@ -17,18 +17,20 @@
 //! Deterministic: identical inputs always yield an identical pack, so resume
 //! and cache keys stay stable across runs.
 
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 
+use knowdit_kg_model::audit_finding::FindingSeverity;
 use knowdit_kg_model::link_strength::LinkStrength;
 use sha2::{Digest, Sha256};
 
-/// Light per-member view the selector needs: identity, edge strength, and the
-/// text similarity is computed over. Rendered prompt strings are attached
-/// later at materialization time.
+/// Light per-member view the selector needs: identity, edge strength, finding
+/// severity, and the text similarity is computed over. Rendered prompt strings
+/// are attached later at materialization time.
 #[derive(Debug, Clone)]
 pub(crate) struct PackMember {
     pub finding_id: i32,
     pub link_strength: LinkStrength,
+    pub severity: FindingSeverity,
     pub title: String,
     pub root_cause: String,
     pub description: String,
@@ -44,69 +46,149 @@ pub(crate) struct PackSelection {
     pub deduped: Vec<i32>,
 }
 
+impl PackMember {
+    /// Deterministic intra-`(extract_id, historical_id)` ordering for `finding`
+    /// granularity under `SpecSchedule::Fair`:
+    /// 1. Sort by `(link_strength.rank() DESC, severity.rank() DESC, finding_id ASC)`.
+    /// 2. Partition into distinct normalized titles (`unique`) and exact-title
+    ///    duplicates (`duplicates`).
+    /// 3. Greedily order `unique` from index `0` (anchor) by max-min token-Jaccard
+    ///    distance over `>= 3`-char alphanumeric runs of `title + root_cause + description`.
+    /// 4. Append `duplicates` at the tail rather than dropping them.
+    pub(crate) fn order_for_finding_mode(members: &[Self]) -> Vec<i32> {
+        if members.len() <= 1 {
+            return members.iter().map(|m| m.finding_id).collect();
+        }
+        let (unique, duplicates) = Self::partition_by_title(members);
+        let mut out = Self::mmr_select(&unique, unique.len());
+        out.extend(duplicates);
+        out
+    }
+
+    fn partition_by_title(members: &[Self]) -> (Vec<&Self>, Vec<i32>) {
+        let mut ordered: Vec<&Self> = members.iter().collect();
+        ordered.sort_by(|a, b| {
+            b.link_strength
+                .rank()
+                .cmp(&a.link_strength.rank())
+                .then(b.severity.rank().cmp(&a.severity.rank()))
+                .then(a.finding_id.cmp(&b.finding_id))
+        });
+
+        let mut seen_titles: BTreeSet<String> = BTreeSet::new();
+        let mut deduped: Vec<i32> = Vec::new();
+        let mut unique: Vec<&Self> = Vec::with_capacity(ordered.len());
+        for member in ordered {
+            let key = member.normalized_title();
+            if !key.is_empty() && !seen_titles.insert(key) {
+                deduped.push(member.finding_id);
+                continue;
+            }
+            unique.push(member);
+        }
+        (unique, deduped)
+    }
+
+    fn mmr_select(unique: &[&Self], limit: usize) -> Vec<i32> {
+        if unique.is_empty() || limit == 0 {
+            return Vec::new();
+        }
+        let target_len = limit.min(unique.len());
+        let anchor = unique[0];
+        let anchor_tokens = anchor.token_set();
+        let mut selected: Vec<i32> = Vec::with_capacity(target_len);
+        selected.push(anchor.finding_id);
+        if target_len == 1 {
+            return selected;
+        }
+
+        let mut pool: Vec<(i32, BTreeSet<String>, f64)> = unique[1..]
+            .iter()
+            .map(|candidate| {
+                let tokens = candidate.token_set();
+                let dist = Self::jaccard_distance(&tokens, &anchor_tokens);
+                (candidate.finding_id, tokens, dist)
+            })
+            .collect();
+
+        while selected.len() < target_len && !pool.is_empty() {
+            // Strict `>` on distance preserves pool order `(strength DESC, severity DESC, id ASC)` on ties.
+            let mut best_idx = 0usize;
+            for idx in 1..pool.len() {
+                if pool[idx].2 > pool[best_idx].2 {
+                    best_idx = idx;
+                }
+            }
+            let (picked_id, picked_tokens, _) = pool.remove(best_idx);
+            selected.push(picked_id);
+            if selected.len() < target_len {
+                for entry in &mut pool {
+                    let dist = Self::jaccard_distance(&entry.1, &picked_tokens);
+                    if dist < entry.2 {
+                        entry.2 = dist;
+                    }
+                }
+            }
+        }
+        selected
+    }
+
+    /// Lowercase, collapse whitespace, strip punctuation — enough to catch the
+    /// "same report title pasted twice" duplicates the corpus actually contains.
+    fn normalized_title(&self) -> String {
+        self.title
+            .split_whitespace()
+            .map(|word| {
+                word.chars()
+                    .filter(|c| c.is_alphanumeric())
+                    .collect::<String>()
+                    .to_lowercase()
+            })
+            .filter(|word| !word.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// Lowercase alphanumeric runs of length >= 3 over title + root cause +
+    /// description. Deliberately close to the linker's own `link_tokens` so pack
+    /// diversity tracks the same notion of "same mechanism" the KG uses.
+    fn token_set(&self) -> BTreeSet<String> {
+        let mut tokens = BTreeSet::new();
+        let mut push = |text: &str| {
+            for word in text.split(|c: char| !c.is_alphanumeric()) {
+                let word = word.to_lowercase();
+                if word.len() >= 3 {
+                    tokens.insert(word);
+                }
+            }
+        };
+        push(&self.title);
+        push(&self.root_cause);
+        push(&self.description);
+        tokens
+    }
+
+    fn jaccard_distance(a: &BTreeSet<String>, b: &BTreeSet<String>) -> f64 {
+        if a.is_empty() && b.is_empty() {
+            return 0.0;
+        }
+        let intersection = a.intersection(b).count();
+        let union = a.len() + b.len() - intersection;
+        if union == 0 {
+            return 0.0;
+        }
+        1.0 - (intersection as f64 / union as f64)
+    }
+}
+
 /// Select up to `pack_size` members. Never fails: with fewer eligible members
-/// than `pack_size` the whole (deduped, strength-ordered) set is returned.
+/// than `pack_size` the whole (deduped, strength+severity-ordered) set is returned.
 pub(crate) fn select_pack(members: &[PackMember], pack_size: usize) -> PackSelection {
     assert!(pack_size >= 1, "pack_size must be >= 1");
-    // 1. Strength order; finding_id breaks ties so the result is stable.
-    let mut ordered: Vec<&PackMember> = members.iter().collect();
-    ordered.sort_by(|a, b| {
-        b.link_strength
-            .rank()
-            .cmp(&a.link_strength.rank())
-            .then(a.finding_id.cmp(&b.finding_id))
-    });
-
-    // 2. Exact-title dedup: keep the first (strongest) occurrence.
-    let mut seen_titles: HashSet<String> = HashSet::new();
-    let mut deduped: Vec<i32> = Vec::new();
-    let mut unique: Vec<&PackMember> = Vec::with_capacity(ordered.len());
-    for member in ordered {
-        let key = normalize_title(&member.title);
-        if !seen_titles.insert(key) {
-            deduped.push(member.finding_id);
-            continue;
-        }
-        unique.push(member);
-    }
-
-    if unique.is_empty() {
-        return PackSelection {
-            members: Vec::new(),
-            deduped,
-        };
-    }
-
-    // 3. Anchor + greedy max-min-diversity fill.
-    let anchor = unique[0];
-    let mut selected: Vec<&PackMember> = vec![anchor];
-    let mut selected_tokens: Vec<HashSet<String>> = vec![token_set(anchor)];
-    let mut pool: Vec<&PackMember> = unique[1..].to_vec();
-
-    while selected.len() < pack_size && !pool.is_empty() {
-        let (best_idx, _) = pool
-            .iter()
-            .enumerate()
-            .map(|(idx, candidate)| {
-                let tokens = token_set(candidate);
-                // Max-min distance: the candidate's distance to its closest
-                // already-selected member. Pool order (strength desc, id asc)
-                // breaks ties via strict `>`.
-                let min_distance = selected_tokens
-                    .iter()
-                    .map(|sel| jaccard_distance(&tokens, sel))
-                    .fold(f64::INFINITY, f64::min);
-                (idx, min_distance)
-            })
-            .max_by(|a, b| a.1.total_cmp(&b.1))
-            .expect("pool is non-empty");
-        let picked = pool.remove(best_idx);
-        selected_tokens.push(token_set(picked));
-        selected.push(picked);
-    }
-
+    let (unique, deduped) = PackMember::partition_by_title(members);
+    let selected = PackMember::mmr_select(&unique, pack_size);
     PackSelection {
-        members: selected.iter().map(|m| m.finding_id).collect(),
+        members: selected,
         deduped,
     }
 }
@@ -129,54 +211,6 @@ pub(crate) fn pack_fingerprint(member_ids: &[i32]) -> String {
     hex[..16].to_string()
 }
 
-/// Lowercase, collapse whitespace, strip punctuation — enough to catch the
-/// "same report title pasted twice" duplicates the corpus actually contains.
-fn normalize_title(title: &str) -> String {
-    title
-        .split_whitespace()
-        .map(|word| {
-            word.chars()
-                .filter(|c| c.is_alphanumeric())
-                .collect::<String>()
-                .to_lowercase()
-        })
-        .filter(|word| !word.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-/// Lowercase alphanumeric runs of length >= 3 over title + root cause +
-/// description. Deliberately close to the linker's own `link_tokens` so pack
-/// diversity tracks the same notion of "same mechanism" the KG uses.
-fn token_set(member: &PackMember) -> HashSet<String> {
-    let mut tokens = HashSet::new();
-    let mut push = |text: &str| {
-        for word in text.split(|c: char| !c.is_alphanumeric()) {
-            let word = word.to_lowercase();
-            if word.len() >= 3 {
-                tokens.insert(word);
-            }
-        }
-    };
-    push(&member.title);
-    push(&member.root_cause);
-    push(&member.description);
-    tokens
-}
-
-fn jaccard_distance(a: &HashSet<String>, b: &HashSet<String>) -> f64 {
-    if a.is_empty() && b.is_empty() {
-        // Two textless members are identical for diversity purposes.
-        return 0.0;
-    }
-    let intersection = a.intersection(b).count();
-    let union = a.len() + b.len() - intersection;
-    if union == 0 {
-        return 0.0;
-    }
-    1.0 - (intersection as f64 / union as f64)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,10 +219,51 @@ mod tests {
         PackMember {
             finding_id: id,
             link_strength: strength,
+            severity: FindingSeverity::Medium,
             title: title.to_string(),
             root_cause: root_cause.to_string(),
             description: String::new(),
         }
+    }
+
+    #[test]
+    fn finding_mode_orders_by_severity_then_mmr_and_keeps_duplicates_at_tail() {
+        let mut m_low = member(
+            1,
+            LinkStrength::High,
+            "low rounding issue",
+            "dust rounding on deposit shares",
+        );
+        m_low.severity = FindingSeverity::Low;
+        let mut m_high_a = member(
+            2,
+            LinkStrength::High,
+            "Flash Share Inflation",
+            "flash loan inflates share price via direct donation",
+        );
+        m_high_a.severity = FindingSeverity::High;
+        let mut m_high_dup = member(
+            3,
+            LinkStrength::High,
+            "flash  share inflation!",
+            "flash loan inflates share price via direct donation",
+        );
+        m_high_dup.severity = FindingSeverity::High;
+        let mut m_med_distinct = member(
+            4,
+            LinkStrength::High,
+            "Oracle Stale Heartbeat",
+            "chainlink aggregator timestamp staleness bypasses liquidation",
+        );
+        m_med_distinct.severity = FindingSeverity::Medium;
+
+        let ordered =
+            PackMember::order_for_finding_mode(&[m_low, m_high_a, m_high_dup, m_med_distinct]);
+        // Anchor = High severity (2); next = distinct mechanism (4) over low rounding,
+        // and exact normalized-title duplicate (3) is placed at the tail rather than dropped.
+        assert_eq!(ordered.first(), Some(&2));
+        assert_eq!(ordered.last(), Some(&3));
+        assert_eq!(ordered.len(), 4);
     }
 
     #[test]

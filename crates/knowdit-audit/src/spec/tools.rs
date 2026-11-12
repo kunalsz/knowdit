@@ -24,7 +24,7 @@ use crate::types::{
     SuqenceCallStep,
 };
 
-use super::{LinkSpecStatus, ProjectIndex};
+use super::{CallableReachability, LinkSpecStatus, ProjectIndex};
 
 // ---------------------------------------------------------------------------
 // Spec draft + tools
@@ -51,6 +51,10 @@ pub struct SpecDraft {
     pub final_status: Option<LinkSpecStatus>,
     pub abort_reason: Option<String>,
     pub final_summary: Option<String>,
+    /// True **only** when the agent explicitly invoked `finalize(status="abandoned")`
+    /// with zero committed specs (never set on step exhaustion, retry exhaustion,
+    /// or provider errors).
+    pub explicit_abandon: bool,
 }
 
 impl SpecDraft {
@@ -416,12 +420,16 @@ impl SetCallSequenceTool {
         let mut guard = self.draft.0.lock().await;
         // Validate every step before mutating anything.
         let mut problems: Vec<String> = Vec::new();
+        let mut aux_step_count = 0usize;
+        let mut project_step_count = 0usize;
+        let mut readonly_project_step_count = 0usize;
         for (i, step) in args.steps.iter().enumerate() {
             let contract = step.contract.trim();
             let function = step.function.trim();
             if guard.find_aux_contract(contract).is_some() {
                 // Auxiliary contract: its functions are synthesized by the
                 // harness, so accept any function name.
+                aux_step_count += 1;
                 continue;
             }
             if !self.project.has_contract(contract) {
@@ -429,12 +437,38 @@ impl SetCallSequenceTool {
                     "step {}: contract `{contract}` is not a project contract/interface and not a declared auxiliary contract",
                     i + 1
                 ));
-            } else if !self.project.contract_has_function(contract, function) {
-                problems.push(format!(
-                    "step {}: `{contract}` has no function `{function}` (own or inherited)",
-                    i + 1
-                ));
+            } else {
+                match self.project.classify_sequence_callable(contract, function) {
+                    None => {
+                        problems.push(format!(
+                            "step {}: `{contract}` has no function `{function}` (own or inherited)",
+                            i + 1
+                        ));
+                    }
+                    Some(CallableReachability::NonExternal) => {
+                        problems.push(format!(
+                            "step {}: `{contract}.{function}` is non-external (`internal`/`private`/`constructor`/`modifier` or non-`pub` in Rust) and cannot be called directly — inspect incoming edges with `lookup_call_graph` and route through an `external`/`public` entrypoint instead",
+                            i + 1
+                        ));
+                    }
+                    Some(CallableReachability::ExternalReadOnly) => {
+                        project_step_count += 1;
+                        readonly_project_step_count += 1;
+                    }
+                    Some(CallableReachability::ExternalMutating | CallableReachability::Unknown) => {
+                        project_step_count += 1;
+                    }
+                }
             }
+        }
+        if problems.is_empty()
+            && aux_step_count == 0
+            && project_step_count > 0
+            && readonly_project_step_count == project_step_count
+        {
+            problems.push(
+                "every step in the call sequence is read-only (`view`/`pure`) with zero auxiliary-contract steps; read-only calls cannot transition state from `pre_attack` to `post_attack` — include at least one state-mutating entrypoint call".to_string(),
+            );
         }
         if !problems.is_empty() {
             return Ok(format!(
@@ -723,6 +757,7 @@ impl FinalizeTool {
         };
         guard.final_status = Some(status);
         guard.final_summary = Some(args.summary);
+        guard.explicit_abandon = status == LinkSpecStatus::Abandoned && guard.completed.is_empty();
         guard.abort_reason = args.abort_reason.or_else(|| {
             if status == LinkSpecStatus::Abandoned {
                 Some("agent abandoned without explicit reason".to_string())
@@ -1616,5 +1651,223 @@ mod grounding_tests {
             .await
             .unwrap();
         assert!(r.contains("max_specs_per_pair=1 reached"), "{r}");
+    }
+
+    #[tokio::test]
+    async fn set_call_sequence_enforces_external_reachability_and_mutability()
+    -> color_eyre::eyre::Result<()> {
+        let func_src = |id: i32, name: &str, path: &str, content: Option<&str>| Function {
+            id,
+            name: name.to_string(),
+            args: String::new(),
+            relative_file_path: PathBuf::from(path),
+            loc: loc(),
+            content: content.map(str::to_string),
+            calls: Vec::new(),
+            description: None,
+        };
+        let mut contracts = BTreeMap::new();
+        contracts.insert(
+            1,
+            Contract {
+                id: 1,
+                name: "BaseVault".to_string(),
+                relative_file_path: PathBuf::from("src/BaseVault.sol"),
+                chunk: chunk(),
+                functions: vec![func_src(
+                    10,
+                    "inheritedWithdraw",
+                    "src/BaseVault.sol",
+                    Some("function inheritedWithdraw(uint256 a) public {}"),
+                )],
+                description: None,
+            },
+        );
+        contracts.insert(
+            2,
+            Contract {
+                id: 2,
+                name: "Vault".to_string(),
+                relative_file_path: PathBuf::from("src/Vault.sol"),
+                chunk: chunk(),
+                functions: vec![
+                    func_src(
+                        20,
+                        "_accrue",
+                        "src/Vault.sol",
+                        Some("function _accrue() internal {}"),
+                    ),
+                    func_src(
+                        21,
+                        "_secret",
+                        "src/Vault.sol",
+                        Some("function _secret() private {}"),
+                    ),
+                    func_src(
+                        22,
+                        "totalAssets",
+                        "src/Vault.sol",
+                        Some("function totalAssets() external view returns (uint256) { return 0; }"),
+                    ),
+                    func_src(
+                        23,
+                        "previewRedeem",
+                        "src/Vault.sol",
+                        Some("function previewRedeem(uint256 s) public pure returns (uint256) { return s; }"),
+                    ),
+                    func_src(
+                        24,
+                        "deposit",
+                        "src/Vault.sol",
+                        Some("function deposit(uint256 a) external {}"),
+                    ),
+                    func_src(25, "syntheticFixture", "src/Vault.sol", None),
+                ],
+                description: None,
+            },
+        );
+        contracts.insert(
+            3,
+            Contract {
+                id: 3,
+                name: "solana_prog".to_string(),
+                relative_file_path: PathBuf::from("programs/prog/src/lib.rs"),
+                chunk: chunk(),
+                functions: vec![
+                    func_src(
+                        30,
+                        "priv_helper",
+                        "programs/prog/src/lib.rs",
+                        Some("fn priv_helper() {}"),
+                    ),
+                    func_src(
+                        31,
+                        "crate_helper",
+                        "programs/prog/src/lib.rs",
+                        Some("pub(crate) fn crate_helper() {}"),
+                    ),
+                    func_src(
+                        32,
+                        "ix_deposit",
+                        "programs/prog/src/lib.rs",
+                        Some("pub fn ix_deposit() {}"),
+                    ),
+                ],
+                description: None,
+            },
+        );
+        let idx = Arc::new(ProjectIndex::build(
+            CallGraph {
+                contracts,
+                interfaces: BTreeMap::new(),
+            },
+            StorageGraph::default(),
+            InheritanceGraph::new(vec![ContractInherit {
+                contract_id: 2,
+                inherited_id: 1,
+            }]),
+        ));
+        let draft = DraftHandle::new();
+        let tool = SetCallSequenceTool {
+            draft: draft.clone(),
+            project: idx.clone(),
+        };
+
+        // 1. Reject internal Solidity function.
+        let r = tool
+            .invoke(SetCallSequenceArgs {
+                steps: vec![CallStepArg {
+                    contract: "Vault".to_string(),
+                    function: "_accrue".to_string(),
+                    intention: "bad direct internal".to_string(),
+                }],
+            })
+            .await?;
+        assert!(r.starts_with("error:") && r.contains("lookup_call_graph"), "{r}");
+        assert!(draft.snapshot().await.sequence.is_empty());
+
+        // 2. Reject private / pub(crate) Rust functions.
+        for fn_name in ["priv_helper", "crate_helper"] {
+            let r = tool
+                .invoke(SetCallSequenceArgs {
+                    steps: vec![CallStepArg {
+                        contract: "solana_prog".to_string(),
+                        function: fn_name.to_string(),
+                        intention: "bad non-pub rust".to_string(),
+                    }],
+                })
+                .await?;
+            assert!(r.starts_with("error:"), "{r}");
+        }
+
+        // 3. Reject 100% view/pure sequences with zero aux steps.
+        let r = tool
+            .invoke(SetCallSequenceArgs {
+                steps: vec![
+                    CallStepArg {
+                        contract: "Vault".to_string(),
+                        function: "totalAssets".to_string(),
+                        intention: "read".to_string(),
+                    },
+                    CallStepArg {
+                        contract: "Vault".to_string(),
+                        function: "previewRedeem".to_string(),
+                        intention: "pure calc".to_string(),
+                    },
+                ],
+            })
+            .await?;
+        assert!(r.starts_with("error:") && r.contains("read-only"), "{r}");
+
+        // 4. Accept inherited public overload + view step, Rust `pub fn`, and `content: None` fixture.
+        let r = tool
+            .invoke(SetCallSequenceArgs {
+                steps: vec![
+                    CallStepArg {
+                        contract: "Vault".to_string(),
+                        function: "totalAssets".to_string(),
+                        intention: "snapshot before".to_string(),
+                    },
+                    CallStepArg {
+                        contract: "Vault".to_string(),
+                        function: "inheritedWithdraw".to_string(),
+                        intention: "mutate via inherited public".to_string(),
+                    },
+                    CallStepArg {
+                        contract: "solana_prog".to_string(),
+                        function: "ix_deposit".to_string(),
+                        intention: "rust pub instruction".to_string(),
+                    },
+                ],
+            })
+            .await?;
+        assert!(r.starts_with("ok:"), "{r}");
+        assert_eq!(draft.snapshot().await.sequence.len(), 3);
+
+        let r = tool
+            .invoke(SetCallSequenceArgs {
+                steps: vec![CallStepArg {
+                    contract: "Vault".to_string(),
+                    function: "syntheticFixture".to_string(),
+                    intention: "fail-open fixture".to_string(),
+                }],
+            })
+            .await?;
+        assert!(r.starts_with("ok:"), "{r}");
+
+        // 5. FinalizeTool sets explicit_abandon = true ONLY on abandoned without specs.
+        let fin = FinalizeTool {
+            draft: draft.clone(),
+        };
+        let fin_res = fin
+            .invoke(FinalizeArgs {
+                status: FinalizeStatus::Abandoned,
+                summary: "not applicable".to_string(),
+                abort_reason: Some("no pool".to_string()),
+            })
+            .await?;
+        assert!(fin_res.starts_with("ok:"), "{fin_res}");
+        assert!(draft.snapshot().await.explicit_abandon);
+        Ok(())
     }
 }

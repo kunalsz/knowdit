@@ -100,9 +100,18 @@ pub struct HarnessSharedArgs {
     pub forge_test_runs: u64,
 
     /// `--fuzz-runs` for the `forge coverage` invocation. Coverage is
-    /// much slower per sample, so this is usually a smaller value.
-    #[arg(long = "forge-coverage-runs", default_value_t = 5_000)]
+    /// much slower per sample, so 256 runs suffices for line-coverage
+    /// fidelity checks while avoiding redundant 5,000-run interpreter spend.
+    #[arg(long = "forge-coverage-runs", default_value_t = 256)]
     pub forge_coverage_runs: u64,
+
+    /// Number of isolated Foundry build slots (`--out` / `--cache-path`)
+    /// allowed to run `forge` concurrently. In `workflow streamloop`,
+    /// `--default-concurrency` populates this (capped at `8` when inferred);
+    /// standalone `fuzz`/`regen` fall back to `--fuzz-concurrency` /
+    /// `--regen-concurrency`.
+    #[arg(long = "forge-concurrency")]
+    pub forge_concurrency: Option<usize>,
 
     /// Maximum agent steps per spec across all restarts. Cumulative
     /// budget — restarts reuse the same step counter so a model that
@@ -188,12 +197,21 @@ impl HarnessSharedArgs {
     /// `forge coverage --help` probe runs only once even when fuzz
     /// + regen both run inside the same autoloop cycle.
     pub fn to_forge_backend(&self) -> Result<ForgeBackend> {
+        self.to_forge_backend_with_concurrency(1)
+    }
+
+    pub fn to_forge_backend_with_concurrency(&self, fallback_concurrency: usize) -> Result<ForgeBackend> {
         let mem_cap_bytes =
             (self.forge_mem_cap_gb > 0).then(|| self.forge_mem_cap_gb * 1024 * 1024 * 1024);
-        ForgeBackend::new(
+        let slots = self
+            .forge_concurrency
+            .unwrap_or(fallback_concurrency)
+            .max(1);
+        ForgeBackend::with_concurrency(
             self.forge_bin.clone(),
             self.docker_image.clone(),
             mem_cap_bytes,
+            slots,
         )
     }
 
@@ -255,7 +273,7 @@ impl HarnessSharedArgs {
     /// handle" so orchestrators don't re-thread the underlying
     /// `(backend, options, kind)` tuple manually.
     pub fn to_solidity_harness(&self, build: FuzzOptionsBuild) -> Result<SolidityHarness> {
-        let forge_backend = self.to_forge_backend()?;
+        let forge_backend = self.to_forge_backend_with_concurrency(build.concurrency)?;
         let options = self.to_fuzz_options(build);
         Ok(SolidityHarness::new(
             self.harness_mode.into(),

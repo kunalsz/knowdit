@@ -448,3 +448,248 @@ async fn resume_query_uses_compound_specification_index() {
         "expected compound index in plan, got:\n{joined}"
     );
 }
+
+#[tokio::test]
+async fn abandoned_link_idempotent_upsert_and_resume_priority() -> color_eyre::eyre::Result<()> {
+    use sea_orm::EntityTrait;
+
+    let temp = temp_db().await;
+    // Re-running init_schema on an already-migrated DB must stay idempotent.
+    temp.repo.init_schema().await?;
+
+    insert_extract(&temp.repo, 1).await;
+    insert_historical(&temp.repo, 100).await;
+
+    let k_abandoned = LinkKey {
+        extract_id: 1,
+        historical_id: 100,
+        finding_id: 10,
+    };
+    let k_partial = LinkKey {
+        extract_id: 1,
+        historical_id: 100,
+        finding_id: 11,
+    };
+    let k_built = LinkKey {
+        extract_id: 1,
+        historical_id: 100,
+        finding_id: 12,
+    };
+    let k_fresh = LinkKey {
+        extract_id: 1,
+        historical_id: 100,
+        finding_id: 13,
+    };
+
+    // Record abandoned twice on the same triple: compound unique index + on_conflict
+    // updates abort_reason in place rather than duplicating rows.
+    temp.repo
+        .record_abandoned_links(&[k_abandoned, k_partial, k_built], "first reason")
+        .await?;
+    temp.repo
+        .record_abandoned_links(&[k_abandoned], "updated reason")
+        .await?;
+
+    let rows = crate::db::abandoned_link::Entity::find()
+        .all(temp.repo.connection())
+        .await?;
+    assert_eq!(rows.len(), 3);
+    let updated = rows
+        .iter()
+        .find(|r| r.finding_id == 10)
+        .ok_or_else(|| color_eyre::eyre::eyre!("missing abandoned row for finding 10"))?;
+    assert_eq!(updated.abort_reason, "updated reason");
+
+    // Seed Partial and Built on top of existing abandoned rows to verify
+    // Built > Partial > Abandoned > NotStarted priority.
+    let p_spec = insert_spec(&temp.repo, 1, 100, 11).await;
+    let b_spec = insert_spec(&temp.repo, 1, 100, 12).await;
+    insert_code_gen(&temp.repo, b_spec).await;
+
+    assert_eq!(
+        temp.repo.link_resume_state(1, 100, 10).await?,
+        LinkResumeState::Abandoned
+    );
+    assert_eq!(
+        temp.repo.link_resume_state(1, 100, 11).await?,
+        LinkResumeState::Partial {
+            spec_ids: vec![p_spec]
+        }
+    );
+    assert_eq!(
+        temp.repo.link_resume_state(1, 100, 12).await?,
+        LinkResumeState::Built
+    );
+    assert_eq!(
+        temp.repo.link_resume_state(1, 100, 13).await?,
+        LinkResumeState::NotStarted
+    );
+
+    let bulk = temp
+        .repo
+        .load_link_resume_states(&[k_abandoned, k_partial, k_built, k_fresh])
+        .await?;
+    assert_eq!(bulk.get(&k_abandoned), Some(&LinkResumeState::Abandoned));
+    assert_eq!(
+        bulk.get(&k_partial),
+        Some(&LinkResumeState::Partial {
+            spec_ids: vec![p_spec]
+        })
+    );
+    assert_eq!(bulk.get(&k_built), Some(&LinkResumeState::Built));
+    assert_eq!(bulk.get(&k_fresh), Some(&LinkResumeState::NotStarted));
+
+    // Verify abandoned_link bulk query never projects abort_reason.
+    use sea_orm::{DatabaseBackend, QueryTrait};
+    let ab_sql = crate::repo::abandoned_link_resume_query(vec![1], vec![100], vec![10])
+        .build(DatabaseBackend::Sqlite)
+        .sql;
+    assert!(
+        !ab_sql.to_lowercase().contains("abort_reason"),
+        "abandoned resume query must not overfetch abort_reason: {ab_sql}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn skipped_viability_and_terminal_specifications_behavior() -> color_eyre::eyre::Result<()> {
+    assert!(CodeGenStatus::SkippedViability.counts_as_resumable_skip());
+    assert!(CodeGenStatus::Completed.counts_as_resumable_skip());
+    assert!(CodeGenStatus::Duplicate.counts_as_resumable_skip());
+    assert!(!CodeGenStatus::Abandoned.counts_as_resumable_skip());
+
+    let temp = temp_db().await;
+    insert_extract(&temp.repo, 1).await;
+    insert_historical(&temp.repo, 100).await;
+
+    let s_completed = insert_spec(&temp.repo, 1, 100, 1).await;
+    let s_valid = insert_spec(&temp.repo, 1, 100, 2).await;
+    let s_dup = insert_spec(&temp.repo, 1, 100, 3).await;
+    let s_skip = insert_spec(&temp.repo, 1, 100, 4).await;
+
+    let _cg1 = insert_code_gen(&temp.repo, s_completed).await;
+    let cg_valid = insert_code_gen(&temp.repo, s_valid).await;
+
+    for (spec_id, status) in [
+        (s_dup, CodeGenStatus::Duplicate),
+        (s_skip, CodeGenStatus::SkippedViability),
+    ] {
+        code_gen_model::Entity::insert(code_gen_model::ActiveModel {
+            spec_id: Set(spec_id),
+            harness_relative_path: Set(String::new()),
+            harness_source: Set(String::new()),
+            status: Set(status),
+            final_reason: Set("screened".to_string()),
+            agent_steps: Set(0),
+            ..Default::default()
+        })
+        .exec(temp.repo.connection())
+        .await?;
+    }
+
+    let run = crate::db::harness_run::Entity::insert(crate::db::harness_run::ActiveModel {
+        code_id: Set(cg_valid),
+        kind: Set(crate::repo::RunKind::Test),
+        seed: Set(None),
+        runs: Set(1),
+        forge_args: Set("[]".to_string()),
+        exit_code: Set(0),
+        stdout: Set(String::new()),
+        stderr: Set(String::new()),
+        duration_ms: Set(0),
+        violated: Set(true),
+        sequence_json: Set(None),
+        ..Default::default()
+    })
+    .exec(temp.repo.connection())
+    .await?
+    .last_insert_id;
+    crate::db::reflection::Entity::insert(crate::db::reflection::ActiveModel {
+        run_id: Set(run),
+        spec_id: Set(s_valid),
+        result: Set(crate::repo::ReflectionResult::ValidFinding),
+        reason: Set("confirmed".to_string()),
+        ..Default::default()
+    })
+    .exec(temp.repo.connection())
+    .await?;
+
+    // Both Duplicate and SkippedViability count as resumable skips...
+    let resumable = temp.repo.loaded_completed_code_gen_spec_ids().await?;
+    assert!(resumable.contains(&s_completed));
+    assert!(resumable.contains(&s_valid));
+    assert!(resumable.contains(&s_dup));
+    assert!(resumable.contains(&s_skip));
+
+    // ...but load_terminal_specifications returns ONLY canonical Completed specs,
+    // annotated with is_valid_finding.
+    let terminals = temp.repo.load_terminal_specifications().await?;
+    assert_eq!(terminals.len(), 2);
+    assert_eq!(terminals[0].spec.id, s_completed);
+    assert!(!terminals[0].is_valid_finding);
+    assert_eq!(terminals[1].spec.id, s_valid);
+    assert!(terminals[1].is_valid_finding);
+    Ok(())
+}
+
+#[tokio::test]
+async fn append_project_semantics_preserves_existing_ids() -> color_eyre::eyre::Result<()> {
+    use knowdit_kg_model::{ExtractedFunction, ExtractedSemantic};
+
+    let temp = temp_db().await;
+    let initial = vec![
+        ExtractedSemantic {
+            name: "Deposit Flow".to_string(),
+            category: DeFiCategory::Lending,
+            definition: "def1".to_string(),
+            description: "desc1".to_string(),
+            functions: vec![ExtractedFunction {
+                name: "deposit".to_string(),
+                contract: "Vault".to_string(),
+                signature: Some("deposit(uint256)".to_string()),
+            }],
+        },
+        ExtractedSemantic {
+            name: "Withdraw Flow".to_string(),
+            category: DeFiCategory::Lending,
+            definition: "def2".to_string(),
+            description: "desc2".to_string(),
+            functions: vec![ExtractedFunction {
+                name: "withdraw".to_string(),
+                contract: "Vault".to_string(),
+                signature: Some("withdraw(uint256)".to_string()),
+            }],
+        },
+    ];
+    temp.repo.replace_project_semantics(&initial).await?;
+
+    let appended = vec![ExtractedSemantic {
+        name: "Vault Stateful Entrypoints".to_string(),
+        category: DeFiCategory::Lending,
+        definition: "def3".to_string(),
+        description: "desc3".to_string(),
+        functions: vec![ExtractedFunction {
+            name: "emergencySweep".to_string(),
+            contract: "Vault".to_string(),
+            signature: Some("emergencySweep(address)".to_string()),
+        }],
+    }];
+    temp.repo.append_project_semantics(&appended).await?;
+
+    let rows = project_semantic_model::Entity::find()
+        .all(temp.repo.connection())
+        .await?;
+    let ids_and_names: Vec<(i32, String)> = rows.into_iter().map(|r| (r.id, r.name)).collect();
+    assert_eq!(
+        ids_and_names,
+        vec![
+            (1, "Deposit Flow".to_string()),
+            (2, "Withdraw Flow".to_string()),
+            (3, "Vault Stateful Entrypoints".to_string()),
+        ]
+    );
+    let loaded = temp.repo.load_project_semantics().await?;
+    assert_eq!(loaded.len(), 3);
+    assert_eq!(loaded[2].functions[0].name, "emergencySweep");
+    Ok(())
+}

@@ -42,8 +42,9 @@ mod pack;
 mod prompt;
 mod tools;
 pub mod novelty;
+pub mod viability;
 pub use backend::SpecBackend;
-pub use index::ProjectIndex;
+pub use index::{CallableReachability, ProjectIndex, StatefulEntrypoint};
 use prompt::{
     build_pair_system_prompt, build_pair_user_prompt, build_regen_prompt_extension,
     build_system_prompt, build_user_prompt,
@@ -143,6 +144,21 @@ pub enum SpecGranularity {
     Pair,
 }
 
+/// Intra-bucket link scheduling policy for `finding` granularity.
+///
+/// * [`Self::Fair`] (default) — 2-level `(extract_id -> historical_id)`
+///   round-robin inside each `(match_rank, link_rank)` bucket with findings
+///   inside each `(extract_id, historical_id)` pair ordered by
+///   `(link_strength DESC, severity DESC, MMR Jaccard distance, finding_id ASC)`.
+/// * [`Self::Legacy`] — flat `(historical_id ASC, finding_id ASC)` queue per
+///   extract, preserved for reproducible legacy ordering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SpecSchedule {
+    #[default]
+    Fair,
+    Legacy,
+}
+
 /// Tunables for one Specification Generator pass.
 #[derive(Debug, Clone)]
 pub struct SpecGenOptions {
@@ -230,6 +246,12 @@ pub struct SpecGenOptions {
     /// explores the same surface a whole per-finding batch would, so it needs
     /// a larger budget than `max_agent_steps`.
     pub pair_max_agent_steps: usize,
+    /// Intra-bucket scheduling policy (`Fair` 2-level round-robin vs `Legacy`
+    /// flat sort).
+    pub schedule: SpecSchedule,
+    /// When `true`, re-include links/members marked `LinkResumeState::Abandoned`
+    /// in `abandoned_link` instead of skipping them on resume.
+    pub retry_abandoned: bool,
 }
 
 impl Default for SpecGenOptions {
@@ -256,6 +278,8 @@ impl Default for SpecGenOptions {
             pack_size: 10,
             max_specs_per_pair: 16,
             pair_max_agent_steps: 96,
+            schedule: SpecSchedule::Fair,
+            retry_abandoned: false,
         }
     }
 }
@@ -306,6 +330,10 @@ pub struct LinkSpecOutcome {
     pub specification_ids: Vec<i32>,
     /// Reason the agent reported for abandoning, when `status == Abandoned`.
     pub abort_reason: Option<String>,
+    /// True **only** when the agent explicitly called `finalize(status="abandoned")`
+    /// with zero committed specs. Transient/step/retry failures leave this `false`
+    /// so `commit` writes zero rows and resume retries them.
+    pub explicit_abandon: bool,
     /// Free-form summary from the agent's final tool call.
     pub final_summary: Option<String>,
     /// Number of agent steps consumed (counts initial step too).
@@ -316,12 +344,42 @@ pub struct LinkSpecOutcome {
 
 impl LinkSpecOutcome {
     /// Persist `self.specifications` to the project DB's `specification` table
-    /// and record the assigned row ids in `self.specification_ids`. A no-op
-    /// (leaving `specification_ids` empty) when there are no specs, or on a
-    /// serialize / append failure (logged, not fatal — a commit failure for one
-    /// link shouldn't abort the run).
+    /// (recording assigned row ids in `self.specification_ids`), or — when zero
+    /// specs were committed AND `self.explicit_abandon` is `true` — record
+    /// `abandoned_link` rows for the evaluated link/pack members. Transient
+    /// errors (`explicit_abandon == false`) write nothing so resume retries them.
     pub async fn commit(&mut self, repo: &RepoDatabase) {
         if self.specifications.is_empty() {
+            if self.explicit_abandon && self.status == LinkSpecStatus::Abandoned {
+                let keys: Vec<LinkKey> = if self.pack_finding_ids.is_empty() {
+                    vec![LinkKey {
+                        extract_id: self.extract_id,
+                        historical_id: self.historical_id,
+                        finding_id: self.finding_id,
+                    }]
+                } else {
+                    self.pack_finding_ids
+                        .iter()
+                        .map(|&finding_id| LinkKey {
+                            extract_id: self.extract_id,
+                            historical_id: self.historical_id,
+                            finding_id,
+                        })
+                        .collect()
+                };
+                let reason = self
+                    .abort_reason
+                    .as_deref()
+                    .unwrap_or("agent abandoned without explicit reason");
+                if let Err(err) = repo.record_abandoned_links(&keys, reason).await {
+                    tracing::error!(
+                        "failed to record {} abandoned_link row(s) for extract={} historical={}: {err:#}",
+                        keys.len(),
+                        self.extract_id,
+                        self.historical_id,
+                    );
+                }
+            }
             return;
         }
         let mut payload = Vec::with_capacity(self.specifications.len());
@@ -429,6 +487,10 @@ impl SpecGenStream {
 
     pub fn historical_finding_total(&self) -> usize {
         self.plan.historical_finding_total()
+    }
+
+    pub fn project_index(&self) -> Arc<ProjectIndex> {
+        self.plan.project_index()
     }
 
     pub fn next_link_key(&self) -> Option<LinkKey> {
@@ -549,6 +611,7 @@ impl PlannedLinkWork {
                 spec_finding_ids: Vec::new(),
                 pack_finding_ids: Vec::new(),
                 abort_reason: None,
+                explicit_abandon: false,
                 final_summary: Some(
                     "resumed from existing spec rows; gen-spec agent skipped".to_string(),
                 ),
@@ -1229,10 +1292,15 @@ impl PreparedLinkPlan {
             SpecGranularity::Finding => {
                 let candidates = prepare_finding_candidates(repo, &runtime, options).await?;
                 let raw_link_count = candidates.raw_count;
-                select_pending(candidates.items, options, raw_link_count)
-                    .into_iter()
-                    .map(PendingWork::Finding)
-                    .collect()
+                select_pending_with_runtime(
+                    candidates.items,
+                    options,
+                    raw_link_count,
+                    Some(&runtime),
+                )
+                .into_iter()
+                .map(PendingWork::Finding)
+                .collect()
             }
             SpecGranularity::Pair => {
                 let candidates =
@@ -1452,6 +1520,7 @@ async fn resolve_link_resume(
     let before = candidates.len();
     let mut kept: Vec<LinkCandidate> = Vec::with_capacity(before);
     let mut dropped_built = 0usize;
+    let mut dropped_abandoned = 0usize;
     let mut resumed_partial = 0usize;
     for chunk in candidates.chunks(RESUME_CHUNK) {
         let keys: Vec<LinkKey> = chunk.iter().map(|c| c.key).collect();
@@ -1462,6 +1531,9 @@ async fn resolve_link_resume(
         for candidate in chunk {
             match states.get(&candidate.key) {
                 Some(LinkResumeState::Built) => dropped_built += 1,
+                Some(LinkResumeState::Abandoned) if !options.retry_abandoned => {
+                    dropped_abandoned += 1;
+                }
                 Some(LinkResumeState::Partial { spec_ids }) => {
                     resumed_partial += 1;
                     let mut candidate = candidate.clone();
@@ -1473,10 +1545,11 @@ async fn resolve_link_resume(
         }
     }
     candidates = kept;
-    if dropped_built > 0 || resumed_partial > 0 {
+    if dropped_built > 0 || dropped_abandoned > 0 || resumed_partial > 0 {
         tracing::info!(
-            "Specification Generator resume: {} link(s) dropped (Built), {} link(s) resuming at inner cycle (Partial), {} link(s) remaining; {} → {} link(s) total",
+            "Specification Generator resume: {} link(s) dropped (Built), {} link(s) dropped (Abandoned), {} link(s) resuming at inner cycle (Partial), {} link(s) remaining; {} → {} link(s) total",
             dropped_built,
+            dropped_abandoned,
             resumed_partial,
             candidates.len(),
             before,
@@ -1547,6 +1620,7 @@ async fn prepare_pair_candidates(
                 PackMember {
                     finding_id: linked.finding.id,
                     link_strength: linked.strength,
+                    severity: linked.finding.severity,
                     title: linked.finding.title.clone(),
                     root_cause: linked.finding.root_cause.clone(),
                     description: linked.finding.description.clone(),
@@ -1561,7 +1635,13 @@ async fn prepare_pair_candidates(
         // and scheduling bucket even when every member has already resumed.
         let strongest = members
             .iter()
-            .max_by_key(|member| (member.link_strength.rank(), std::cmp::Reverse(member.finding_id)))
+            .max_by_key(|member| {
+                (
+                    member.link_strength.rank(),
+                    member.severity.rank(),
+                    std::cmp::Reverse(member.finding_id),
+                )
+            })
             .expect("members is non-empty")
             .clone();
         drafts.push(PairDraft {
@@ -1603,6 +1683,7 @@ async fn prepare_pair_candidates(
             resumed.extend(states);
         }
         let mut resumed_members = 0usize;
+        let mut abandoned_members = 0usize;
         for draft in &mut drafts {
             let pair_id = (draft.extract_id, draft.historical_id);
             draft.members.retain(|member| {
@@ -1613,6 +1694,10 @@ async fn prepare_pair_candidates(
                 }) {
                     Some(LinkResumeState::Built) => {
                         resumed_members += 1;
+                        false
+                    }
+                    Some(LinkResumeState::Abandoned) if !options.retry_abandoned => {
+                        abandoned_members += 1;
                         false
                     }
                     Some(LinkResumeState::Partial { spec_ids }) => {
@@ -1632,10 +1717,11 @@ async fn prepare_pair_candidates(
             !draft.members.is_empty()
                 || partial_ids.contains_key(&(draft.extract_id, draft.historical_id))
         });
-        if resumed_members > 0 {
+        if resumed_members > 0 || abandoned_members > 0 {
             tracing::info!(
-                "Specification Generator pair resume: {} member link(s) already built or partial — excluded from pack selection",
-                resumed_members
+                "Specification Generator pair resume: {} member link(s) built/partial, {} abandoned — excluded from pack selection",
+                resumed_members,
+                abandoned_members,
             );
         }
 
@@ -1735,14 +1821,166 @@ struct PairDraft {
     prior_summaries: Vec<String>,
 }
 
+/// Per-extract 2-level round-robin queue inside one `(match_rank, link_rank)`
+/// bucket under [`SpecSchedule::Fair`].
+struct ExtractBucketQueue {
+    historical_ring: VecDeque<i32>,
+    by_historical: BTreeMap<i32, VecDeque<LinkCandidate>>,
+}
+
+impl ExtractBucketQueue {
+    fn from_candidates(
+        candidates: Vec<LinkCandidate>,
+        runtime: Option<&SpecRuntime>,
+        mmr_cache: &mut BTreeMap<(i32, Vec<i32>), Vec<i32>>,
+    ) -> Self {
+        let mut grouped: BTreeMap<i32, Vec<LinkCandidate>> = BTreeMap::new();
+        for candidate in candidates {
+            grouped
+                .entry(candidate.key.historical_id)
+                .or_default()
+                .push(candidate);
+        }
+
+        let mut historical_ring = VecDeque::with_capacity(grouped.len());
+        let mut by_historical = BTreeMap::new();
+        for (historical_id, mut group) in grouped {
+            group.sort_by_key(|c| c.key.finding_id);
+            if let Some(rt) = runtime
+                && group.len() > 1
+            {
+                let cache_key = (
+                    historical_id,
+                    group.iter().map(|c| c.key.finding_id).collect::<Vec<i32>>(),
+                );
+                let ordered_ids = mmr_cache
+                    .entry(cache_key)
+                    .or_insert_with(|| {
+                        let pack_members: Vec<PackMember> = group
+                            .iter()
+                            .filter_map(|c| {
+                                let linked = rt.linked_finding(historical_id, c.key.finding_id)?;
+                                Some(PackMember {
+                                    finding_id: c.key.finding_id,
+                                    link_strength: c.link_strength,
+                                    severity: linked.finding.severity,
+                                    title: linked.finding.title.clone(),
+                                    root_cause: linked.finding.root_cause.clone(),
+                                    description: linked.finding.description.clone(),
+                                })
+                            })
+                            .collect();
+                        if pack_members.len() == group.len() {
+                            PackMember::order_for_finding_mode(&pack_members)
+                        } else {
+                            group.iter().map(|c| c.key.finding_id).collect()
+                        }
+                    })
+                    .clone();
+                let mut rank_by_id: BTreeMap<i32, usize> = BTreeMap::new();
+                for (pos, fid) in ordered_ids.into_iter().enumerate() {
+                    rank_by_id.insert(fid, pos);
+                }
+                group.sort_by_key(|c| {
+                    (
+                        rank_by_id
+                            .get(&c.key.finding_id)
+                            .copied()
+                            .unwrap_or(usize::MAX),
+                        c.key.finding_id,
+                    )
+                });
+            }
+            historical_ring.push_back(historical_id);
+            by_historical.insert(historical_id, VecDeque::from(group));
+        }
+
+        Self {
+            historical_ring,
+            by_historical,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.historical_ring.is_empty()
+    }
+
+    fn pop_next_admissible(
+        &mut self,
+        extract_id: i32,
+        per_eh_cap: Option<usize>,
+        per_e_cap: Option<usize>,
+        per_eh: &mut BTreeMap<(i32, i32), usize>,
+        per_e: &mut BTreeMap<i32, usize>,
+    ) -> Option<LinkCandidate> {
+        if let Some(cap) = per_e_cap
+            && per_e.get(&extract_id).copied().unwrap_or(0) >= cap
+        {
+            self.historical_ring.clear();
+            self.by_historical.clear();
+            return None;
+        }
+
+        while let Some(historical_id) = self.historical_ring.pop_front() {
+            let current_eh = per_eh
+                .get(&(extract_id, historical_id))
+                .copied()
+                .unwrap_or(0);
+            if let Some(cap) = per_eh_cap
+                && current_eh >= cap
+            {
+                self.by_historical.remove(&historical_id);
+                continue;
+            }
+            let Some(cand_queue) = self.by_historical.get_mut(&historical_id) else {
+                continue;
+            };
+            let Some(candidate) = cand_queue.pop_front() else {
+                self.by_historical.remove(&historical_id);
+                continue;
+            };
+            let new_eh = current_eh + 1;
+            per_eh.insert((extract_id, historical_id), new_eh);
+            let new_e = per_e.get(&extract_id).copied().unwrap_or(0) + 1;
+            per_e.insert(extract_id, new_e);
+
+            let still_has_items = !cand_queue.is_empty();
+            let under_eh_cap = per_eh_cap.is_none_or(|cap| new_eh < cap);
+            if still_has_items && under_eh_cap {
+                self.historical_ring.push_back(historical_id);
+            } else {
+                self.by_historical.remove(&historical_id);
+            }
+            if let Some(cap) = per_e_cap
+                && new_e >= cap
+            {
+                self.historical_ring.clear();
+                self.by_historical.clear();
+            }
+            return Some(candidate);
+        }
+        None
+    }
+}
+
 /// Consume `candidates` from strongest to weakest `(match, link)` bucket,
 /// applying per-`(extract, historical)` and per-extract quotas with counters
 /// shared across every bucket, interleaving extracts round-robin **within** a
 /// bucket for fairness, and stopping after `max_links`.
+#[cfg(test)]
 fn select_pending(
     candidates: Vec<LinkCandidate>,
     options: &SpecGenOptions,
     raw_link_count: usize,
+) -> VecDeque<LinkCandidate> {
+    select_pending_with_runtime(candidates, options, raw_link_count, None)
+}
+
+fn select_pending_with_runtime(
+    candidates: Vec<LinkCandidate>,
+    options: &SpecGenOptions,
+    raw_link_count: usize,
+    runtime: Option<&SpecRuntime>,
 ) -> VecDeque<LinkCandidate> {
     // Bucket by (match_rank, link_rank); BTreeMap keeps ascending key order, so
     // `.rev()` walks strongest match first, then strongest link.
@@ -1763,60 +2001,102 @@ fn select_pending(
     let mut selected: VecDeque<LinkCandidate> = VecDeque::new();
     let mut per_eh: BTreeMap<(i32, i32), usize> = BTreeMap::new();
     let mut per_e: BTreeMap<i32, usize> = BTreeMap::new();
+    let mut mmr_cache: BTreeMap<(i32, Vec<i32>), Vec<i32>> = BTreeMap::new();
 
-    'buckets: for by_extract in buckets.into_values().rev() {
-        // Deterministic order inside one extract: (historical_id, finding_id).
-        let mut queues: BTreeMap<i32, VecDeque<LinkCandidate>> = BTreeMap::new();
-        for (extract_id, mut queue) in by_extract {
-            queue.sort_by_key(|c| (c.key.historical_id, c.key.finding_id));
-            queues.insert(extract_id, queue.into());
-        }
-
-        // Round-robin across extracts by ascending id. A candidate over quota
-        // is dropped (quotas only grow, so it can never become admissible) and
-        // does not consume a slot.
-        loop {
-            let extract_ids: Vec<i32> = queues.keys().copied().collect();
-            if extract_ids.is_empty() {
-                break;
-            }
-            for extract_id in extract_ids {
-                let Some(queue) = queues.get_mut(&extract_id) else {
-                    continue;
-                };
-                while let Some(candidate) = queue.pop_front() {
-                    if let Some(cap) = per_eh_cap {
-                        let count = per_eh
-                            .get(&(candidate.key.extract_id, candidate.key.historical_id))
-                            .copied()
-                            .unwrap_or(0);
-                        if count >= cap {
-                            continue;
-                        }
+    match options.schedule {
+        SpecSchedule::Fair => {
+            'buckets: for by_extract in buckets.into_values().rev() {
+                let mut queues: BTreeMap<i32, ExtractBucketQueue> = BTreeMap::new();
+                for (extract_id, group) in by_extract {
+                    let q = ExtractBucketQueue::from_candidates(group, runtime, &mut mmr_cache);
+                    if !q.is_empty() {
+                        queues.insert(extract_id, q);
                     }
-                    if let Some(cap) = per_e_cap {
-                        let count = per_e
-                            .get(&candidate.key.extract_id)
-                            .copied()
-                            .unwrap_or(0);
-                        if count >= cap {
-                            continue;
-                        }
-                    }
-                    *per_eh
-                        .entry((candidate.key.extract_id, candidate.key.historical_id))
-                        .or_insert(0) += 1;
-                    *per_e.entry(candidate.key.extract_id).or_insert(0) += 1;
-                    selected.push_back(candidate);
-                    if let Some(cap) = max_links
-                        && selected.len() >= cap
-                    {
-                        break 'buckets;
-                    }
-                    break;
                 }
-                if queue.is_empty() {
-                    queues.remove(&extract_id);
+
+                loop {
+                    let extract_ids: Vec<i32> = queues.keys().copied().collect();
+                    if extract_ids.is_empty() {
+                        break;
+                    }
+                    for extract_id in extract_ids {
+                        let Some(queue) = queues.get_mut(&extract_id) else {
+                            continue;
+                        };
+                        if let Some(candidate) = queue.pop_next_admissible(
+                            extract_id,
+                            per_eh_cap,
+                            per_e_cap,
+                            &mut per_eh,
+                            &mut per_e,
+                        ) {
+                            selected.push_back(candidate);
+                            if let Some(cap) = max_links
+                                && selected.len() >= cap
+                            {
+                                break 'buckets;
+                            }
+                        }
+                        if queue.is_empty() {
+                            queues.remove(&extract_id);
+                        }
+                    }
+                }
+            }
+        }
+        SpecSchedule::Legacy => {
+            'buckets: for by_extract in buckets.into_values().rev() {
+                // Legacy deterministic order inside one extract: (historical_id, finding_id).
+                let mut queues: BTreeMap<i32, VecDeque<LinkCandidate>> = BTreeMap::new();
+                for (extract_id, mut queue) in by_extract {
+                    queue.sort_by_key(|c| (c.key.historical_id, c.key.finding_id));
+                    queues.insert(extract_id, queue.into());
+                }
+
+                loop {
+                    let extract_ids: Vec<i32> = queues.keys().copied().collect();
+                    if extract_ids.is_empty() {
+                        break;
+                    }
+                    for extract_id in extract_ids {
+                        let Some(queue) = queues.get_mut(&extract_id) else {
+                            continue;
+                        };
+                        while let Some(candidate) = queue.pop_front() {
+                            if let Some(cap) = per_eh_cap {
+                                let count = per_eh
+                                    .get(&(candidate.key.extract_id, candidate.key.historical_id))
+                                    .copied()
+                                    .unwrap_or(0);
+                                if count >= cap {
+                                    continue;
+                                }
+                            }
+                            if let Some(cap) = per_e_cap {
+                                let count = per_e
+                                    .get(&candidate.key.extract_id)
+                                    .copied()
+                                    .unwrap_or(0);
+                                if count >= cap {
+                                    continue;
+                                }
+                            }
+                            *per_eh
+                                .entry((candidate.key.extract_id, candidate.key.historical_id))
+                                .or_insert(0) += 1;
+                            *per_e.entry(candidate.key.extract_id).or_insert(0) += 1;
+                            selected.push_back(candidate);
+                            if let Some(cap) = max_links
+                                && selected.len() >= cap
+                            {
+                                break 'buckets;
+                            }
+                            break;
+                        }
+                        if queue.is_empty() {
+                            queues.remove(&extract_id);
+                        }
+                    }
                 }
             }
         }
@@ -2286,6 +2566,7 @@ impl PlannedLinkWork {
             pack_finding_ids: pack_ids,
             specification_ids: Vec::new(),
             abort_reason: snapshot.abort_reason.clone(),
+            explicit_abandon: snapshot.explicit_abandon,
             final_summary: snapshot.final_summary.clone(),
             steps,
             compact_count,
@@ -2352,6 +2633,7 @@ impl PlannedLinkWork {
                     pack_finding_ids: link.pack.iter().map(|hint| hint.finding_id).collect(),
                     specification_ids: Vec::new(),
                     abort_reason: Some(format!("agent error: {err:#}")),
+                    explicit_abandon: false,
                     final_summary: None,
                     steps,
                     compact_count,
@@ -3192,6 +3474,7 @@ mod planner_db_tests {
             pack_finding_ids: Vec::new(),
             specification_ids: Vec::new(),
             abort_reason: None,
+            explicit_abandon: false,
             final_summary: None,
             steps: 0,
             compact_count: 0,
@@ -3721,6 +4004,7 @@ mod planner_db_tests {
             pack_finding_ids: vec![1, 2],
             specification_ids: Vec::new(),
             abort_reason: None,
+            explicit_abandon: false,
             final_summary: None,
             steps: 3,
             compact_count: 0,
@@ -3750,5 +4034,225 @@ mod planner_db_tests {
             .await
             .expect("pair summaries");
         assert_eq!(summaries.get(&(1, 1)).map(Vec::len), Some(2));
+    }
+
+    #[test]
+    fn fair_schedule_two_level_round_robin_vs_legacy() {
+        let mk_cand = |extract_id: i32,
+                       historical_id: i32,
+                       finding_id: i32,
+                       match_strength: MatchStrength,
+                       link_strength: LinkStrength| LinkCandidate {
+            key: LinkKey {
+                extract_id,
+                historical_id,
+                finding_id,
+            },
+            match_strength,
+            link_strength,
+            pre_committed_spec_ids: Vec::new(),
+        };
+        let to_keys = |selected: VecDeque<LinkCandidate>| -> Vec<(i32, i32, i32)> {
+            selected
+                .into_iter()
+                .map(|c| (c.key.extract_id, c.key.historical_id, c.key.finding_id))
+                .collect()
+        };
+        let candidates = vec![
+            mk_cand(1, 10, 1, MatchStrength::High, LinkStrength::High),
+            mk_cand(1, 10, 2, MatchStrength::High, LinkStrength::High),
+            mk_cand(1, 20, 3, MatchStrength::High, LinkStrength::High),
+            mk_cand(2, 10, 1, MatchStrength::High, LinkStrength::High),
+        ];
+
+        let fair_opts = SpecGenOptions {
+            schedule: SpecSchedule::Fair,
+            ..Default::default()
+        };
+        assert_eq!(
+            to_keys(select_pending(candidates.clone(), &fair_opts, 4)),
+            vec![(1, 10, 1), (2, 10, 1), (1, 20, 3), (1, 10, 2)],
+            "Fair schedule must visit (e1, h10), (e2, h10), (e1, h20) before (e1, h10, f2)"
+        );
+
+        let legacy_opts = SpecGenOptions {
+            schedule: SpecSchedule::Legacy,
+            ..Default::default()
+        };
+        assert_eq!(
+            to_keys(select_pending(candidates, &legacy_opts, 4)),
+            vec![(1, 10, 1), (2, 10, 1), (1, 10, 2), (1, 20, 3)],
+            "Legacy schedule preserves flat (historical_id, finding_id) order"
+        );
+    }
+
+    #[tokio::test]
+    async fn fair_plan_orders_intra_pair_by_severity_and_mmr() -> Result<()> {
+        let temp = temp_repo().await;
+        let repo = &temp.repo;
+        let make_finding = |id: i32, sev: FindingSeverity, title: &str, rc: &str| {
+            HistoricalLinkedFinding {
+                finding: knowdit_kg_model::db::audit_finding::Model {
+                    id,
+                    title: title.to_string(),
+                    severity: sev,
+                    root_cause: rc.to_string(),
+                    description: String::new(),
+                    patterns: String::new(),
+                    exploits: String::new(),
+                },
+                strength: LinkStrength::High,
+                evidence: "ev".to_string(),
+                raw_children: Vec::new(),
+                rendered_description: String::new(),
+                rendered_patterns: String::new(),
+                rendered_exploits: String::new(),
+            }
+        };
+        let hist = HistoricalSemanticRecord {
+            semantic: knowdit_kg_model::db::semantic_node::Model {
+                id: 100,
+                name: "Share Accounting".to_string(),
+                definition: "def".to_string(),
+                description: "desc".to_string(),
+                category: DeFiCategory::Lending,
+            },
+            findings: vec![
+                make_finding(
+                    1,
+                    FindingSeverity::Low,
+                    "Low dust rounding",
+                    "wei dust loss on share redemption",
+                ),
+                make_finding(
+                    2,
+                    FindingSeverity::High,
+                    "First depositor inflation",
+                    "flash loan donation inflates share price denominator",
+                ),
+                make_finding(
+                    3,
+                    FindingSeverity::High,
+                    "First depositor clone",
+                    "flash loan donation inflates share price denominator",
+                ),
+                make_finding(
+                    4,
+                    FindingSeverity::Medium,
+                    "Oracle stale price",
+                    "chainlink heartbeat staleness bypasses health check",
+                ),
+            ],
+            raw_children: Vec::new(),
+            rendered_description: String::new(),
+        };
+        seed(
+            repo,
+            &[extract("e1")],
+            vec![hist],
+            vec![(1, 100, MatchStrength::High)],
+        )
+        .await;
+
+        let mut plan = PreparedLinkPlan::prepare(repo, &SpecGenOptions::default())
+            .await?
+            .ok_or_else(|| color_eyre::eyre::eyre!("expected plan"))?;
+        let batch_sz = NonZeroUsize::new(10)
+            .ok_or_else(|| color_eyre::eyre::eyre!("nonzero"))?;
+        let batch = plan.take_batch(batch_sz);
+        let ordered_fids: Vec<i32> = batch.iter().map(|l| l.finding_id).collect();
+        // f2 (High, lowest id) anchors; f4 (distinct oracle mechanism) beats f3 (paraphrase of f2).
+        assert_eq!(ordered_fids.first(), Some(&2));
+        assert_eq!(ordered_fids.get(1), Some(&4));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explicit_abandon_advances_pair_waves_while_transient_failure_writes_nothing()
+    -> Result<()> {
+        let temp = temp_repo().await;
+        let repo = &temp.repo;
+        seed(
+            repo,
+            &[extract("e1")],
+            vec![historical(
+                1,
+                &[
+                    (1, LinkStrength::High),
+                    (2, LinkStrength::High),
+                    (3, LinkStrength::High),
+                    (4, LinkStrength::High),
+                ],
+            )],
+            vec![(1, 1, MatchStrength::High)],
+        )
+        .await;
+
+        let pair_opts = SpecGenOptions {
+            granularity: SpecGranularity::Pair,
+            pack_size: 2,
+            ..Default::default()
+        };
+
+        // Wave 1: transient failure (`explicit_abandon = false`) must write zero rows!
+        let mut transient_fail = LinkSpecOutcome {
+            ordinal: 1,
+            extract_id: 1,
+            historical_id: 1,
+            finding_id: 1,
+            status: LinkSpecStatus::Abandoned,
+            specifications: Vec::new(),
+            spec_finding_ids: Vec::new(),
+            pack_finding_ids: vec![1, 2],
+            specification_ids: Vec::new(),
+            abort_reason: Some("agent error: network timeout".to_string()),
+            explicit_abandon: false,
+            final_summary: None,
+            steps: 2,
+            compact_count: 0,
+        };
+        transient_fail.commit(repo).await;
+
+        let mut plan_after_transient = PreparedLinkPlan::prepare(repo, &pair_opts)
+            .await?
+            .ok_or_else(|| color_eyre::eyre::eyre!("expected pair plan"))?;
+        let one = NonZeroUsize::new(1)
+            .ok_or_else(|| color_eyre::eyre::eyre!("nonzero"))?;
+        let first_wave = plan_after_transient.take_batch(one);
+        let first_pack: Vec<i32> = first_wave[0].pack.iter().map(|h| h.finding_id).collect();
+        assert_eq!(
+            first_pack,
+            vec![1, 2],
+            "transient error wrote no abandoned_link rows, so [1, 2] retry"
+        );
+
+        // Wave 1 explicit abandon (`FinalizeTool` status=abandoned): records [1, 2].
+        let mut explicit_ab = transient_fail;
+        explicit_ab.explicit_abandon = true;
+        explicit_ab.abort_reason = Some("no AMM pool in protocol".to_string());
+        explicit_ab.commit(repo).await;
+
+        // Wave 2 automatically advances to unpacked members [3, 4]!
+        let mut plan_wave_2 = PreparedLinkPlan::prepare(repo, &pair_opts)
+            .await?
+            .ok_or_else(|| color_eyre::eyre::eyre!("expected wave 2 pair plan"))?;
+        let second_wave = plan_wave_2.take_batch(one);
+        let second_pack: Vec<i32> = second_wave[0].pack.iter().map(|h| h.finding_id).collect();
+        assert_eq!(second_pack, vec![3, 4]);
+
+        // Wave 2 explicit abandon records [3, 4] -> Wave 3 drops the pair completely...
+        let mut wave2_ab = explicit_ab;
+        wave2_ab.finding_id = 3;
+        wave2_ab.pack_finding_ids = vec![3, 4];
+        wave2_ab.commit(repo).await;
+        assert!(PreparedLinkPlan::prepare(repo, &pair_opts).await?.is_none());
+
+        // ...unless `retry_abandoned = true` is passed!
+        let retry_opts = SpecGenOptions {
+            retry_abandoned: true,
+            ..pair_opts
+        };
+        assert!(PreparedLinkPlan::prepare(repo, &retry_opts).await?.is_some());
+        Ok(())
     }
 }

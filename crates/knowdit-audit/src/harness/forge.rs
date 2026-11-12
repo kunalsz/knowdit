@@ -18,7 +18,9 @@
 //! SIGKILL'ing the docker CLI client doesn't reliably propagate to the
 //! daemon-managed container.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -52,32 +54,200 @@ fn tail_utf8(s: &str, max_bytes: usize) -> &str {
 
 use color_eyre::eyre::{Result, WrapErr, eyre};
 use tokio::process::Command;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OnceCell};
 
 #[cfg(target_os = "linux")]
 use super::cgroup::ScopedCgroup;
 
-/// Process-global serialization of `forge` subprocesses.
-///
-/// Every link's `RunForgeTool` points at the *same* project directory, so
-/// all of them share `out/` and `cache/solidity-files-cache.json`. Foundry
-/// writes that cache non-atomically and without a file lock, so two
-/// concurrent `forge` processes on one project can observe a half-written
-/// cache (a spurious parse/compile error) or clobber each other's entries
-/// (wasted recompiles). Holding this lock for the whole spawn→wait keeps
-/// forge's on-disk build state consistent regardless of how many link
-/// pipelines are in flight.
-///
-/// Only the forge subprocess serializes — the LLM-driven phases
-/// (gen-spec, reflect, regen) still run concurrently, which is where the
-/// wall-clock is actually spent. Forge itself already parallelizes across
-/// cores internally, so running several at once oversubscribes the box.
-static FORGE_LOCK: Mutex<()> = Mutex::const_new(());
-
-/// Extra time a caller will wait for [`FORGE_LOCK`] beyond its own forge
-/// timeout. A well-behaved holder releases within its timeout, so this only
-/// trips when the holder is genuinely wedged.
+/// Extra time a caller will wait for a slot in [`ForgeSlotPool`] beyond its own
+/// forge timeout. A well-behaved holder releases within its timeout, so this
+/// only trips when all slot holders are genuinely wedged.
 const FORGE_LOCK_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Subdirectory under `<work_dir>` holding `template/{out,cache}` and
+/// `slot_{i}/{out,cache}` so sharded build directories work identically on the
+/// host and inside Docker's `-v <work_dir>:<work_dir>` mount.
+const FORGE_SLOTS_DIR: &str = ".knowdit-forge-slots";
+
+/// Relative `--out` and `--cache-path` paths for one initialized build slot.
+#[derive(Debug, Clone)]
+pub struct SlotPaths {
+    pub rel_out: String,
+    pub rel_cache: String,
+}
+
+/// RAII lease on one build slot (`0..K`) from [`ForgeSlotPool`]. Always returns
+/// its slot index to the bounded channel on [`Drop`] — whether the caller
+/// finishes normally, times out, aborts, or unwinds from a panic.
+#[derive(Debug)]
+pub struct ForgeSlotGuard {
+    slot_idx: usize,
+    tx: async_channel::Sender<usize>,
+}
+
+impl ForgeSlotGuard {
+    pub fn slot_idx(&self) -> usize {
+        self.slot_idx
+    }
+}
+
+impl Drop for ForgeSlotGuard {
+    fn drop(&mut self) {
+        let _ = self.tx.try_send(self.slot_idx);
+    }
+}
+
+/// Bounded pool of `K` isolated Foundry build/cache slots (`slot_0..slot_{K-1}`)
+/// seeded lazily from `preflight`'s `template/{out,cache}` directory.
+#[derive(Debug)]
+pub struct ForgeSlotPool {
+    capacity: usize,
+    tx: async_channel::Sender<usize>,
+    rx: async_channel::Receiver<usize>,
+    initialized: Mutex<BTreeMap<(PathBuf, usize), Arc<OnceCell<SlotPaths>>>>,
+}
+
+impl ForgeSlotPool {
+    pub fn new(concurrency: usize) -> Self {
+        let capacity = concurrency.max(1);
+        let (tx, rx) = async_channel::bounded(capacity);
+        for slot_idx in 0..capacity {
+            let _ = tx.try_send(slot_idx);
+        }
+        Self {
+            capacity,
+            tx,
+            rx,
+            initialized: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Acquire one slot lease, failing after `wait_timeout` if every slot in
+    /// the pool remains wedged.
+    pub async fn acquire(&self, wait_timeout: Duration) -> Result<ForgeSlotGuard> {
+        match tokio::time::timeout(wait_timeout, self.rx.recv()).await {
+            Ok(Ok(slot_idx)) => Ok(ForgeSlotGuard {
+                slot_idx,
+                tx: self.tx.clone(),
+            }),
+            Ok(Err(_)) => Err(eyre!("forge slot pool channel closed unexpectedly")),
+            Err(_) => Err(eyre!(
+                "timed out after {}s waiting for the shared forge slot pool (capacity={}); \
+                 all forge slot holders are wedged (killed child / hung holder). Failing this \
+                 invocation so remaining links can proceed.",
+                wait_timeout.as_secs(),
+                self.capacity,
+            )),
+        }
+    }
+
+    /// Drop cached slot-init markers for `work_dir` when a fresh `preflight`
+    /// rebuilds `template/{out,cache}`.
+    pub async fn reset_work_dir(&self, work_dir: &Path) {
+        let mut guard = self.initialized.lock().await;
+        guard.retain(|(dir, _), _| dir != work_dir);
+    }
+
+    /// Lazily clone `<work_dir>/.knowdit-forge-slots/template` into
+    /// `<work_dir>/.knowdit-forge-slots/slot_{slot_idx}` on first use, returning
+    /// the relative `--out` and `--cache-path` strings for `forge` CLI argv.
+    pub async fn ensure_slot_paths(&self, work_dir: &Path, slot_idx: usize) -> Result<SlotPaths> {
+        let cell = {
+            let mut guard = self.initialized.lock().await;
+            guard
+                .entry((work_dir.to_path_buf(), slot_idx))
+                .or_insert_with(|| Arc::new(OnceCell::new()))
+                .clone()
+        };
+        let work_dir_owned = work_dir.to_path_buf();
+        let paths = cell
+            .get_or_try_init(|| async move {
+                Self::init_slot_on_disk(&work_dir_owned, slot_idx).await
+            })
+            .await?;
+        Ok(paths.clone())
+    }
+
+    async fn init_slot_on_disk(work_dir: &Path, slot_idx: usize) -> Result<SlotPaths> {
+        let slots_root = work_dir.join(FORGE_SLOTS_DIR);
+        tokio::fs::create_dir_all(&slots_root)
+            .await
+            .wrap_err_with(|| format!("failed to create {}", slots_root.display()))?;
+
+        let template_dir = slots_root.join("template");
+        let slot_dir = slots_root.join(format!("slot_{slot_idx}"));
+        if slot_dir.exists() {
+            let _ = tokio::fs::remove_dir_all(&slot_dir).await;
+        }
+
+        if template_dir.is_dir() {
+            let cloned_via_cp = Command::new("cp")
+                .arg("--reflink=auto")
+                .arg("-a")
+                .arg(&template_dir)
+                .arg(&slot_dir)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .await
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !cloned_via_cp {
+                Self::copy_dir_recursive(&template_dir, &slot_dir).await?;
+            }
+        }
+
+        let slot_out = slot_dir.join("out");
+        let slot_cache = slot_dir.join("cache");
+        tokio::fs::create_dir_all(&slot_out)
+            .await
+            .wrap_err_with(|| format!("failed to create {}", slot_out.display()))?;
+        tokio::fs::create_dir_all(&slot_cache)
+            .await
+            .wrap_err_with(|| format!("failed to create {}", slot_cache.display()))?;
+
+        Ok(SlotPaths {
+            rel_out: format!("{FORGE_SLOTS_DIR}/slot_{slot_idx}/out"),
+            rel_cache: format!("{FORGE_SLOTS_DIR}/slot_{slot_idx}/cache"),
+        })
+    }
+
+    async fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
+        let mut stack: Vec<(PathBuf, PathBuf)> = vec![(src.to_path_buf(), dst.to_path_buf())];
+        while let Some((cur_src, cur_dst)) = stack.pop() {
+            tokio::fs::create_dir_all(&cur_dst)
+                .await
+                .wrap_err_with(|| format!("failed to create {}", cur_dst.display()))?;
+            let mut entries = tokio::fs::read_dir(&cur_src)
+                .await
+                .wrap_err_with(|| format!("failed to read {}", cur_src.display()))?;
+            while let Some(entry) = entries.next_entry().await? {
+                let file_type = entry.file_type().await?;
+                let next_src = entry.path();
+                let next_dst = cur_dst.join(entry.file_name());
+                if file_type.is_dir() {
+                    stack.push((next_src, next_dst));
+                } else if file_type.is_file() {
+                    tokio::fs::copy(&next_src, &next_dst)
+                        .await
+                        .wrap_err_with(|| {
+                            format!(
+                                "failed to copy {} -> {}",
+                                next_src.display(),
+                                next_dst.display()
+                            )
+                        })?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
 
 /// One forge invocation backend = how to spawn `forge <args>`. The
 /// outer [`ForgeBackend`] owns this plus a probed [`ForgeFeatures`]
@@ -117,46 +287,48 @@ pub struct ForgeFeatures {
 }
 
 /// Forge invocation runtime. Combines the chosen spawn strategy
-/// (`kind`) with the capability set we probed at construction time
-/// (`features`). Constructed once per fuzz pass; cloned into each
-/// per-spec [`ForgeRunner`].
+/// (`kind`), the capability set we probed at construction time
+/// (`features`), and the sharded [`ForgeSlotPool`] isolating concurrent
+/// `out/` and `cache/` directories. Constructed once per fuzz pass;
+/// cloned into each per-spec [`ForgeRunner`].
 #[derive(Debug, Clone)]
 pub struct ForgeBackend {
     pub kind: ForgeBackendKind,
     pub features: ForgeFeatures,
+    pub slot_pool: Arc<ForgeSlotPool>,
 }
 
 impl ForgeBackend {
-    /// Resolve a usable `forge` runtime and probe its feature flags.
-    /// Used as the single source of truth for both preflight checks
-    /// (callers discard the result) and for the fuzz pass itself
-    /// (callers pass the value into [`ForgeRunner::new`]).
-    ///
-    /// Resolution order for the runtime:
-    ///
-    /// 1. **`forge_bin = Some(path)`** → local mode against that
-    ///    explicit binary. Cgroup wrapping kicks in when
-    ///    `mem_cap_bytes` is set AND a writable cgroup v2 ancestor
-    ///    with `memory` delegation exists; otherwise direct exec
-    ///    with a `tracing::warn!`.
-    /// 2. **`forge_bin = None`, Linux, docker runtime present**
-    ///    → docker mode against `docker_image`. If the image is not
-    ///    pulled yet, `docker run` will pull it on first invocation;
-    ///    no preflight pull happens here.
-    /// 3. **Fallback** → look up `forge` on `$PATH`. Picks the first
-    ///    executable named `forge` in `$PATH` and treats it as a
-    ///    user-supplied `--forge-bin`. Used on Linux when docker is
-    ///    not installed, and on non-Linux OSes (which never had
-    ///    docker support to begin with).
-    /// 4. **None of the above** → hard error.
+    /// Resolve a usable `forge` runtime with a 1-slot pool (use
+    /// [`Self::with_concurrency`] to size a multi-slot pool).
     pub fn new(
         forge_bin: Option<PathBuf>,
         docker_image: String,
         mem_cap_bytes: Option<u64>,
     ) -> Result<Self> {
+        Self::with_concurrency(forge_bin, docker_image, mem_cap_bytes, 1)
+    }
+
+    /// Resolve a usable `forge` runtime, probe its feature flags, and allocate
+    /// a [`ForgeSlotPool`] with `forge_concurrency.max(1)` isolated build slots.
+    pub fn with_concurrency(
+        forge_bin: Option<PathBuf>,
+        docker_image: String,
+        mem_cap_bytes: Option<u64>,
+        forge_concurrency: usize,
+    ) -> Result<Self> {
         let kind = resolve_kind(forge_bin, docker_image, mem_cap_bytes)?;
         let features = probe_features(&kind);
-        Ok(Self { kind, features })
+        let slot_pool = Arc::new(ForgeSlotPool::new(forge_concurrency.max(1)));
+        tracing::info!(
+            "ForgeBackend: initialized ForgeSlotPool with {} slot(s)",
+            slot_pool.capacity()
+        );
+        Ok(Self {
+            kind,
+            features,
+            slot_pool,
+        })
     }
 }
 
@@ -462,41 +634,40 @@ impl ForgeRunner {
         (uid, gid)
     }
 
-    /// Spawn `forge args...` and return [`ForgeOutput`]. Hard-bounded by
+    /// Spawn `forge args...` inside an isolated build slot from
+    /// [`ForgeSlotPool`] and return [`ForgeOutput`]. Hard-bounded by
     /// `self.timeout` — if exceeded the handle is dropped and the
-    /// per-backend cleanup fires (kill child / docker kill / cgroup.kill).
-    ///
-    /// The whole spawn→wait is serialized against every other `ForgeRunner`
-    /// in this process via [`FORGE_LOCK`], because all links share one
-    /// project's `out/` + build cache (see the lock's docs).
+    /// per-backend cleanup fires (kill child / docker kill / cgroup.kill)
+    /// while [`ForgeSlotGuard`] returns the slot index on drop.
     pub async fn run(&self, args: &[String]) -> Result<ForgeOutput> {
-        // Waiting for the lock is itself bounded. Without this, a holder that
-        // never releases (a forge child OOM-killed mid-run leaves its waiter
-        // parked on a pipe that will never close, or a task that panicked
-        // while holding the guard) wedges every other link forever: the
-        // process sits at zero CPU with nothing to report, which is exactly
-        // the "run looks alive but is doing nothing" failure. Failing this
-        // invocation lets the pipeline mark the spec and move on.
-        let grace = self
-            .lock_grace
-            .unwrap_or(FORGE_LOCK_GRACE);
+        let grace = self.lock_grace.unwrap_or(FORGE_LOCK_GRACE);
         let lock_timeout = self.timeout.saturating_add(grace);
-        let _forge_guard = match tokio::time::timeout(lock_timeout, FORGE_LOCK.lock()).await {
-            Ok(guard) => guard,
-            Err(_) => {
-                return Err(eyre!(
-                    "timed out after {}s waiting for the shared forge lock; another forge \
-                     invocation is wedged (killed child / panicked holder). Failing this \
-                     invocation so the remaining links can proceed.",
-                    lock_timeout.as_secs()
-                ));
-            }
-        };
+        let slot_guard = self.backend.slot_pool.acquire(lock_timeout).await?;
+
+        let mut effective_args: Vec<String> = args.to_vec();
+        let uses_build_artifacts = matches!(
+            args.first().map(String::as_str),
+            Some("test" | "coverage" | "build" | "inspect" | "script")
+        );
+        let has_explicit_out = args.iter().any(|a| a == "--out" || a == "--cache-path");
+        if uses_build_artifacts && !has_explicit_out {
+            let slot_paths = self
+                .backend
+                .slot_pool
+                .ensure_slot_paths(&self.work_dir, slot_guard.slot_idx())
+                .await?;
+            effective_args.push("--out".to_string());
+            effective_args.push(slot_paths.rel_out);
+            effective_args.push("--cache-path".to_string());
+            effective_args.push(slot_paths.rel_cache);
+        }
+
         let start = Instant::now();
-        let handle = self.spawn(args)?;
+        let handle = self.spawn(&effective_args)?;
         let timeout = self.timeout;
         let outcome = tokio::time::timeout(timeout, handle.wait_with_output()).await;
         let duration_ms = start.elapsed().as_millis() as i64;
+        drop(slot_guard);
         match outcome {
             Ok(Ok(out)) => Ok(ForgeOutput {
                 exit_code: out.status.code().unwrap_or(-2),
@@ -582,6 +753,31 @@ contract KnowditPreflight is Test {
             .await
             .wrap_err_with(|| format!("preflight: failed to write {}", test_path.display()))?;
 
+        // Seed `<work_dir>/.knowdit-forge-slots/template/{out,cache}` during
+        // preflight so every lazily-initialized worker slot (`slot_0..slot_K`)
+        // starts with a warm solc artifact + cache snapshot instead of paying
+        // cold compilation per slot.
+        let slots_root = self.work_dir.join(FORGE_SLOTS_DIR);
+        let template_out = slots_root.join("template").join("out");
+        let template_cache = slots_root.join("template").join("cache");
+        tokio::fs::create_dir_all(&template_out)
+            .await
+            .wrap_err_with(|| {
+                format!(
+                    "preflight: failed to create template out dir {}",
+                    template_out.display()
+                )
+            })?;
+        tokio::fs::create_dir_all(&template_cache)
+            .await
+            .wrap_err_with(|| {
+                format!(
+                    "preflight: failed to create template cache dir {}",
+                    template_cache.display()
+                )
+            })?;
+        self.backend.slot_pool.reset_work_dir(&self.work_dir).await;
+
         // Reuse the same FOUNDRY_TEST + --match-path scoping the per-spec
         // runner uses, so this smoke test doesn't drag any existing
         // harness file into its compile graph.
@@ -600,6 +796,10 @@ contract KnowditPreflight is Test {
             format!("{}/*", pre_rel.to_string_lossy().trim_end_matches('/')),
             "--fuzz-runs".to_string(),
             "1".to_string(),
+            "--out".to_string(),
+            format!("{FORGE_SLOTS_DIR}/template/out"),
+            "--cache-path".to_string(),
+            format!("{FORGE_SLOTS_DIR}/template/cache"),
         ];
 
         let out_result = scoped.run(&argv).await;
@@ -880,15 +1080,20 @@ pub struct ForgeOutput {
 #[cfg(test)]
 mod lock_timeout_tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
     use std::time::{Duration, Instant};
 
-    fn local_runner(work_dir: std::path::PathBuf, timeout: Duration) -> ForgeRunner {
+    fn local_runner(
+        work_dir: std::path::PathBuf,
+        binary: std::path::PathBuf,
+        concurrency: usize,
+        timeout: Duration,
+    ) -> ForgeRunner {
         let mut runner = ForgeRunner::new(
             ForgeBackend {
-                kind: ForgeBackendKind::LocalDirect {
-                    binary: std::path::PathBuf::from("/bin/true"),
-                },
+                kind: ForgeBackendKind::LocalDirect { binary },
                 features: ForgeFeatures::default(),
+                slot_pool: Arc::new(ForgeSlotPool::new(concurrency)),
             },
             work_dir,
             timeout,
@@ -897,34 +1102,139 @@ mod lock_timeout_tests {
         runner
     }
 
-    /// A wedged holder must not park every other link forever. Before this was
-    /// bounded, a forge child killed mid-run (OOM, for instance) left its
-    /// waiter asleep on a pipe that never closed, and the whole streamloop sat
-    /// at zero CPU indefinitely.
     #[tokio::test]
-    async fn waiting_for_a_wedged_lock_times_out() {
-        let dir = std::env::temp_dir();
-        let runner = local_runner(dir, Duration::from_millis(50));
+    async fn waiting_for_a_wedged_lock_times_out() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let runner = local_runner(
+            dir.path().to_path_buf(),
+            std::path::PathBuf::from("/bin/true"),
+            1,
+            Duration::from_millis(50),
+        );
 
-        // Simulate a wedged holder by taking the lock ourselves.
-        let _held = FORGE_LOCK.lock().await;
+        // Hold the sole slot so `runner.run` sees a wedged pool.
+        let _held = runner
+            .backend
+            .slot_pool
+            .acquire(Duration::from_secs(1))
+            .await?;
 
         let started = Instant::now();
         let err = runner
             .run(&["--version".to_string()])
             .await
-            .expect_err("must not hang, and must not succeed without the lock");
+            .expect_err("must not hang, and must not succeed without a slot");
         let waited = started.elapsed();
 
         assert!(
-            err.to_string().contains("waiting for the shared forge lock"),
+            err.to_string().contains("waiting for the shared forge slot pool"),
             "unexpected error: {err}"
         );
-        // timeout (50ms) + grace (60s) is the ceiling; it must return well
-        // before any unbounded wait would.
         assert!(
-            waited < Duration::from_secs(65),
-            "lock wait was not bounded: {waited:?}"
+            waited < Duration::from_secs(5),
+            "slot pool wait was not bounded: {waited:?}"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn slot_pool_returns_slots_on_task_abort_and_panic() -> Result<()> {
+        let pool = Arc::new(ForgeSlotPool::new(2));
+
+        // 1. Task aborted while holding slot 0.
+        let pool_abort = pool.clone();
+        let aborted = tokio::spawn(async move {
+            let _guard = pool_abort.acquire(Duration::from_secs(1)).await;
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        aborted.abort();
+        let _ = aborted.await;
+
+        // 2. Task panicking while holding a slot.
+        let pool_panic = pool.clone();
+        let panicked = tokio::spawn(async move {
+            let _guard = pool_panic.acquire(Duration::from_secs(1)).await;
+            panic!("simulated worker panic");
+        });
+        let _ = panicked.await;
+
+        // Both slots must be back in the pool and immediately acquirable!
+        let g1 = pool.acquire(Duration::from_millis(100)).await?;
+        let g2 = pool.acquire(Duration::from_millis(100)).await?;
+        assert_ne!(g1.slot_idx(), g2.slot_idx());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn slot_pool_clones_template_and_issues_distinct_cli_dirs_concurrently() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let work_dir = dir.path().to_path_buf();
+
+        // Seed `.knowdit-forge-slots/template/{out,cache}` to verify lazy slot cloning.
+        let tpl_out = work_dir.join(FORGE_SLOTS_DIR).join("template").join("out");
+        let tpl_cache = work_dir.join(FORGE_SLOTS_DIR).join("template").join("cache");
+        tokio::fs::create_dir_all(&tpl_out).await?;
+        tokio::fs::create_dir_all(&tpl_cache).await?;
+        tokio::fs::write(tpl_out.join("Seeded.json"), b"{\"abi\":[]}").await?;
+        tokio::fs::write(tpl_cache.join("solidity-files-cache.json"), b"{}").await?;
+
+        // Fake `forge` script that sleeps briefly (so 2 invocations overlap) and echoes argv.
+        let fake_forge = work_dir.join("fake_forge.sh");
+        tokio::fs::write(
+            &fake_forge,
+            "#!/usr/bin/env bash\nsleep 0.05\nprintf '%s\\n' \"$@\"\n",
+        )
+        .await?;
+        let mut perms = tokio::fs::metadata(&fake_forge).await?.permissions();
+        perms.set_mode(0o755);
+        tokio::fs::set_permissions(&fake_forge, perms).await?;
+
+        let runner = local_runner(work_dir.clone(), fake_forge, 2, Duration::from_secs(5));
+        let r1 = runner.clone();
+        let r2 = runner.clone();
+        let argv_a = vec![
+            "test".to_string(),
+            "--match-contract".to_string(),
+            "A".to_string(),
+        ];
+        let argv_b = vec![
+            "test".to_string(),
+            "--match-contract".to_string(),
+            "B".to_string(),
+        ];
+        let (o1, o2) = tokio::try_join!(r1.run(&argv_a), r2.run(&argv_b))?;
+        assert_eq!(o1.exit_code, 0);
+        assert_eq!(o2.exit_code, 0);
+
+        let combined = format!("{}\n{}", o1.stdout, o2.stdout);
+        assert!(
+            combined.contains(".knowdit-forge-slots/slot_0/out")
+                && combined.contains(".knowdit-forge-slots/slot_0/cache"),
+            "slot_0 flags missing:\n{combined}"
+        );
+        assert!(
+            combined.contains(".knowdit-forge-slots/slot_1/out")
+                && combined.contains(".knowdit-forge-slots/slot_1/cache"),
+            "slot_1 flags missing:\n{combined}"
+        );
+        // Both slots must carry the cloned template artifacts at slot_{i}/out/Seeded.json!
+        assert!(
+            work_dir
+                .join(FORGE_SLOTS_DIR)
+                .join("slot_0")
+                .join("out")
+                .join("Seeded.json")
+                .is_file()
+        );
+        assert!(
+            work_dir
+                .join(FORGE_SLOTS_DIR)
+                .join("slot_1")
+                .join("out")
+                .join("Seeded.json")
+                .is_file()
+        );
+        Ok(())
     }
 }

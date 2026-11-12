@@ -140,13 +140,33 @@ impl RunForgeTool {
             _ => None,
         };
 
-        // Coverage worth chasing? Both modes benefit: handler-invariant
-        // needs it for Gate 2; PoC mode runs it as evidence that the
-        // deterministic test actually exercised project lines (helps
-        // the reflect grader judge ValidFinding vs hallucination).
-        let run_coverage = test_out.exit_code == 0
-            && (test_summary.total_calls > 0 || test_summary.deterministic_test_failure)
-            && !test_out.timed_out;
+        // Gate-1-conditional lazy coverage (U4):
+        // 1. Never spawn `forge coverage` when Gate 1 failed (`test_gate_verdict.is_some()`)
+        //    or `forge test` timed out.
+        // 2. Skip duplicate `forge coverage` runs when the `.sol` source SHA-256
+        //    is unchanged since the last completed coverage run, reusing the
+        //    cached Gate 2 verdict.
+        // 3. When `test_summary.violated == true` and the current `.sol` hash
+        //    has no recorded coverage yet, run the fast 256-run `forge coverage`
+        //    once so `VerdictGrader` retains LCOV line-coverage context.
+        let (source_hash, cached_hit) = {
+            let guard = self.attempt.0.lock().await;
+            let hash = guard.source_sha256();
+            let hit = match (hash, guard.last_covered_source_sha256, &guard.cached_gate2_verdict) {
+                (Some(h), Some(prev), Some(cached_verdict)) if h == prev => {
+                    Some((cached_verdict.clone(), guard.last_coverage_row_count))
+                }
+                _ => None,
+            };
+            (hash, hit)
+        };
+
+        let eligible_for_coverage = test_gate_verdict.is_none()
+            && !test_out.timed_out
+            && (test_summary.violated
+                || (test_out.exit_code == 0 && test_summary.total_calls > 0));
+        let run_coverage = eligible_for_coverage && cached_hit.is_none();
+
         let mut cov_summary: Option<CoverageBlockBundle> = None;
         if run_coverage {
             let cov_argv = self.build_coverage_argv(&args);
@@ -227,6 +247,17 @@ impl RunForgeTool {
                 coverage_idx,
             });
             state.last_gate_passed = block.gate_verdict.is_none() && !block.coverage.is_empty();
+            if !block.timed_out
+                && let Some(hash) = source_hash
+            {
+                state.last_covered_source_sha256 = Some(hash);
+                state.cached_gate2_verdict = Some(block.gate_verdict.clone());
+                state.last_coverage_row_count = block.coverage.len();
+            }
+        } else if eligible_for_coverage
+            && let Some((ref cached_verdict, cached_rows)) = cached_hit
+        {
+            state.last_gate_passed = cached_verdict.is_none() && cached_rows > 0;
         } else {
             state.last_gate_passed = false;
         }
@@ -293,6 +324,15 @@ impl RunForgeTool {
                 "--- forge coverage stdout (last 4K) ---\n{}",
                 tail_str(&block.record.stdout, 4_000)
             ));
+        } else if eligible_for_coverage
+            && let Some((cached_verdict, cached_rows)) = &cached_hit
+        {
+            if let Some(v) = cached_verdict {
+                sections.push(v.clone());
+            }
+            sections.push(format!(
+                "note: forge coverage skipped (harness .sol SHA-256 unchanged; reusing cached Gate 2 verdict over {cached_rows} lcov rows)."
+            ));
         } else if run_coverage {
             sections.push(
                 "note: orchestrator attempted to run forge coverage but the spawn failed; \
@@ -301,7 +341,7 @@ impl RunForgeTool {
             );
         } else {
             sections.push(
-                "note: forge coverage was skipped this turn (no clean exit or no project \
+                "note: forge coverage was skipped this turn (Gate 1 failed, no clean exit, or no project \
                  execution). Fix the test run first."
                     .to_string(),
             );
@@ -471,5 +511,184 @@ impl ListTestFilesTool {
             ));
         }
         Ok(format!("ok: {} file(s)\n{out}", found.len()))
+    }
+}
+
+#[cfg(test)]
+mod lazy_coverage_tests {
+    use super::*;
+    use crate::harness::forge::{ForgeBackend, ForgeBackendKind, ForgeFeatures, ForgeSlotPool};
+    use knowdit_repo_model::cg::{CallGraph, Contract, FileChunk, FileLocation, Function};
+    use std::collections::BTreeMap;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::Duration;
+
+    fn sample_callgraph_and_spec() -> (Arc<CallGraph>, Arc<AuditSpecification>) {
+        let loc = FileLocation {
+            start_line: 1,
+            start_column: 0,
+            end_line: 10,
+            end_column: 0,
+        };
+        let mut contracts = BTreeMap::new();
+        contracts.insert(
+            1,
+            Contract {
+                id: 1,
+                name: "Vault".to_string(),
+                relative_file_path: PathBuf::from("src/Vault.sol"),
+                chunk: FileChunk {
+                    loc,
+                    content: String::new(),
+                },
+                functions: vec![Function {
+                    id: 1,
+                    name: "withdraw".to_string(),
+                    args: String::new(),
+                    relative_file_path: PathBuf::from("src/Vault.sol"),
+                    loc,
+                    content: Some("function withdraw() external {}".to_string()),
+                    calls: Vec::new(),
+                    description: None,
+                }],
+                description: None,
+            },
+        );
+        let mut spec = AuditSpecification::default();
+        spec.sequence.push(crate::types::SuqenceCallStep {
+            contract: "Vault".to_string(),
+            function: "withdraw".to_string(),
+            intention: "drain".to_string(),
+        });
+        (
+            Arc::new(CallGraph {
+                contracts,
+                interfaces: BTreeMap::new(),
+            }),
+            Arc::new(spec),
+        )
+    }
+
+    #[tokio::test]
+    async fn run_forge_skips_coverage_on_gate1_fail_and_caches_by_source_sha256()
+    -> color_eyre::eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let work_dir = dir.path().to_path_buf();
+        let lcov_path = work_dir.join("lcov.info");
+        let cov_counter = work_dir.join("cov_count.txt");
+        let mode_file = work_dir.join("mode.txt");
+
+        // Fake `forge` script driven by `mode.txt`:
+        // - `gate1_fail`: exit 0, calls=100, reverts=99 (99% revert rate -> Gate 1 fails!)
+        // - `clean_pass`: exit 0, calls=100, reverts=0 (Gate 1 passes!)
+        // - `violated`: exit 1, deterministic `KNOWDIT_POST_ATTACK_REACHED:` violation!
+        let script_path = work_dir.join("fake_forge.sh");
+        let script = format!(
+            r#"#!/usr/bin/env bash
+sub="$1"
+if [ "$sub" = "coverage" ]; then
+  echo "1" >> "{cov}"
+  cat <<'EOF' > "{lcov}"
+SF:src/Vault.sol
+DA:3,5
+end_of_record
+EOF
+  exit 0
+fi
+mode=$(cat "{mode}")
+if [ "$mode" = "gate1_fail" ]; then
+  echo '{{"test/H.t.sol:H":{{"test_results":{{"invariant_x()":{{"status":"Success","reason":null,"kind":{{"Invariant":{{"runs":10,"calls":100,"reverts":99}}}}}}}}}}}}'
+  exit 0
+elif [ "$mode" = "violated" ]; then
+  echo '{{"test/H.t.sol:H":{{"test_results":{{"test_poc()":{{"status":"Failure","reason":"KNOWDIT_POST_ATTACK_REACHED: drained","kind":{{"Standard":0}}}}}}}}}}'
+  exit 1
+else
+  echo '{{"test/H.t.sol:H":{{"test_results":{{"invariant_x()":{{"status":"Success","reason":null,"kind":{{"Invariant":{{"runs":10,"calls":100,"reverts":0}}}}}}}}}}}}'
+  exit 0
+fi
+"#,
+            cov = cov_counter.display(),
+            lcov = lcov_path.display(),
+            mode = mode_file.display(),
+        );
+        tokio::fs::write(&script_path, script).await?;
+        let mut perms = tokio::fs::metadata(&script_path).await?.permissions();
+        perms.set_mode(0o755);
+        tokio::fs::set_permissions(&script_path, perms).await?;
+
+        let runner = ForgeRunner::new(
+            ForgeBackend {
+                kind: ForgeBackendKind::LocalDirect {
+                    binary: script_path,
+                },
+                features: ForgeFeatures::default(),
+                slot_pool: Arc::new(ForgeSlotPool::new(2)),
+            },
+            work_dir.clone(),
+            Duration::from_secs(5),
+        );
+        let attempt = AttemptHandle::new();
+        let _ = attempt
+            .write_agent_file(&work_dir, "H.t.sol", "contract H_v1 {}")
+            .await?;
+
+        let (callgraph, spec) = sample_callgraph_and_spec();
+        let tool = RunForgeTool {
+            attempt: attempt.clone(),
+            runner,
+            test_runs: 100,
+            coverage_runs: 256,
+            match_path_glob: "test/*".to_string(),
+            spec,
+            callgraph,
+            gate2_fidelity_threshold: 0.5,
+            via_ir: false,
+            lcov_path,
+        };
+        let args = RunForgeArgs {
+            match_contract: "H".to_string(),
+            match_test: None,
+            seed: None,
+        };
+
+        // 1. Gate 1 fails -> MUST NOT spawn `forge coverage`!
+        tokio::fs::write(&mode_file, "gate1_fail").await?;
+        let out1 = tool.invoke(args.clone()).await?;
+        assert!(out1.contains("[GATE 1 FAILED"), "{out1}");
+        assert!(
+            !cov_counter.exists(),
+            "forge coverage must not run when Gate 1 fails"
+        );
+
+        // 2. Clean pass -> spawns `forge coverage` once (count == 1).
+        tokio::fs::write(&mode_file, "clean_pass").await?;
+        let out2 = tool.invoke(args.clone()).await?;
+        assert!(out2.contains("ok: forge coverage"), "{out2}");
+        assert_eq!(tokio::fs::read_to_string(&cov_counter).await?.lines().count(), 1);
+        assert!(attempt.snapshot().await.last_gate_passed);
+
+        // 3. Second clean pass with UNCHANGED `.sol` SHA-256 -> skips `forge coverage`!
+        let out3 = tool.invoke(args.clone()).await?;
+        assert!(out3.contains("SHA-256 unchanged"), "{out3}");
+        assert_eq!(
+            tokio::fs::read_to_string(&cov_counter).await?.lines().count(),
+            1,
+            "unchanged .sol must reuse cached Gate 2 verdict without spawning forge coverage"
+        );
+        assert!(attempt.snapshot().await.last_gate_passed);
+
+        // 4. Edit `.sol` to v2 + trigger `violated` -> runs 256-run coverage once for new hash!
+        let _ = attempt
+            .write_agent_file(&work_dir, "H.t.sol", "contract H_v2 {}")
+            .await?;
+        tokio::fs::write(&mode_file, "violated").await?;
+        let out4 = tool.invoke(args).await?;
+        assert!(out4.contains("[SUCCESS — violation observed]"), "{out4}");
+        assert_eq!(
+            tokio::fs::read_to_string(&cov_counter).await?.lines().count(),
+            2,
+            "uncovered violated .sol must run fast coverage once so reflect retains LCOV rows"
+        );
+        Ok(())
     }
 }

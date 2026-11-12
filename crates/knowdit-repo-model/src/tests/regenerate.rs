@@ -209,11 +209,28 @@ async fn clear_specifications_alone_is_not_fk_safe() {
 }
 
 #[tokio::test]
-async fn reset_for_regenerate_clears_entire_downstream_safely() {
+async fn reset_for_regenerate_clears_entire_downstream_safely() -> color_eyre::eyre::Result<()> {
     let temp = temp_db().await;
     seed_full_downstream(&temp.repo).await;
+    temp.repo
+        .record_abandoned_links(
+            &[crate::link::LinkKey {
+                extract_id: 1,
+                historical_id: 100,
+                finding_id: 88,
+            }],
+            "explicitly abandoned",
+        )
+        .await?;
     let before = counts(&temp.repo).await;
     assert_eq!(before, (1, 1, 1, 1, 1));
+    assert_eq!(
+        crate::db::abandoned_link::Entity::find()
+            .all(temp.repo.connection())
+            .await?
+            .len(),
+        1
+    );
 
     temp.repo
         .reset_for_regenerate()
@@ -226,24 +243,30 @@ async fn reset_for_regenerate_clears_entire_downstream_safely() {
         (0, 0, 0, 0, 0),
         "specs + every FK-dependent table cleared"
     );
+    assert!(
+        crate::db::abandoned_link::Entity::find()
+            .all(temp.repo.connection())
+            .await?
+            .is_empty(),
+        "abandoned_link must be cleared during regenerate reset"
+    );
 
     // Upstream inputs are preserved.
     assert_eq!(
         project_semantic_model::Entity::find()
             .all(temp.repo.connection())
-            .await
-            .unwrap()
+            .await?
             .len(),
         1
     );
     assert_eq!(
         historical_semantic_model::Entity::find()
             .all(temp.repo.connection())
-            .await
-            .unwrap()
+            .await?
             .len(),
         1
     );
+    Ok(())
 }
 
 #[tokio::test]

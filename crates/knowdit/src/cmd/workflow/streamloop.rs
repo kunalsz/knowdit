@@ -36,20 +36,21 @@ use std::sync::Arc;
 
 use clap::Args;
 use color_eyre::eyre::{Result, WrapErr, eyre};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use knowdit_audit::harness::HarnessBackend;
 use knowdit_audit::mapper::MapperOutcome;
 use knowdit_audit::spec::{
     BillingExhausted, LinkKey, LinkSource, LinkSpecOutcome, LinkSpecStatus, PlannedLinkWork,
-    SpecGenOptions, SpecGenStream, SpecificationGenerator, billing_exhaustion,
+    ProjectIndex, SpecGenOptions, SpecGenStream, SpecificationGenerator, billing_exhaustion,
 };
-use knowdit_audit::spec::novelty;
+use knowdit_audit::spec::{novelty, viability};
 use knowdit_audit::types::AuditSpecification;
 use knowdit_kg::db::HistoricalDatabase;
 use knowdit_project::{ProjectData, SourceLanguage};
 use knowdit_repo_model::{
-    CodeGenCore, CodeGenRecord, CodeGenStatus, FindingProvenance, LoadedValidFinding, RepoDatabase,
+    CodeGenCore, CodeGenRecord, CodeGenStatus, FindingProvenance, LoadedValidFinding,
+    ProjectProfile, RepoDatabase,
 };
 use llmy::clap::OptOpenAISetup;
 use llmy::client::billing::TokenUsage;
@@ -270,7 +271,12 @@ impl StreamloopArgs {
                         .clone()
                         .unwrap_or_else(|| format!("{}-knowdit-fuzz", spec_name)),
                     max_specs: 0,
-                    concurrency: self.fuzz.fuzz_concurrency.unwrap_or(1).max(1),
+                    concurrency: self
+                        .fuzz
+                        .fuzz_concurrency
+                        .or_else(|| self.stream_link_concurrency.map(|c| c.min(8)))
+                        .unwrap_or(1)
+                        .max(1),
                     regenerate: self.fuzz.fuzz_regenerate,
                     via_ir: self.harness.harness_via_ir,
                 })?;
@@ -526,7 +532,8 @@ impl StreamloopArgs {
             concurrency: self.stream_link_concurrency.unwrap_or(1).max(1),
             report_cfg,
             usage_max_link_rows: self.usage_max_link_rows,
-            novelty_gate: self.gen_specs.gen_specs_novelty_gate,
+            novelty_gate: self.gen_specs.novelty_gate_enabled(),
+            viability_gate: self.gen_specs.gen_specs_viability_gate,
             memory_report_secs: self.memory_report_secs,
         }
         .run()
@@ -552,11 +559,13 @@ impl StreamloopArgs {
         self.regen.regen_concurrency.get_or_insert(d);
         self.stream_link_concurrency.get_or_insert(d);
         self.review.review_concurrency.get_or_insert(d);
+        self.harness.forge_concurrency.get_or_insert(d.min(8));
         tracing::info!(
-            "[streamloop] --default-concurrency={d} fills in map={} gen-specs={} fuzz={} reflect={} regen={} stream-link={} (explicit per-phase flags win)",
+            "[streamloop] --default-concurrency={d} fills in map={} gen-specs={} fuzz={} forge={} reflect={} regen={} stream-link={} (explicit per-phase flags win)",
             self.map.map_concurrency.unwrap_or(1),
             self.gen_specs.gen_specs_concurrency.unwrap_or(1),
             self.fuzz.fuzz_concurrency.unwrap_or(1),
+            self.harness.forge_concurrency.unwrap_or(1),
             self.reflect.reflect_concurrency.unwrap_or(1),
             self.regen.regen_concurrency.unwrap_or(1),
             self.stream_link_concurrency.unwrap_or(1),
@@ -642,11 +651,17 @@ struct LinkContext<B: HarnessBackend + Clone + 'static> {
     /// Reflection threads this into the grader system prompt without
     /// having to round-trip through the backend per call.
     language_prompt_prefix: String,
-    /// Opt-in novelty gate: judge committed specs against the pair's
-    /// already-validated specs before the drain validates them.
+    /// Project-wide novelty gate (default enabled): judge committed specs
+    /// against top-12 overlapping validated specs across the repository.
     novelty_gate: bool,
-    /// Cache-key root for the novelty judge (`{project}-knowdit-spec`).
+    /// Opt-in pre-fuzz viability gate (`--gen-specs-viability-gate`).
+    viability_gate: bool,
+    /// Cache-key root for pre-fuzz novelty/viability judges (`{project}-knowdit-spec`).
     novelty_cache_root: String,
+    /// Shared static project index for extracting sequence signatures in `viability`.
+    project_index: Arc<ProjectIndex>,
+    /// Cached project profile for `out_of_scope_notes` screening in `viability`.
+    project_profile: Option<ProjectProfile>,
 }
 
 impl<B: HarnessBackend + Clone + 'static> LinkContext<B> {
@@ -703,13 +718,26 @@ impl<B: HarnessBackend + Clone + 'static> LinkContext<B> {
         // Snapshot semantics: every spec the agent committed (the gate only
         // changes which of them get validated, not how many were committed).
         let committed_count = outcome.specification_ids.len();
+        let spec_by_id: BTreeMap<i32, AuditSpecification> = outcome
+            .specification_ids
+            .iter()
+            .copied()
+            .zip(outcome.specifications.iter().cloned())
+            .collect();
 
-        // Novelty gate (opt-in): judge the committed specs against the pair's
-        // already-validated specs; semantic duplicates are recorded terminal
-        // (`Duplicate` codegen) and skip codegen / fuzz / reflect. Billing
-        // exhaustion propagates; judge errors fail open inside the gate.
-        if self.novelty_gate && !outcome.specification_ids.is_empty() {
-            self.apply_novelty_gate(&key, &mut outcome, &mut drain, &scopes)
+        // Project-wide novelty gate (default enabled): judge the committed specs
+        // against overlapping canonical validated specs across the repository;
+        // semantic duplicates get a terminal `Duplicate` codegen row and skip
+        // codegen / fuzz / reflect.
+        if self.novelty_gate && !outcome.specification_ids.is_empty() && !spec_by_id.is_empty() {
+            self.apply_novelty_gate(&key, &spec_by_id, &mut outcome, &mut drain, &scopes)
+                .await?;
+        }
+
+        // Opt-in pre-fuzz viability gate: screen surviving novel specs against
+        // `out_of_scope_notes` + sequence signatures in one fail-open JSON call.
+        if self.viability_gate && !outcome.specification_ids.is_empty() && !spec_by_id.is_empty() {
+            self.apply_viability_gate(&key, &spec_by_id, &mut outcome, &mut drain, &scopes)
                 .await?;
         }
 
@@ -779,16 +807,16 @@ impl<B: HarnessBackend + Clone + 'static> LinkContext<B> {
         })
     }
 
-    /// Novelty gate: judge the link's just-committed specs against the specs
-    /// already **validated** (terminal codegen) for the same
-    /// `(extract, historical)` pair. Semantic duplicates are recorded as
-    /// terminal `Duplicate` codegen rows — the exploration record stays
-    /// complete, resume treats the link as built, and the drain validates
-    /// only the novel remainder. Judge errors fail open (all novel); a
+    /// Project-wide novelty gate: judge the link's newly committed specs against
+    /// up to [`novelty::MAX_PRIOR_SPECS`] canonical validated (`Completed`) specs
+    /// across the entire repository ranked by `(sequence ∪ post_attack)` Jaccard
+    /// similarity (plus intra-batch earlier specs). Semantic duplicates are
+    /// recorded as terminal `Duplicate` codegen rows. Judge errors fail open;
     /// billing-cap exhaustion propagates as run-fatal.
     async fn apply_novelty_gate(
         &self,
         key: &LinkKey,
+        spec_by_id: &BTreeMap<i32, AuditSpecification>,
         outcome: &mut LinkSpecOutcome,
         drain: &mut LinkDrainCounts,
         scopes: &LinkScopes,
@@ -796,41 +824,25 @@ impl<B: HarnessBackend + Clone + 'static> LinkContext<B> {
         let new_specs: Vec<(i32, AuditSpecification)> = outcome
             .specification_ids
             .iter()
-            .cloned()
-            .zip(outcome.specifications.iter().cloned())
+            .filter_map(|id| spec_by_id.get(id).cloned().map(|s| (*id, s)))
             .collect();
         if new_specs.is_empty() {
             return Ok(());
         }
 
-        // Comparison set: the pair's specs with a terminal codegen from
-        // earlier links, excluding the current batch (its mutual duplicates
-        // are judged intra-batch by the same call).
-        let pair_specs = self
+        let terminal_specs = self
             .repo
-            .load_pair_specifications(key.extract_id, key.historical_id)
+            .load_terminal_specifications()
             .await
-            .wrap_err("novelty gate: failed to load pair specifications")?;
-        let terminal = self
-            .repo
-            .loaded_completed_code_gen_spec_ids()
-            .await
-            .wrap_err("novelty gate: failed to load terminal codegen index")?;
-        let new_ids: HashSet<i32> = outcome.specification_ids.iter().copied().collect();
-        let mut prior: Vec<(i32, AuditSpecification)> = pair_specs
-            .into_iter()
-            .filter(|row| terminal.contains(&row.id) && !new_ids.contains(&row.id))
-            .filter_map(|row| {
-                serde_json::from_str::<AuditSpecification>(&row.specification_json)
-                    .ok()
-                    .map(|spec| (row.id, spec))
-            })
-            .collect();
-        // Most recent first: later specs are the pair's best expressions.
-        prior.sort_by_key(|(id, _)| std::cmp::Reverse(*id));
-        prior.truncate(novelty::MAX_PRIOR_SPECS);
-        if prior.is_empty() {
-            // First validated spec of the pair — nothing to duplicate.
+            .wrap_err("novelty gate: failed to load project-wide terminal specifications")?;
+        let prior = novelty::select_prior_specs_for_batch(
+            (key.extract_id, key.historical_id),
+            &new_specs,
+            &terminal_specs,
+            novelty::MAX_PRIOR_SPECS,
+        );
+        if prior.is_empty() && new_specs.len() < 2 {
+            // Nothing validated yet and singleton batch — nothing to duplicate.
             return Ok(());
         }
 
@@ -842,26 +854,23 @@ impl<B: HarnessBackend + Clone + 'static> LinkContext<B> {
             "novelty-e{}-h{}-f{}",
             key.extract_id, key.historical_id, key.finding_id
         );
-        let verdicts =
-            novelty::judge_spec_novelty(
-                &scopes.dedup,
-                Some(&cache_key),
-                Some(&debug_prefix),
-                &new_specs,
-                &prior,
-            )
-            .await?;
+        let verdicts = novelty::judge_spec_novelty(
+            &scopes.dedup,
+            Some(&cache_key),
+            Some(&debug_prefix),
+            &new_specs,
+            &prior,
+        )
+        .await?;
 
         let duplicates: Vec<(i32, &novelty::NoveltyVerdict)> = new_specs
             .iter()
             .zip(verdicts.iter())
-            .filter_map(|((id, _), verdict)| {
-                verdict.duplicate_of.map(|_| (*id, verdict))
-            })
+            .filter_map(|((id, _), verdict)| verdict.duplicate_of.map(|_| (*id, verdict)))
             .collect();
         if duplicates.is_empty() {
             tracing::info!(
-                "novelty gate: all {} committed spec(s) novel against {} validated pair sibling(s)",
+                "novelty gate: all {} committed spec(s) novel against {} project-wide prior spec(s)",
                 new_specs.len(),
                 prior.len()
             );
@@ -890,15 +899,100 @@ impl<B: HarnessBackend + Clone + 'static> LinkContext<B> {
                     format!("novelty gate: failed to record duplicate codegen for spec {spec_id}")
                 })?;
         }
-        let duplicate_ids: HashSet<i32> = duplicates.iter().map(|(id, _)| *id).collect();
+        let duplicate_ids: BTreeSet<i32> = duplicates.iter().map(|(id, _)| *id).collect();
         outcome
             .specification_ids
             .retain(|id| !duplicate_ids.contains(id));
         drain.dedup_skipped = duplicates.len();
         tracing::info!(
-            "novelty gate: {}/{} committed spec(s) judged duplicates of validated pair sibling(s) —              skipping their validation, {} novel spec(s) proceed",
+            "novelty gate: {}/{} committed spec(s) judged duplicates against {} project-wide prior spec(s) — skipping their validation, {} novel spec(s) proceed",
             duplicates.len(),
             new_specs.len(),
+            prior.len(),
+            outcome.specification_ids.len()
+        );
+        Ok(())
+    }
+
+    /// Opt-in pre-fuzz viability gate: screen surviving novel specs against
+    /// `ProjectProfile.out_of_scope_notes` and sequence signatures. Unambiguous
+    /// rejections write terminal `CodeGenStatus::SkippedViability` rows and
+    /// skip `fuzz -> reflect -> regen`.
+    async fn apply_viability_gate(
+        &self,
+        key: &LinkKey,
+        spec_by_id: &BTreeMap<i32, AuditSpecification>,
+        outcome: &mut LinkSpecOutcome,
+        drain: &mut LinkDrainCounts,
+        scopes: &LinkScopes,
+    ) -> Result<()> {
+        let candidate_specs: Vec<(i32, AuditSpecification)> = outcome
+            .specification_ids
+            .iter()
+            .filter_map(|id| spec_by_id.get(id).cloned().map(|s| (*id, s)))
+            .collect();
+        if candidate_specs.is_empty() {
+            return Ok(());
+        }
+
+        let cache_key = format!(
+            "{}-viability-e{}-h{}-f{}",
+            self.novelty_cache_root, key.extract_id, key.historical_id, key.finding_id
+        );
+        let debug_prefix = format!(
+            "viability-e{}-h{}-f{}",
+            key.extract_id, key.historical_id, key.finding_id
+        );
+        let verdicts = viability::judge_spec_viability(
+            &scopes.viability,
+            Some(&cache_key),
+            Some(&debug_prefix),
+            self.project_profile.as_ref(),
+            &self.project_index,
+            &candidate_specs,
+        )
+        .await?;
+
+        let rejected: Vec<(i32, &viability::ViabilityVerdict)> = candidate_specs
+            .iter()
+            .zip(verdicts.iter())
+            .filter_map(|((id, _), v)| (!v.viable).then_some((*id, v)))
+            .collect();
+        if rejected.is_empty() {
+            return Ok(());
+        }
+
+        for (spec_id, verdict) in &rejected {
+            let record = CodeGenRecord {
+                core: CodeGenCore {
+                    spec_id: *spec_id,
+                    harness_relative_path: String::new(),
+                    harness_source: String::new(),
+                    status: CodeGenStatus::SkippedViability,
+                    final_reason: verdict.reason.clone(),
+                    agent_steps: 0,
+                },
+                runs: Vec::new(),
+            };
+            self.repo
+                .write_code_gen_with_runs(&record, &[])
+                .await
+                .wrap_err_with(|| {
+                    format!(
+                        "viability gate: failed to record SkippedViability codegen for spec {spec_id}"
+                    )
+                })?;
+        }
+
+        let rejected_ids: BTreeSet<i32> = rejected.iter().map(|(id, _)| *id).collect();
+        outcome
+            .specification_ids
+            .retain(|id| !rejected_ids.contains(id));
+        drain.viability_skipped = rejected.len();
+        tracing::info!(
+            "viability gate: {}/{} novel spec(s) screened out as SkippedViability — {} viable spec(s) proceed to fuzz",
+            rejected.len(),
+            candidate_specs.len(),
             outcome.specification_ids.len()
         );
         Ok(())
@@ -1274,6 +1368,8 @@ pub(crate) struct LinkUsageReport {
     regen: PhaseUsage,
     /// Novelty-gate judge calls (child of the link scope).
     dedup: PhaseUsage,
+    /// Pre-fuzz viability-gate judge calls (child of the link scope).
+    viability: PhaseUsage,
     reflect: PhaseUsage,
 }
 
@@ -1349,6 +1445,7 @@ struct LinkScopes {
     codegen: LLM,
     regen: LLM,
     dedup: LLM,
+    viability: LLM,
     reflect: LLM,
 }
 
@@ -1360,6 +1457,7 @@ impl LinkScopes {
         let codegen = link.scope(Some("codegen".to_string()), None);
         let regen = link.scope(Some("regen".to_string()), None);
         let dedup = link.scope(Some("dedup".to_string()), None);
+        let viability = link.scope(Some("viability".to_string()), None);
         let reflect = link_reflect.scope(Some("reflect".to_string()), None);
         Self {
             link,
@@ -1368,6 +1466,7 @@ impl LinkScopes {
             codegen,
             regen,
             dedup,
+            viability,
             reflect,
         }
     }
@@ -1382,6 +1481,7 @@ impl LinkScopes {
             codegen: PhaseUsage::snapshot(&self.codegen),
             regen: PhaseUsage::snapshot(&self.regen),
             dedup: PhaseUsage::snapshot(&self.dedup),
+            viability: PhaseUsage::snapshot(&self.viability),
             reflect: PhaseUsage::snapshot(&self.reflect),
         }
     }
@@ -1541,9 +1641,11 @@ pub(crate) struct LinkPipelineInputs<B: HarnessBackend + Clone + Send + Sync + '
     pub(crate) report_cfg: Option<review_findings::ReportInlineCfg>,
     /// Cap on retained per-link usage detail rows (`0` = none).
     pub(crate) usage_max_link_rows: usize,
-    /// Opt-in novelty gate (see `--gen-specs-novelty-gate`): judge committed
-    /// specs against the pair's already-validated specs before the drain.
+    /// Project-wide novelty gate (default `true`; disabled by
+    /// `--no-gen-specs-novelty-gate`).
     pub(crate) novelty_gate: bool,
+    /// Opt-in pre-fuzz viability gate (`--gen-specs-viability-gate`).
+    pub(crate) viability_gate: bool,
     /// Log an `[mem]` sampler line every N seconds (`0` disables). Diagnostics
     /// for the long-run memory growth that OOM-killed multi-hour streamloops.
     pub(crate) memory_report_secs: u64,
@@ -1574,6 +1676,7 @@ impl<B: HarnessBackend + Clone + Send + Sync + 'static> LinkPipelineInputs<B> {
             report_cfg,
             usage_max_link_rows,
             novelty_gate,
+            viability_gate,
             memory_report_secs,
         } = self;
         let concurrency = concurrency.max(1);
@@ -1616,6 +1719,12 @@ impl<B: HarnessBackend + Clone + Send + Sync + 'static> LinkPipelineInputs<B> {
             ),
             None => None,
         };
+        let project_index = stream.project_index();
+        let project_profile = if viability_gate {
+            repo.get_project_profile().await?
+        } else {
+            None
+        };
         // `language_prompt_prefix` flows into LinkContext too so the per-link
         // reflect path can prepend it to the grader system prompt without
         // re-walking the harness backend each call.
@@ -1633,7 +1742,10 @@ impl<B: HarnessBackend + Clone + Send + Sync + 'static> LinkPipelineInputs<B> {
             max_inner_cycles: max_inner_cycles.max(1),
             language_prompt_prefix,
             novelty_gate,
+            viability_gate,
             novelty_cache_root,
+            project_index,
+            project_profile,
         });
         // Start the memory sampler before the scheduler so the first ticks
         // cover the startup allocations too.
@@ -1744,9 +1856,11 @@ struct LinkTally {
 
 #[derive(Clone, Debug, Default, Serialize)]
 struct LinkDrainCounts {
-    /// Specs the novelty gate judged duplicates of already-validated pair
-    /// siblings — recorded terminal (`Duplicate` codegen), validation skipped.
+    /// Specs the novelty gate judged duplicates of already-validated project
+    /// specs — recorded terminal (`Duplicate` codegen), validation skipped.
     dedup_skipped: usize,
+    /// Specs the opt-in pre-fuzz viability gate screened out (`SkippedViability`).
+    viability_skipped: usize,
     fuzz_completed: usize,
     fuzz_violated: usize,
     reflect_graded: usize,
@@ -1890,5 +2004,57 @@ mod usage_tests {
         assert_eq!(stats.link_usages.len(), 2);
         assert_eq!(stats.omitted_link_rows, 1);
         assert_eq!(stats.link_total.usd, Decimal::new(3, 0));
+    }
+
+    #[test]
+    fn default_concurrency_caps_inferred_forge_slots_at_eight_and_honors_explicit() -> Result<()> {
+        use clap::Parser;
+
+        #[derive(Parser)]
+        struct TestStreamCli {
+            #[command(flatten)]
+            args: StreamloopArgs,
+        }
+
+        let mut inferred = TestStreamCli::try_parse_from([
+            "knowdit",
+            "--project",
+            "demo:.",
+            "--database-url",
+            "sqlite://kg.db",
+            "--output-folder",
+            "out",
+            "-d",
+            "16",
+        ])?;
+        assert_eq!(inferred.args.harness.forge_coverage_runs, 256);
+        inferred.args.apply_default_concurrency();
+        assert_eq!(inferred.args.stream_link_concurrency, Some(16));
+        assert_eq!(
+            inferred.args.harness.forge_concurrency,
+            Some(8),
+            "inferred forge_concurrency must cap at 8"
+        );
+
+        let mut explicit = TestStreamCli::try_parse_from([
+            "knowdit",
+            "--project",
+            "demo:.",
+            "--database-url",
+            "sqlite://kg.db",
+            "--output-folder",
+            "out",
+            "-d",
+            "16",
+            "--forge-concurrency",
+            "12",
+        ])?;
+        explicit.args.apply_default_concurrency();
+        assert_eq!(
+            explicit.args.harness.forge_concurrency,
+            Some(12),
+            "explicit --forge-concurrency must win over -d"
+        );
+        Ok(())
     }
 }

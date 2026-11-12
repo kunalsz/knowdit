@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use knowdit_repo_model::{CodeGenRecord, CoverageEntry, HarnessRunRecord, RunKind};
 use llmy::client::settings::LLMSettings;
+use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
 /// Monotonic process-local counter that uniquifies the per-spec scratch
@@ -415,6 +416,25 @@ pub(super) struct HarnessAttempt {
     pub last_gate_passed: bool,
     pub last_test_calls: u64,
     pub restarts: usize,
+    /// SHA-256 of the most recent `harness_source` for which `forge coverage`
+    /// completed without timing out. Re-running `forge test` without editing
+    /// the `.sol` file reuses [`Self::cached_gate2_verdict`] instead of
+    /// spawning another `forge coverage` subprocess.
+    pub last_covered_source_sha256: Option<[u8; 32]>,
+    /// Cached Gate 2 verdict (`Some(None)` = passed, `Some(Some(reason))` =
+    /// failed) paired with [`Self::last_covered_source_sha256`].
+    pub cached_gate2_verdict: Option<Option<String>>,
+    pub last_coverage_row_count: usize,
+}
+
+impl HarnessAttempt {
+    pub(super) fn source_sha256(&self) -> Option<[u8; 32]> {
+        if self.harness_source.is_empty() {
+            None
+        } else {
+            Some(Sha256::digest(self.harness_source.as_bytes()).into())
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use clap::{Args, ValueEnum};
 use color_eyre::eyre::Result;
 use knowdit_audit::spec::{
-    LinkSource, LinkSpecSummary, SpecGenOptions, SpecGenOutcome, SpecGranularity,
+    LinkSource, LinkSpecSummary, SpecGenOptions, SpecGenOutcome, SpecGranularity, SpecSchedule,
     SpecificationGenerator,
 };
 use knowdit_kg_model::link_strength::LinkStrength;
@@ -167,15 +167,54 @@ pub struct GenSpecsSharedArgs {
     #[arg(long = "gen-specs-pair-max-agent-steps", default_value_t = 96)]
     pub gen_specs_pair_max_agent_steps: usize,
 
-    /// Opt-in novelty gate (streamloop drain): before a committed spec enters
-    /// codegen / fuzz / reflect, an LLM judge compares it against the specs
-    /// already validated for the same `(extract, historical)` pair. Semantic
-    /// duplicates get a terminal `Duplicate` codegen row and skip validation,
-    /// while every link still runs its spec-gen agent — exploration breadth
-    /// is preserved and only re-confirmation spend is cut. Fail-open: judge
-    /// errors mark specs novel.
-    #[arg(long = "gen-specs-novelty-gate", default_value_t = false)]
+    /// Intra-bucket scheduling policy (`fair` 2-level `(extract -> historical)`
+    /// round-robin + severity/MMR ordering vs `legacy` flat sort).
+    #[arg(long = "gen-specs-schedule", value_enum, default_value_t = ScheduleArg::Fair)]
+    pub gen_specs_schedule: ScheduleArg,
+
+    /// Re-run links/members previously marked `Abandoned` in `abandoned_link`
+    /// instead of skipping them on resume.
+    #[arg(long = "gen-specs-retry-abandoned", default_value_t = false)]
+    pub gen_specs_retry_abandoned: bool,
+
+    /// Explicitly enable the project-wide novelty gate (enabled by default;
+    /// retained for script compatibility alongside `--no-gen-specs-novelty-gate`).
+    #[arg(
+        long = "gen-specs-novelty-gate",
+        overrides_with = "no_gen_specs_novelty_gate"
+    )]
     pub gen_specs_novelty_gate: bool,
+
+    /// Disable the project-wide pre-fuzz novelty gate (which is enabled by
+    /// default in `workflow streamloop`).
+    #[arg(
+        long = "no-gen-specs-novelty-gate",
+        overrides_with = "gen_specs_novelty_gate"
+    )]
+    pub no_gen_specs_novelty_gate: bool,
+
+    /// Opt-in pre-fuzz viability gate: screen novel specs in one JSON check
+    /// against `ProjectProfile.out_of_scope_notes` and sequence signatures,
+    /// recording unambiguous out-of-scope / contradictory specs as
+    /// `CodeGenStatus::SkippedViability` (fail-open).
+    #[arg(long = "gen-specs-viability-gate", default_value_t = false)]
+    pub gen_specs_viability_gate: bool,
+}
+
+/// CLI-layer mirror of [`SpecSchedule`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ScheduleArg {
+    Fair,
+    Legacy,
+}
+
+impl From<ScheduleArg> for SpecSchedule {
+    fn from(v: ScheduleArg) -> Self {
+        match v {
+            ScheduleArg::Fair => SpecSchedule::Fair,
+            ScheduleArg::Legacy => SpecSchedule::Legacy,
+        }
+    }
 }
 
 /// CLI-layer mirror of [`SpecGranularity`].
@@ -195,6 +234,12 @@ impl From<GranularityArg> for SpecGranularity {
 }
 
 impl GenSpecsSharedArgs {
+    /// Whether the project-wide pre-fuzz novelty gate is active. Defaults to
+    /// `true` unless `--no-gen-specs-novelty-gate` was passed last.
+    pub fn novelty_gate_enabled(&self) -> bool {
+        !self.no_gen_specs_novelty_gate
+    }
+
     /// Reject unsafe / contradictory values before any LLM work.
     pub(crate) fn validate(&self) -> Result<()> {
         if self.gen_specs_batch_links == 0 {
@@ -269,6 +314,8 @@ impl GenSpecsSharedArgs {
             pack_size: self.gen_specs_pack_size,
             max_specs_per_pair: self.gen_specs_max_specs_per_pair,
             pair_max_agent_steps: self.gen_specs_pair_max_agent_steps,
+            schedule: self.gen_specs_schedule.into(),
+            retry_abandoned: self.gen_specs_retry_abandoned,
         }
     }
 }
@@ -384,35 +431,63 @@ impl GenSpecsArgs {
                  run the profile phase)."
             )
         })?;
-        let cache_key = shared
-            .gen_specs_cache_key
-            .clone()
-            .unwrap_or_else(|| format!("{}-knowdit-spec", project_name));
-        let options = SpecGenOptions {
-            max_agent_steps: shared.gen_specs_max_agent_steps,
-            max_specs_per_link: shared.gen_specs_max_specs_per_link,
-            compact_context_threshold_tokens: shared.gen_specs_compact_context_threshold_tokens,
-            cache_key,
-            debug_prefix: shared.gen_specs_debug_prefix.clone(),
-            llm_settings: None,
-            max_links: (shared.gen_specs_max_links > 0).then_some(shared.gen_specs_max_links),
-            batch_links: shared.gen_specs_batch_links.max(1),
-            summary_rows: shared.gen_specs_summary_rows,
-            max_findings_per_historical: (shared.gen_specs_max_findings_per_historical > 0)
-                .then_some(shared.gen_specs_max_findings_per_historical),
-            max_links_per_extract: (shared.gen_specs_max_links_per_extract > 0)
-                .then_some(shared.gen_specs_max_links_per_extract),
-            concurrency: shared.gen_specs_concurrency.unwrap_or(1).max(1),
-            regenerate: shared.gen_specs_regenerate,
-            min_strength: shared.gen_specs_min_strength.into(),
-            min_link_strength: shared.gen_specs_min_link_strength.into(),
-            language_prompt_prefix,
-            link_source: LinkSource::Mapper,
-            granularity: shared.gen_specs_granularity.into(),
-            pack_size: shared.gen_specs_pack_size,
-            max_specs_per_pair: shared.gen_specs_max_specs_per_pair,
-            pair_max_agent_steps: shared.gen_specs_pair_max_agent_steps,
-        };
+        let mut options =
+            shared.build_spec_options(project_name, language_prompt_prefix, LinkSource::Mapper);
+        options.concurrency = shared.gen_specs_concurrency.unwrap_or(1).max(1);
         SpecificationGenerator::new().run(repo, llm, &options).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct TestCli {
+        #[command(flatten)]
+        args: GenSpecsSharedArgs,
+    }
+
+    #[test]
+    fn novelty_gate_defaults_enabled_and_respects_override_flags() -> Result<()> {
+        let default_cli = TestCli::try_parse_from(["knowdit"])?;
+        assert!(default_cli.args.novelty_gate_enabled());
+        assert_eq!(default_cli.args.gen_specs_schedule, ScheduleArg::Fair);
+        assert!(!default_cli.args.gen_specs_retry_abandoned);
+        assert!(!default_cli.args.gen_specs_viability_gate);
+
+        let disabled = TestCli::try_parse_from(["knowdit", "--no-gen-specs-novelty-gate"])?;
+        assert!(!disabled.args.novelty_gate_enabled());
+
+        let explicit_on = TestCli::try_parse_from(["knowdit", "--gen-specs-novelty-gate"])?;
+        assert!(explicit_on.args.novelty_gate_enabled());
+
+        let re_enabled = TestCli::try_parse_from([
+            "knowdit",
+            "--no-gen-specs-novelty-gate",
+            "--gen-specs-novelty-gate",
+        ])?;
+        assert!(re_enabled.args.novelty_gate_enabled());
+
+        let re_disabled = TestCli::try_parse_from([
+            "knowdit",
+            "--gen-specs-novelty-gate",
+            "--no-gen-specs-novelty-gate",
+        ])?;
+        assert!(!re_disabled.args.novelty_gate_enabled());
+
+        let legacy = TestCli::try_parse_from([
+            "knowdit",
+            "--gen-specs-schedule",
+            "legacy",
+            "--gen-specs-retry-abandoned",
+            "--gen-specs-viability-gate",
+        ])?;
+        let opts = legacy.args.build_spec_options("proj", String::new(), LinkSource::Mapper);
+        assert_eq!(opts.schedule, SpecSchedule::Legacy);
+        assert!(opts.retry_abandoned);
+        assert!(legacy.args.gen_specs_viability_gate);
+        Ok(())
     }
 }

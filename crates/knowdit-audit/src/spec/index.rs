@@ -3,14 +3,226 @@
 //! renderings derived from it. Split out of `spec::mod` so the index and its
 //! derived views live together.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use color_eyre::eyre::Result;
+use knowdit_kg_model::ExtractedSemantic;
 use knowdit_repo_model::cg::{CallGraph, Contract, Function, FunctionCall, Interface};
 use knowdit_repo_model::inheritance::{ContractInherit, InheritanceGraph};
 use knowdit_repo_model::storage::{ContractVariable, StateVariable, StorageGraph};
 use llmy::agent::tools::memory::{AgentMemory, AgentMemoryContent, AgentMemoryContext};
+
+/// Static external-callability and state-mutability classification of a callable
+/// parsed from its source signature header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallableReachability {
+    /// Externally invocable and capable of mutating state (`external`/`public`
+    /// without `view`/`pure`, `fallback`/`receive`, interface calls, or Rust `pub fn`).
+    ExternalMutating,
+    /// Externally invocable read-only callable (`external`/`public` with `view`/`pure`).
+    ExternalReadOnly,
+    /// Not externally invocable (`internal`, `private`, `constructor`, `modifier`,
+    /// or Rust private / `pub(crate)` / `pub(super)`).
+    NonExternal,
+    /// Source body absent (`Function.content == None`) or unparseable; treated
+    /// fail-open by `SetCallSequenceTool` and ignored as synthetic by U2.
+    Unknown,
+}
+
+impl CallableReachability {
+    fn overload_priority(self) -> u8 {
+        match self {
+            Self::ExternalMutating => 4,
+            Self::Unknown => 3,
+            Self::ExternalReadOnly => 2,
+            Self::NonExternal => 1,
+        }
+    }
+
+    /// Combine reachability across multiple overloads or inherited declarations
+    /// sharing `(contract, function)`: if at least one overload is externally
+    /// callable/mutating (or `Unknown`), prefer it over `NonExternal`.
+    pub fn merge_overload(self, other: Self) -> Self {
+        if other.overload_priority() > self.overload_priority() {
+            other
+        } else {
+            self
+        }
+    }
+
+    pub(crate) fn classify_function(function: &Function, container_kind: ContainerKind) -> Self {
+        let Some(source) = function.content.as_deref() else {
+            return Self::Unknown;
+        };
+        match function.relative_file_path.extension().and_then(|e| e.to_str()) {
+            Some("rs") => match knowdit_rust::extract_function_signature(source) {
+                Ok(Some(sig)) => Self::classify_rust_signature(&sig, container_kind),
+                _ => Self::Unknown,
+            },
+            Some("move") => Self::Unknown,
+            _ => match knowdit_sol::signature::extract_function_signature(source) {
+                Ok(Some(sig)) => Self::classify_solidity_signature(&sig, container_kind),
+                _ => Self::Unknown,
+            },
+        }
+    }
+
+    fn classify_rust_signature(sig: &str, container_kind: ContainerKind) -> Self {
+        if container_kind == ContainerKind::Interface {
+            return Self::ExternalMutating;
+        }
+        let trimmed = sig.trim_start();
+        if let Some(after_pub) = trimmed.strip_prefix("pub")
+            && after_pub.starts_with(char::is_whitespace)
+            && !after_pub.trim_start().starts_with('(')
+        {
+            return Self::ExternalMutating;
+        }
+        Self::NonExternal
+    }
+
+    fn classify_solidity_signature(sig: &str, container_kind: ContainerKind) -> Self {
+        let trimmed = sig.trim();
+        let leading_end = trimmed
+            .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .unwrap_or(trimmed.len());
+        let keyword = &trimmed[..leading_end];
+        match keyword {
+            "constructor" | "modifier" => Self::NonExternal,
+            "receive" | "fallback" => {
+                let specifiers = Self::solidity_top_level_specifiers(&trimmed[leading_end..], false);
+                let is_readonly = specifiers
+                    .iter()
+                    .any(|tok| matches!(tok.as_str(), "view" | "pure" | "constant"));
+                if is_readonly {
+                    Self::ExternalReadOnly
+                } else {
+                    Self::ExternalMutating
+                }
+            }
+            "function" => {
+                let specifiers = Self::solidity_top_level_specifiers(&trimmed[leading_end..], true);
+                let is_readonly = specifiers
+                    .iter()
+                    .any(|tok| matches!(tok.as_str(), "view" | "pure" | "constant"));
+                let is_ext_or_pub = specifiers
+                    .iter()
+                    .any(|tok| matches!(tok.as_str(), "external" | "public"));
+                let is_int_or_priv = specifiers
+                    .iter()
+                    .any(|tok| matches!(tok.as_str(), "internal" | "private"));
+                if container_kind == ContainerKind::Interface {
+                    if is_int_or_priv {
+                        Self::NonExternal
+                    } else if is_readonly {
+                        Self::ExternalReadOnly
+                    } else {
+                        Self::ExternalMutating
+                    }
+                } else if is_ext_or_pub {
+                    if is_readonly {
+                        Self::ExternalReadOnly
+                    } else {
+                        Self::ExternalMutating
+                    }
+                } else {
+                    Self::NonExternal
+                }
+            }
+            _ => Self::Unknown,
+        }
+    }
+
+    /// Extract top-level identifier specifiers outside parentheses and string
+    /// literals. When `after_first_parens` is true (for `function name(...)`),
+    /// only tokens appearing after the parameter list `(...)` closes are
+    /// collected so parameter names cannot masquerade as visibility keywords.
+    fn solidity_top_level_specifiers(rest: &str, after_first_parens: bool) -> Vec<String> {
+        let mut tokens = Vec::new();
+        let mut current = String::new();
+        let mut paren_depth = 0usize;
+        let mut passed_params = !after_first_parens;
+        let mut saw_open_paren = false;
+        let mut in_quote: Option<char> = None;
+        let mut escape = false;
+
+        for ch in rest.chars() {
+            if let Some(q) = in_quote {
+                if escape {
+                    escape = false;
+                } else if ch == '\\' {
+                    escape = true;
+                } else if ch == q {
+                    in_quote = None;
+                }
+                continue;
+            }
+            if ch == '"' || ch == '\'' {
+                if !current.is_empty() {
+                    if passed_params && paren_depth == 0 {
+                        tokens.push(std::mem::take(&mut current));
+                    } else {
+                        current.clear();
+                    }
+                }
+                in_quote = Some(ch);
+                continue;
+            }
+            if ch == '(' {
+                if !current.is_empty() {
+                    if passed_params && paren_depth == 0 {
+                        tokens.push(std::mem::take(&mut current));
+                    } else {
+                        current.clear();
+                    }
+                }
+                paren_depth += 1;
+                saw_open_paren = true;
+                continue;
+            }
+            if ch == ')' {
+                if !current.is_empty() {
+                    current.clear();
+                }
+                paren_depth = paren_depth.saturating_sub(1);
+                if saw_open_paren && paren_depth == 0 {
+                    passed_params = true;
+                }
+                continue;
+            }
+            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '$' {
+                if passed_params && paren_depth == 0 {
+                    current.push(ch);
+                }
+            } else if !current.is_empty() {
+                if passed_params && paren_depth == 0 {
+                    tokens.push(std::mem::take(&mut current));
+                } else {
+                    current.clear();
+                }
+            }
+        }
+        if !current.is_empty() && passed_params && paren_depth == 0 {
+            tokens.push(current);
+        }
+        tokens
+    }
+}
+
+/// One in-scope externally callable state-mutating entrypoint discovered by
+/// [`ProjectIndex::stateful_external_entrypoints`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatefulEntrypoint {
+    pub contract_id: i32,
+    pub contract_name: String,
+    pub relative_file_path: PathBuf,
+    pub function_id: i32,
+    pub function_name: String,
+    pub signature: String,
+    pub written_state_vars: Vec<String>,
+}
 
 #[derive(Debug)]
 pub struct ProjectIndex {
@@ -23,7 +235,7 @@ pub struct ProjectIndex {
     pub storage_graph: StorageGraph,
     pub inheritance_graph: InheritanceGraph,
     /// `function.id -> (relative_file_path, contract_or_interface_name, kind)`
-    pub function_owner: BTreeMap<i32, FunctionOwner>,
+    pub(crate) function_owner: BTreeMap<i32, FunctionOwner>,
     /// Lower-cased contract name -> contract ids (multiple files may reuse).
     pub contract_ids_by_name: BTreeMap<String, Vec<i32>>,
     /// Lower-cased interface name -> interface ids.
@@ -61,7 +273,7 @@ impl ContainerKind {
 }
 
 impl ProjectIndex {
-    pub(crate) fn build(
+    pub fn build(
         call_graph: CallGraph,
         storage_graph: StorageGraph,
         inheritance_graph: InheritanceGraph,
@@ -236,31 +448,346 @@ impl ProjectIndex {
 
     /// True when project contract/interface `contract` declares — or
     /// inherits — a function named `function` (case-insensitive).
+    #[cfg(test)]
     pub(crate) fn contract_has_function(&self, contract: &str, function: &str) -> bool {
+        self.classify_sequence_callable(contract, function).is_some()
+    }
+
+    /// Classify `(contract, function)` across `contract`, its transitive
+    /// `inheritance_graph.ancestors_of(cid)`, and `interfaces`. Returns `None`
+    /// only when no matching function exists on any of those containers.
+    pub fn classify_sequence_callable(
+        &self,
+        contract: &str,
+        function: &str,
+    ) -> Option<CallableReachability> {
         let target = function.trim().to_lowercase();
-        let declares = |cid: i32| {
-            self.contract(cid)
-                .map(|c| c.functions.iter().any(|f| f.name.to_lowercase() == target))
-                .unwrap_or(false)
-        };
-        for cid in self.lookup_contract(contract) {
-            if declares(cid) {
-                return true;
+        let mut combined: Option<CallableReachability> = None;
+        let mut fold_fn = |f: &Function, kind: ContainerKind| {
+            if f.name.to_lowercase() == target {
+                let reach = CallableReachability::classify_function(f, kind);
+                combined = Some(match combined {
+                    Some(prev) => prev.merge_overload(reach),
+                    None => reach,
+                });
             }
-            if self
-                .inheritance_graph
-                .ancestors_of(cid)
-                .into_iter()
-                .any(declares)
-            {
-                return true;
+        };
+
+        for cid in self.lookup_contract(contract) {
+            if let Some(c) = self.contract(cid) {
+                for f in &c.functions {
+                    fold_fn(f, ContainerKind::Contract);
+                }
+            }
+            for ancestor_id in self.inheritance_graph.ancestors_of(cid) {
+                if let Some(anc) = self.contract(ancestor_id) {
+                    for f in &anc.functions {
+                        fold_fn(f, ContainerKind::Contract);
+                    }
+                }
+                if let Some(iface) = self.interface(ancestor_id) {
+                    for f in &iface.functions {
+                        fold_fn(f, ContainerKind::Interface);
+                    }
+                }
             }
         }
-        self.lookup_interface(contract).into_iter().any(|iid| {
-            self.interface(iid)
-                .map(|i| i.functions.iter().any(|f| f.name.to_lowercase() == target))
-                .unwrap_or(false)
+        for iid in self.lookup_interface(contract) {
+            if let Some(iface) = self.interface(iid) {
+                for f in &iface.functions {
+                    fold_fn(f, ContainerKind::Interface);
+                }
+            }
+        }
+        combined
+    }
+
+    /// Extract human-readable full signature headers for all callables matching
+    /// `(contract, function)` across `contract`, its ancestors, and interfaces.
+    pub fn sequence_step_signatures(&self, contract: &str, function: &str) -> Vec<String> {
+        let target = function.trim().to_lowercase();
+        let mut out: BTreeSet<String> = BTreeSet::new();
+        let mut collect_fn = |f: &Function| {
+            if f.name.to_lowercase() == target {
+                out.insert(self.extract_clean_signature(f));
+            }
+        };
+        for cid in self.lookup_contract(contract) {
+            if let Some(c) = self.contract(cid) {
+                for f in &c.functions {
+                    collect_fn(f);
+                }
+            }
+            for ancestor_id in self.inheritance_graph.ancestors_of(cid) {
+                if let Some(anc) = self.contract(ancestor_id) {
+                    for f in &anc.functions {
+                        collect_fn(f);
+                    }
+                }
+                if let Some(iface) = self.interface(ancestor_id) {
+                    for f in &iface.functions {
+                        collect_fn(f);
+                    }
+                }
+            }
+        }
+        for iid in self.lookup_interface(contract) {
+            if let Some(iface) = self.interface(iid) {
+                for f in &iface.functions {
+                    collect_fn(f);
+                }
+            }
+        }
+        out.into_iter().collect()
+    }
+
+    /// Compute every production-scope externally callable entrypoint whose
+    /// forward call closure in `CallGraph` writes state, invokes an interface/CPI
+    /// target, or (when `StorageGraph` has zero function-state edges) belongs to
+    /// a contract.
+    pub fn stateful_external_entrypoints(&self) -> Vec<StatefulEntrypoint> {
+        if self.call_graph.contracts.is_empty() {
+            return Vec::new();
+        }
+
+        let mut reverse_calls: BTreeMap<i32, Vec<i32>> = BTreeMap::new();
+        let mut forward_calls: BTreeMap<i32, Vec<i32>> = BTreeMap::new();
+        for contract in self.call_graph.contracts.values() {
+            for function in &contract.functions {
+                for call in &function.calls {
+                    reverse_calls
+                        .entry(call.to_id)
+                        .or_default()
+                        .push(call.from_id);
+                    forward_calls
+                        .entry(call.from_id)
+                        .or_default()
+                        .push(call.to_id);
+                }
+            }
+        }
+
+        let mut direct_writes: BTreeMap<i32, BTreeSet<String>> = BTreeMap::new();
+        for fsv in &self.storage_graph.function_state_variables {
+            if fsv.is_write {
+                let var_name = self
+                    .state_variable(fsv.state_variable_id)
+                    .map(|v| v.name.clone())
+                    .unwrap_or_else(|| format!("var#{}", fsv.state_variable_id));
+                direct_writes
+                    .entry(fsv.function_id)
+                    .or_default()
+                    .insert(var_name);
+            }
+        }
+
+        let storage_empty = self.storage_graph.function_state_variables.is_empty();
+        let mut stateful_fn_ids: BTreeSet<i32> = BTreeSet::new();
+        if storage_empty {
+            for contract in self.call_graph.contracts.values() {
+                for function in &contract.functions {
+                    stateful_fn_ids.insert(function.id);
+                }
+            }
+        } else {
+            let mut queue: VecDeque<i32> = VecDeque::new();
+            for &fn_id in direct_writes.keys() {
+                if stateful_fn_ids.insert(fn_id) {
+                    queue.push_back(fn_id);
+                }
+            }
+            for contract in self.call_graph.contracts.values() {
+                for function in &contract.functions {
+                    let calls_external_target = function.calls.iter().any(|call| {
+                        self.function_owner
+                            .get(&call.to_id)
+                            .is_some_and(|o| o.container_kind == ContainerKind::Interface)
+                            || call
+                                .description
+                                .as_deref()
+                                .is_some_and(|d| d.to_ascii_lowercase().contains("cpi"))
+                    });
+                    if calls_external_target && stateful_fn_ids.insert(function.id) {
+                        queue.push_back(function.id);
+                    }
+                }
+            }
+            while let Some(callee_id) = queue.pop_front() {
+                if let Some(callers) = reverse_calls.get(&callee_id) {
+                    for &caller_id in callers {
+                        if stateful_fn_ids.insert(caller_id) {
+                            queue.push_back(caller_id);
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut entrypoints = Vec::new();
+        for contract in self.call_graph.contracts.values() {
+            if Self::is_non_production_path(&contract.relative_file_path) {
+                continue;
+            }
+            for function in &contract.functions {
+                if Self::is_non_production_path(&function.relative_file_path) {
+                    continue;
+                }
+                if !stateful_fn_ids.contains(&function.id) {
+                    continue;
+                }
+                if CallableReachability::classify_function(function, ContainerKind::Contract)
+                    != CallableReachability::ExternalMutating
+                {
+                    continue;
+                }
+                let written_state_vars =
+                    Self::collect_reachable_writes(function.id, &forward_calls, &direct_writes);
+                entrypoints.push(StatefulEntrypoint {
+                    contract_id: contract.id,
+                    contract_name: contract.name.clone(),
+                    relative_file_path: contract.relative_file_path.clone(),
+                    function_id: function.id,
+                    function_name: function.name.clone(),
+                    signature: self.extract_clean_signature(function),
+                    written_state_vars,
+                });
+            }
+        }
+        entrypoints
+    }
+
+    /// Return all stateful external entrypoints not covered (case-insensitively,
+    /// inheritance-aware across ancestors and descendants) by `semantics`.
+    pub fn uncovered_stateful_entrypoints(
+        &self,
+        semantics: &[ExtractedSemantic],
+    ) -> Vec<StatefulEntrypoint> {
+        let mut covered_pairs: BTreeSet<(String, String)> = BTreeSet::new();
+        let mut covered_unqualified: BTreeSet<String> = BTreeSet::new();
+
+        for sem in semantics {
+            for func in &sem.functions {
+                let raw_name = func.name.trim();
+                let bare_name = raw_name
+                    .split('(')
+                    .next()
+                    .unwrap_or(raw_name)
+                    .trim();
+                if bare_name.is_empty() {
+                    continue;
+                }
+                let contract = func.contract.trim();
+                if !contract.is_empty() {
+                    covered_pairs.insert((contract.to_lowercase(), bare_name.to_lowercase()));
+                } else if let Some((qual_c, qual_f)) = bare_name
+                    .rsplit_once("::")
+                    .or_else(|| bare_name.split_once('.'))
+                {
+                    covered_pairs.insert((
+                        qual_c.trim().to_lowercase(),
+                        qual_f.trim().to_lowercase(),
+                    ));
+                } else {
+                    covered_unqualified.insert(bare_name.to_lowercase());
+                }
+            }
+        }
+
+        self.stateful_external_entrypoints()
+            .into_iter()
+            .filter(|ep| {
+                let fn_lower = ep.function_name.to_lowercase();
+                if covered_unqualified.contains(&fn_lower)
+                    || covered_pairs.contains(&(ep.contract_name.to_lowercase(), fn_lower.clone()))
+                {
+                    return false;
+                }
+                let related_ids = self
+                    .inheritance_graph
+                    .ancestors_of(ep.contract_id)
+                    .into_iter()
+                    .chain(self.inheritance_graph.descendants_of(ep.contract_id));
+                for rel_id in related_ids {
+                    if let Some(rel_contract) = self.contract(rel_id)
+                        && covered_pairs
+                            .contains(&(rel_contract.name.to_lowercase(), fn_lower.clone()))
+                    {
+                        return false;
+                    }
+                }
+                true
+            })
+            .collect()
+    }
+
+    fn collect_reachable_writes(
+        start_fn_id: i32,
+        forward_calls: &BTreeMap<i32, Vec<i32>>,
+        direct_writes: &BTreeMap<i32, BTreeSet<String>>,
+    ) -> Vec<String> {
+        let mut visited: BTreeSet<i32> = BTreeSet::new();
+        let mut queue: VecDeque<i32> = VecDeque::new();
+        let mut writes: BTreeSet<String> = BTreeSet::new();
+        visited.insert(start_fn_id);
+        queue.push_back(start_fn_id);
+        while let Some(fn_id) = queue.pop_front() {
+            if let Some(vars) = direct_writes.get(&fn_id) {
+                writes.extend(vars.iter().cloned());
+            }
+            if let Some(callees) = forward_calls.get(&fn_id) {
+                for &callee_id in callees {
+                    if visited.insert(callee_id) {
+                        queue.push_back(callee_id);
+                    }
+                }
+            }
+        }
+        writes.into_iter().collect()
+    }
+
+    fn is_non_production_path(path: &Path) -> bool {
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if file_name.ends_with(".t.sol") || file_name.ends_with(".s.sol") {
+            return true;
+        }
+        path.components().any(|comp| {
+            let Some(seg) = comp.as_os_str().to_str() else {
+                return false;
+            };
+            matches!(
+                seg.to_ascii_lowercase().as_str(),
+                "test"
+                    | "tests"
+                    | "mock"
+                    | "mocks"
+                    | "script"
+                    | "scripts"
+                    | "lib"
+                    | "node_modules"
+                    | "benches"
+                    | "examples"
+            )
         })
+    }
+
+    fn extract_clean_signature(&self, function: &Function) -> String {
+        if let Some(source) = function.content.as_deref() {
+            let extracted = if function.relative_file_path.extension().and_then(|e| e.to_str())
+                == Some("rs")
+            {
+                knowdit_rust::extract_function_signature(source)
+            } else {
+                knowdit_sol::signature::extract_function_signature(source)
+            };
+            if let Ok(Some(sig)) = extracted {
+                return sig;
+            }
+        }
+        format!("{}({})", function.name, function.args)
     }
 
     pub(crate) fn render_interface_lookup(
@@ -687,19 +1214,7 @@ impl ProjectIndex {
     /// files or `knowdit-sol` for Solidity files. Falls back to `name(args)`
     /// when there is no body content or the source cannot be parsed.
     fn render_function_signature(&self, function: &Function) -> String {
-        if let Some(source) = function.content.as_deref() {
-            let extracted = if function.relative_file_path.extension().and_then(|e| e.to_str())
-                == Some("rs")
-            {
-                knowdit_rust::extract_function_signature(source)
-            } else {
-                knowdit_sol::signature::extract_function_signature(source)
-            };
-            if let Ok(Some(sig)) = extracted {
-                return format!("`{sig}`");
-            }
-        }
-        format!("`{}({})`", function.name, function.args)
+        format!("`{}`", self.extract_clean_signature(function))
     }
 }
 
@@ -832,5 +1347,347 @@ mod tests {
         assert!(index.has_state_variable("solana_vault.vault_token.amount"));
         assert!(index.has_state_variable("vault_token.amount"));
         assert!(!index.has_state_variable("UnknownModule.total_assets"));
+    }
+
+    #[test]
+    fn callable_reachability_classifies_solidity_rust_inheritance_and_closures() {
+        use knowdit_kg_model::{ExtractedFunction, ExtractedSemantic, category::DeFiCategory};
+        use knowdit_repo_model::storage::FunctionStateVariable;
+
+        let loc = FileLocation {
+            start_line: 1,
+            start_column: 0,
+            end_line: 3,
+            end_column: 0,
+        };
+        let sol_fn = |id: i32, name: &str, path: &str, content: Option<&str>, calls: Vec<FunctionCall>| Function {
+            id,
+            name: name.to_string(),
+            args: String::new(),
+            relative_file_path: PathBuf::from(path),
+            loc,
+            content: content.map(str::to_string),
+            calls,
+            description: None,
+        };
+
+        // Contract 1: BaseVault with public mutating `withdraw` + internal `_accrue` (writes state var 1).
+        // Contract 2: Vault inherits BaseVault, has external `deposit` -> calls `_accrue`,
+        //             external view `totalAssets`, internal `preview(uint256 externalAmount)`,
+        //             constructor, modifier, receive, and synthetic `noBody` (content: None).
+        // Contract 3: MockVault under `src/mocks/MockVault.sol` (must be excluded from U2 entrypoints).
+        // Contract 4: Rust module with `pub fn`, `pub(crate) fn`, and private `fn`.
+        let mut contracts = BTreeMap::new();
+        contracts.insert(
+            1,
+            Contract {
+                id: 1,
+                name: "BaseVault".to_string(),
+                relative_file_path: PathBuf::from("src/BaseVault.sol"),
+                chunk: FileChunk {
+                    loc,
+                    content: String::new(),
+                },
+                functions: vec![
+                    sol_fn(
+                        10,
+                        "withdraw",
+                        "src/BaseVault.sol",
+                        Some("function withdraw(uint256 amt) public { _accrue(); }"),
+                        vec![FunctionCall {
+                            id: 1,
+                            from_id: 10,
+                            to_id: 11,
+                            description: None,
+                        }],
+                    ),
+                    sol_fn(
+                        11,
+                        "_accrue",
+                        "src/BaseVault.sol",
+                        Some("function _accrue() internal { totalAssets += 1; }"),
+                        Vec::new(),
+                    ),
+                ],
+                description: None,
+            },
+        );
+        contracts.insert(
+            2,
+            Contract {
+                id: 2,
+                name: "Vault".to_string(),
+                relative_file_path: PathBuf::from("src/Vault.sol"),
+                chunk: FileChunk {
+                    loc,
+                    content: String::new(),
+                },
+                functions: vec![
+                    sol_fn(
+                        20,
+                        "deposit",
+                        "src/Vault.sol",
+                        Some("function deposit(uint256 amt) external onlyRole(\"view\") { _accrue(); }"),
+                        vec![FunctionCall {
+                            id: 2,
+                            from_id: 20,
+                            to_id: 11,
+                            description: None,
+                        }],
+                    ),
+                    sol_fn(
+                        21,
+                        "totalAssets",
+                        "src/Vault.sol",
+                        Some("function totalAssets() external view returns (uint256) { return 0; }"),
+                        Vec::new(),
+                    ),
+                    sol_fn(
+                        22,
+                        "preview",
+                        "src/Vault.sol",
+                        Some("function preview(uint256 externalAmount) internal pure returns (uint256 publicOut) { return externalAmount; }"),
+                        Vec::new(),
+                    ),
+                    sol_fn(
+                        23,
+                        "constructor",
+                        "src/Vault.sol",
+                        Some("constructor(address admin) {}"),
+                        Vec::new(),
+                    ),
+                    sol_fn(
+                        24,
+                        "onlyAdmin",
+                        "src/Vault.sol",
+                        Some("modifier onlyAdmin() { _; }"),
+                        Vec::new(),
+                    ),
+                    sol_fn(
+                        25,
+                        "receive",
+                        "src/Vault.sol",
+                        Some("receive() external payable { _accrue(); }"),
+                        vec![FunctionCall {
+                            id: 3,
+                            from_id: 25,
+                            to_id: 11,
+                            description: None,
+                        }],
+                    ),
+                    sol_fn(26, "noBody", "src/Vault.sol", None, Vec::new()),
+                ],
+                description: None,
+            },
+        );
+        contracts.insert(
+            3,
+            Contract {
+                id: 3,
+                name: "MockVault".to_string(),
+                relative_file_path: PathBuf::from("src/mocks/MockVault.sol"),
+                chunk: FileChunk {
+                    loc,
+                    content: String::new(),
+                },
+                functions: vec![sol_fn(
+                    30,
+                    "mintMock",
+                    "src/mocks/MockVault.sol",
+                    Some("function mintMock() external {}"),
+                    vec![FunctionCall {
+                        id: 4,
+                        from_id: 30,
+                        to_id: 11,
+                        description: None,
+                    }],
+                )],
+                description: None,
+            },
+        );
+        contracts.insert(
+            4,
+            Contract {
+                id: 4,
+                name: "rust_prog".to_string(),
+                relative_file_path: PathBuf::from("programs/prog/src/lib.rs"),
+                chunk: FileChunk {
+                    loc,
+                    content: String::new(),
+                },
+                functions: vec![
+                    sol_fn(
+                        40,
+                        "execute",
+                        "programs/prog/src/lib.rs",
+                        Some("pub async fn execute() {}"),
+                        vec![FunctionCall {
+                            id: 5,
+                            from_id: 40,
+                            to_id: 41,
+                            description: None,
+                        }],
+                    ),
+                    sol_fn(
+                        41,
+                        "crate_helper",
+                        "programs/prog/src/lib.rs",
+                        Some("pub(crate) fn crate_helper() {}"),
+                        Vec::new(),
+                    ),
+                    sol_fn(
+                        42,
+                        "priv_helper",
+                        "programs/prog/src/lib.rs",
+                        Some("fn priv_helper() {}"),
+                        Vec::new(),
+                    ),
+                ],
+                description: None,
+            },
+        );
+
+        let mut state_variables = BTreeMap::new();
+        state_variables.insert(
+            1,
+            StateVariable {
+                id: 1,
+                name: "assets".to_string(),
+                type_name: "uint256".to_string(),
+                relative_file_path: PathBuf::from("src/BaseVault.sol"),
+                loc,
+                content: "uint256 public assets;".to_string(),
+            },
+        );
+        let storage = StorageGraph {
+            state_variables,
+            contract_variables: vec![ContractVariable {
+                contract_id: 1,
+                state_variable_id: 1,
+                description: None,
+            }],
+            function_state_variables: vec![
+                FunctionStateVariable {
+                    function_id: 11,
+                    state_variable_id: 1,
+                    is_write: true,
+                    description: None,
+                },
+                FunctionStateVariable {
+                    function_id: 41,
+                    state_variable_id: 1,
+                    is_write: true,
+                    description: None,
+                },
+            ],
+        };
+        let inheritance = InheritanceGraph::new(vec![ContractInherit {
+            contract_id: 2,
+            inherited_id: 1,
+        }]);
+
+        let index = ProjectIndex::build(
+            CallGraph {
+                contracts,
+                interfaces: BTreeMap::new(),
+            },
+            storage,
+            inheritance,
+        );
+
+        assert_eq!(
+            index.classify_sequence_callable("Vault", "deposit"),
+            Some(CallableReachability::ExternalMutating)
+        );
+        // Inherited public function from BaseVault resolves on Vault.
+        assert_eq!(
+            index.classify_sequence_callable("Vault", "withdraw"),
+            Some(CallableReachability::ExternalMutating)
+        );
+        assert_eq!(
+            index.classify_sequence_callable("Vault", "totalAssets"),
+            Some(CallableReachability::ExternalReadOnly)
+        );
+        // Parameter name `externalAmount` + return `publicOut` must NOT fool internal classifier.
+        assert_eq!(
+            index.classify_sequence_callable("Vault", "preview"),
+            Some(CallableReachability::NonExternal)
+        );
+        assert_eq!(
+            index.classify_sequence_callable("Vault", "_accrue"),
+            Some(CallableReachability::NonExternal)
+        );
+        assert_eq!(
+            index.classify_sequence_callable("Vault", "constructor"),
+            Some(CallableReachability::NonExternal)
+        );
+        assert_eq!(
+            index.classify_sequence_callable("Vault", "onlyAdmin"),
+            Some(CallableReachability::NonExternal)
+        );
+        assert_eq!(
+            index.classify_sequence_callable("Vault", "receive"),
+            Some(CallableReachability::ExternalMutating)
+        );
+        assert_eq!(
+            index.classify_sequence_callable("Vault", "noBody"),
+            Some(CallableReachability::Unknown)
+        );
+        assert_eq!(
+            index.classify_sequence_callable("rust_prog", "execute"),
+            Some(CallableReachability::ExternalMutating)
+        );
+        assert_eq!(
+            index.classify_sequence_callable("rust_prog", "crate_helper"),
+            Some(CallableReachability::NonExternal)
+        );
+        assert_eq!(
+            index.classify_sequence_callable("rust_prog", "priv_helper"),
+            Some(CallableReachability::NonExternal)
+        );
+
+        // Stateful external entrypoints: BaseVault.withdraw, Vault.deposit, Vault.receive, rust_prog.execute
+        // (excludes internal/view/constructor/modifier/Unknown and src/mocks/MockVault.sol).
+        let entrypoints = index.stateful_external_entrypoints();
+        let names: Vec<(String, String)> = entrypoints
+            .iter()
+            .map(|e| (e.contract_name.clone(), e.function_name.clone()))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                ("BaseVault".to_string(), "withdraw".to_string()),
+                ("Vault".to_string(), "deposit".to_string()),
+                ("Vault".to_string(), "receive".to_string()),
+                ("rust_prog".to_string(), "execute".to_string()),
+            ]
+        );
+        assert_eq!(entrypoints[1].written_state_vars, vec!["assets".to_string()]);
+
+        // Inheritance-aware coverage: covering `Vault.withdraw` covers `BaseVault.withdraw` too!
+        let semantics = vec![ExtractedSemantic {
+            name: "Vault Withdraw".to_string(),
+            category: DeFiCategory::Lending,
+            definition: "def".to_string(),
+            description: "desc".to_string(),
+            functions: vec![ExtractedFunction {
+                name: "withdraw".to_string(),
+                contract: "Vault".to_string(),
+                signature: Some("withdraw(uint256)".to_string()),
+            }],
+        }];
+        let uncovered = index.uncovered_stateful_entrypoints(&semantics);
+        let uncovered_names: Vec<(String, String)> = uncovered
+            .into_iter()
+            .map(|e| (e.contract_name, e.function_name))
+            .collect();
+        assert_eq!(
+            uncovered_names,
+            vec![
+                ("Vault".to_string(), "deposit".to_string()),
+                ("Vault".to_string(), "receive".to_string()),
+                ("rust_prog".to_string(), "execute".to_string()),
+            ]
+        );
     }
 }
