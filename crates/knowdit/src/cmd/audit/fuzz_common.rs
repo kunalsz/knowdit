@@ -336,7 +336,7 @@ pub fn language_prompt_prefix_for(language: SourceLanguage) -> Result<&'static s
 pub struct SolanaHarnessSharedArgs {
     /// Path to a local `cargo` binary. When set, Knowdit runs `cargo test`
     /// directly on the host (with optional cgroup v2 memory cap). When unset,
-    /// Knowdit uses `lazymio/knowdit:solana` in Docker if present locally,
+    /// Knowdit uses the locally built `knowdit:solana` Docker image if present,
     /// otherwise resolves `cargo` from `$PATH`.
     #[arg(long = "solana-cargo-bin")]
     pub solana_cargo_bin: Option<PathBuf>,
@@ -346,8 +346,9 @@ pub struct SolanaHarnessSharedArgs {
     #[arg(long = "solana-build-sbf-bin")]
     pub solana_build_sbf_bin: Option<PathBuf>,
 
-    /// Docker image used for sandboxed offline `LiteSVM` + SBF builds.
-    #[arg(long = "solana-docker-image", default_value = "lazymio/knowdit:solana")]
+    /// Local Docker image used for sandboxed offline `LiteSVM` + SBF builds
+    /// (built from `docker/Dockerfile.solana` via `./setup.sh` or `docker build`).
+    #[arg(long = "solana-docker-image", default_value = "knowdit:solana")]
     pub solana_docker_image: String,
 
     /// Per-invocation memory ceiling in GiB (`0` disables the ceiling).

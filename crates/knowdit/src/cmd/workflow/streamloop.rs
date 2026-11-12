@@ -339,8 +339,8 @@ impl StreamloopArgs {
                 )?;
                 tracing::info!("[streamloop preflight] verifying Solana LiteSVM + SBF environment");
                 harness_backend.preflight(&repo_root).await.wrap_err(
-                    "Solana LiteSVM environment preflight failed — ensure SBF `.so` artifacts \
-                     or `lazymio/knowdit:solana` / `cargo-build-sbf` are available and re-run",
+                    "Solana LiteSVM environment preflight failed — run `./setup.sh` or ensure \
+                     SBF `.so` artifacts / local `knowdit:solana` image / `cargo-build-sbf` are available",
                 )?;
                 tracing::info!("[streamloop preflight] Solana LiteSVM environment OK");
 

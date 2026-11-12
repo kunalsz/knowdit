@@ -46,7 +46,15 @@ def build_solana_workspace(
     repo_root = repo_root.resolve()
     has_anchor = (repo_root / "Anchor.toml").is_file()
 
-    local_sbf = cargo_build_sbf or shutil.which("cargo-build-sbf")
+    local_sbf = (
+        cargo_build_sbf
+        or shutil.which("cargo-build-sbf")
+        or (
+            str(Path.home() / ".local/share/solana/install/active_release/bin/cargo-build-sbf")
+            if (Path.home() / ".local/share/solana/install/active_release/bin/cargo-build-sbf").is_file()
+            else None
+        )
+    )
     local_anchor = anchor_bin or shutil.which("anchor")
 
     if not force_docker and (local_sbf or (has_anchor and local_anchor)):
@@ -60,7 +68,18 @@ def build_solana_workspace(
         if not shutil.which("docker"):
             raise RuntimeError(
                 "Neither `cargo-build-sbf` nor `docker` is available on $PATH. "
-                "Install Agave (`agave-install`) or Docker (`lazymio/knowdit:solana`)."
+                "Run `./setup.sh` (installs Agave `cargo-build-sbf` and builds `knowdit:solana`)."
+            )
+        img_check = subprocess.run(
+            ["docker", "image", "inspect", docker_image],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if img_check.returncode != 0:
+            raise RuntimeError(
+                f"Local Docker image `{docker_image}` is not built yet and `cargo-build-sbf` is not on $PATH. "
+                f"Run `./setup.sh` or `docker build -f docker/Dockerfile.solana -t {docker_image} docker`."
             )
         uid = os.getuid()
         gid = os.getgid()
@@ -105,8 +124,8 @@ def main() -> int:
     parser.add_argument("--anchor", default=None, help="Explicit anchor binary")
     parser.add_argument(
         "--docker-image",
-        default="lazymio/knowdit:solana",
-        help="Docker image fallback when host SBF toolchain is absent",
+        default="knowdit:solana",
+        help="Local Docker image built from docker/Dockerfile.solana when host SBF toolchain is absent",
     )
     parser.add_argument("--force-docker", action="store_true", help="Always build inside Docker")
     parser.add_argument("--timeout-secs", type=int, default=900, help="Build timeout in seconds")

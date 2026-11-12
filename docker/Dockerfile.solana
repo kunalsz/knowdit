@@ -1,24 +1,26 @@
 # Reproducible offline-capable Solana / Anchor / LiteSVM execution image
-# Default image tag consumed by `SolanaHarness`: `lazymio/knowdit:solana`
+# Local image tag consumed by `SolanaHarness`: `knowdit:solana`
+# (Built locally by `./setup.sh` or manually — not pulled from Docker Hub.)
 #
 # Build:
-#   docker build -f docker/Dockerfile.solana -t lazymio/knowdit:solana .
+#   docker build -f docker/Dockerfile.solana -t knowdit:solana docker
 
-FROM rust:1.85-bookworm
+FROM rust:bookworm
 
 ARG AGAVE_VERSION=2.1.15
-ARG ANCHOR_VERSION=0.30.1
 
 ENV DEBIAN_FRONTEND=noninteractive \
+    HOME=/opt/knowdit-home \
     CARGO_HOME=/opt/knowdit-cargo-home \
     RUSTUP_HOME=/usr/local/rustup \
     SOLANA_INSTALL_DIR=/opt/solana \
     KNOWDIT_SOLANA_VENDOR=/opt/knowdit-solana-vendor
 
-ENV PATH="/opt/knowdit-cargo-home/bin:/opt/solana/active_release/bin:/usr/local/cargo/bin:${PATH}"
+ENV PATH="/usr/local/cargo/bin:/opt/knowdit-cargo-home/bin:/opt/solana/active_release/bin:${PATH}"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
+        bzip2 \
         ca-certificates \
         clang \
         cmake \
@@ -31,24 +33,59 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         pkg-config \
         protobuf-compiler \
         python3 \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p "${HOME}" "${CARGO_HOME}" "${SOLANA_INSTALL_DIR}" "${KNOWDIT_SOLANA_VENDOR}"
 
-# Install LLVM source-based coverage support (`cargo-llvm-cov`) for Gate 2 Tier 1.
+# Install LLVM source-based coverage support (`cargo-llvm-cov`) into `/usr/local/cargo/bin`
+# (preferring the prebuilt GitHub release tarball for fast builds, with source fallback).
 RUN rustup component add llvm-tools-preview rustfmt clippy \
-    && cargo install --locked cargo-llvm-cov
+    && ARCH="$(uname -m)" \
+    && case "${ARCH}" in \
+         x86_64)  COV_TARGET="x86_64-unknown-linux-gnu" ;; \
+         aarch64|arm64) COV_TARGET="aarch64-unknown-linux-gnu" ;; \
+         *) COV_TARGET="" ;; \
+       esac \
+    && InstalledCov=0 \
+    && if [ -n "${COV_TARGET}" ]; then \
+         COV_URL="https://github.com/taiki-e/cargo-llvm-cov/releases/latest/download/cargo-llvm-cov-${COV_TARGET}.tar.gz"; \
+         if curl -fsSL "${COV_URL}" -o /tmp/llvm-cov.tgz && tar -xzf /tmp/llvm-cov.tgz -C /usr/local/cargo/bin; then \
+           chmod 0755 /usr/local/cargo/bin/cargo-llvm-cov && InstalledCov=1; \
+         fi; \
+         rm -f /tmp/llvm-cov.tgz; \
+       fi \
+    && if [ "${InstalledCov}" -eq 0 ]; then \
+         CARGO_INSTALL_ROOT=/usr/local/cargo cargo install --locked cargo-llvm-cov; \
+       fi
 
-# Install Agave / Solana SBF toolchain (`cargo-build-sbf`, `solana`, SBF SDK).
-RUN sh -c "$(curl -sSfL https://release.anza.xyz/v${AGAVE_VERSION}/install)" -s - v${AGAVE_VERSION} \
-    && mkdir -p /opt/solana \
-    && cp -a /root/.local/share/solana/install/* /opt/solana/ \
-    && rm -rf /root/.local/share/solana
-
-# Install Anchor CLI for Anchor workspace prebuilds.
-RUN cargo install --git https://github.com/coral-xyz/anchor --tag v${ANCHOR_VERSION} anchor-cli --locked || true
+# Install Agave / Solana SBF toolchain (`cargo-build-sbf`, `solana`) from a
+# pre-staged context archive (when `./setup.sh` reuses its host cache) or from
+# Anza's GitHub release tarball, AND pre-warm `platform-tools` on a minimal
+# `cdylib` crate so `docker run --network none` never attempts an online download.
+COPY Dockerfile.solana solana-release* /tmp/knowdit-ctx/
+RUN ARCH="$(uname -m)" \
+    && case "${ARCH}" in \
+         x86_64)  AGAVE_TARGET="x86_64-unknown-linux-gnu" ;; \
+         aarch64|arm64) AGAVE_TARGET="aarch64-unknown-linux-gnu" ;; \
+         *) echo "Unsupported architecture: ${ARCH}" >&2; exit 1 ;; \
+       esac \
+    && mkdir -p /opt/solana/releases/v${AGAVE_VERSION} \
+    && if [ -f /tmp/knowdit-ctx/solana-release.tar.bz2 ]; then \
+         tar -xjf /tmp/knowdit-ctx/solana-release.tar.bz2 -C /opt/solana/releases/v${AGAVE_VERSION}; \
+       else \
+         AGAVE_URL="https://github.com/anza-xyz/agave/releases/download/v${AGAVE_VERSION}/solana-release-${AGAVE_TARGET}.tar.bz2"; \
+         curl -fL --retry 5 --connect-timeout 30 "${AGAVE_URL}" | tar -xjf - -C /opt/solana/releases/v${AGAVE_VERSION}; \
+       fi \
+    && rm -rf /tmp/knowdit-ctx \
+    && ln -sfn "/opt/solana/releases/v${AGAVE_VERSION}/solana-release" /opt/solana/active_release \
+    && mkdir -p /tmp/knowdit-sbf-warm/src \
+    && printf '[package]\nname = "knowdit_sbf_warm"\nversion = "0.1.0"\nedition = "2021"\n\n[lib]\ncrate-type = ["cdylib"]\n\n[dependencies]\n' > /tmp/knowdit-sbf-warm/Cargo.toml \
+    && printf '#![no_std]\n#[panic_handler]\nfn panic(_info: &core::panic::PanicInfo) -> ! { loop {} }\n#[no_mangle]\npub extern "C" fn entrypoint(_input: *mut u8) -> u64 { 0 }\n' > /tmp/knowdit-sbf-warm/src/lib.rs \
+    && /opt/solana/active_release/bin/cargo-build-sbf --manifest-path /tmp/knowdit-sbf-warm/Cargo.toml \
+    && rm -rf /tmp/knowdit-sbf-warm
 
 # Pre-vendor every crate needed by per-spec LiteSVM + proptest harnesses so
 # `docker run --network none` compiles completely offline.
-RUN mkdir -p /tmp/knowdit-seed-harness/src "${KNOWDIT_SOLANA_VENDOR}" "${CARGO_HOME}" \
+RUN mkdir -p /tmp/knowdit-seed-harness/src \
     && cat > /tmp/knowdit-seed-harness/Cargo.toml <<'EOF'
 [package]
 name = "knowdit-seed-harness"
@@ -86,11 +123,30 @@ directory = "/opt/knowdit-solana-vendor"
 [net]
 offline = true
 EOF
-RUN rm -rf /tmp/knowdit-seed-harness /tmp/vendor-config.toml \
+RUN cat > /usr/local/bin/knowdit-solana-cargo <<'EOF'
+#!/bin/sh
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "--manifest-path" ]; then
+    dir="$(dirname "$arg")"
+    if [ -d "$dir" ] && [ ! -f "$dir/Cargo.lock" ] && [ -f /opt/knowdit-solana-seed.lock ]; then
+      cp /opt/knowdit-solana-seed.lock "$dir/Cargo.lock" 2>/dev/null || true
+    fi
+  fi
+  prev="$arg"
+done
+if [ -f "./Cargo.toml" ] && [ ! -f "./Cargo.lock" ] && [ -f /opt/knowdit-solana-seed.lock ]; then
+  cp /opt/knowdit-solana-seed.lock "./Cargo.lock" 2>/dev/null || true
+fi
+exec /usr/local/cargo/bin/cargo "$@"
+EOF
+RUN chmod 0755 /usr/local/bin/knowdit-solana-cargo \
+    && rm -rf /tmp/knowdit-seed-harness /tmp/vendor-config.toml \
     && groupadd -g 1000 knowdit || true \
     && useradd -m -u 1000 -g 1000 -s /bin/bash knowdit || true \
-    && chmod -R a+rX "${CARGO_HOME}" "${KNOWDIT_SOLANA_VENDOR}" /opt/solana "${RUSTUP_HOME}" /opt/knowdit-solana-seed.lock
+    && chmod -R a+rX "${CARGO_HOME}" "${KNOWDIT_SOLANA_VENDOR}" /opt/solana "${RUSTUP_HOME}" /opt/knowdit-solana-seed.lock "${HOME}" \
+    && mkdir -p "${HOME}/.cache" && chmod -R a+rwX "${HOME}/.cache"
 
 USER 1000:1000
 WORKDIR /workspace
-ENTRYPOINT ["/usr/local/cargo/bin/cargo"]
+ENTRYPOINT ["/usr/local/bin/knowdit-solana-cargo"]

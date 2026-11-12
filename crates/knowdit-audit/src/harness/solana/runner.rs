@@ -6,7 +6,7 @@
 //!      cgroup v2 slice (`ScopedCgroup`: `memory.max`, `memory.swap.max = 0`,
 //!      atomic `cgroup.kill` on `Drop`).
 //!   3. [`SolanaBackendKind::Docker`] — `docker run --rm --network none --user uid:gid`
-//!      against `lazymio/knowdit:solana` (offline vendored crate cache) with explicit
+//!      against local `knowdit:solana` (offline vendored crate cache) with explicit
 //!      `docker kill` on `Drop`.
 //!
 //! Concurrent link pipelines share a single `<harness_dir>/.knowdit-cargo-target`
@@ -284,19 +284,8 @@ impl SolanaBackend {
                     mem_max_bytes: cap,
                 });
             }
-            if Self::docker_runtime_present() && Self::find_on_path("cargo").is_none() {
-                let cap = mem_cap_bytes.unwrap_or(0);
-                tracing::info!(
-                    "SolanaBackend: Docker image={docker_image} (not yet pulled locally) mem_max={} MB",
-                    cap / (1024 * 1024),
-                );
-                return Ok(SolanaBackendKind::Docker {
-                    image: docker_image,
-                    mem_max_bytes: cap,
-                });
-            }
             tracing::info!(
-                "SolanaBackend: Docker image `{docker_image}` not present locally; resolving `cargo` from $PATH"
+                "SolanaBackend: local Docker image `{docker_image}` not built yet; resolving `cargo` from $PATH"
             );
         }
         #[cfg(not(target_os = "linux"))]
@@ -306,9 +295,9 @@ impl SolanaBackend {
         match Self::find_on_path("cargo") {
             Some(cargo) => Self::local_kind(cargo, build_sbf_bin, mem_cap_bytes),
             None => Err(eyre!(
-                "no usable Solana / Rust runtime: `--solana-cargo-bin` unset, Docker image \
-                 not available, and `cargo` not found in $PATH. Build the image via \
-                 `docker build -f docker/Dockerfile.solana -t lazymio/knowdit:solana .`, \
+                "no usable Solana / Rust runtime: `--solana-cargo-bin` unset, local Docker image \
+                 `knowdit:solana` not built, and `cargo` not found in $PATH. Run `./setup.sh` \
+                 (or `docker build -f docker/Dockerfile.solana -t knowdit:solana docker`), \
                  install Rust + Agave (`agave-install`), or pass `--solana-cargo-bin <path>`."
             )),
         }
@@ -332,7 +321,7 @@ impl SolanaBackend {
                     explicit.display()
                 )
             })?),
-            None => Self::find_on_path("cargo-build-sbf"),
+            None => Self::find_on_path("cargo-build-sbf").or_else(Self::find_default_agave_sbf),
         };
 
         #[cfg(target_os = "linux")]
@@ -455,17 +444,6 @@ impl SolanaBackend {
     }
 
     #[cfg(target_os = "linux")]
-    fn docker_runtime_present() -> bool {
-        std::process::Command::new("docker")
-            .arg("--version")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-    }
-
-    #[cfg(target_os = "linux")]
     fn docker_image_available(image: &str) -> bool {
         std::process::Command::new("docker")
             .args(["image", "inspect", image])
@@ -485,6 +463,17 @@ impl SolanaBackend {
             }
         }
         None
+    }
+
+    /// Fallback lookup at Agave's standard install location (`~/.local/share/solana/install/active_release/bin/cargo-build-sbf`)
+    /// so freshly `./setup.sh`-installed shells work before restarting the terminal.
+    fn find_default_agave_sbf() -> Option<PathBuf> {
+        let home = std::env::var_os("HOME")?;
+        let candidate = PathBuf::from(home)
+            .join(".local/share/solana/install/active_release/bin/cargo-build-sbf");
+        candidate
+            .is_file()
+            .then(|| std::fs::canonicalize(&candidate).unwrap_or(candidate))
     }
 }
 
@@ -763,7 +752,7 @@ fn test_knowdit_solana_preflight() {
 
         Err(eyre!(
             "preflight: Solana LiteSVM smoke test failed (exit_code={}). \
-             Ensure `lazymio/knowdit:solana` is built (`docker build -f docker/Dockerfile.solana -t lazymio/knowdit:solana .`) \
+             Ensure `knowdit:solana` is built (`./setup.sh` or `docker build -f docker/Dockerfile.solana -t knowdit:solana docker`) \
              or host Cargo has access to `litesvm` / `solana-sdk` crates.\n\
              --- cargo output tail ---\n{}",
             out.exit_code,
@@ -804,9 +793,9 @@ fn test_knowdit_solana_preflight() {
             return Err(eyre!(
                 "preflight: missing compiled Solana SBF shared objects {:?} under {}, \
                  and `cargo-build-sbf` is not available in the active backend. \
-                 Run `python3 scripts/autobuild_solana.py {}`, build `lazymio/knowdit:solana` \
-                 (`docker build -f docker/Dockerfile.solana -t lazymio/knowdit:solana .`), \
-                 or install Agave (`agave-install`) and pass `--solana-build-sbf-bin`.",
+                 Run `./setup.sh` (which installs Agave `cargo-build-sbf` and/or builds `knowdit:solana` \
+                 from `docker/Dockerfile.solana`), run `python3 scripts/autobuild_solana.py {}`, \
+                 or pass `--solana-build-sbf-bin`.",
                 missing,
                 self.sbf_out_dir.display(),
                 self.repo_root.display(),
@@ -965,7 +954,7 @@ fn test_knowdit_solana_preflight() {
                 let repo_str = self.repo_root.display().to_string();
                 let work_str = work_dir.display().to_string();
                 let entrypoint = match which {
-                    SpawnBinary::Cargo => "/usr/local/cargo/bin/cargo",
+                    SpawnBinary::Cargo => "/usr/local/bin/knowdit-solana-cargo",
                     SpawnBinary::BuildSbf => "/opt/solana/active_release/bin/cargo-build-sbf",
                 };
 
