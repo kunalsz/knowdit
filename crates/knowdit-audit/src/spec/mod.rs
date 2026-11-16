@@ -1659,6 +1659,27 @@ async fn prepare_pair_candidates(
 
     // 2. Resume resolution per member, in bounded chunks.
     if !options.regenerate {
+        // Pair-level resume: the pack is a *sample* of a pair's linked
+        // findings, not an exhaustive checklist. A pair whose linked findings
+        // outnumber `pack_size` would otherwise never reach `Built` — each run
+        // would spec a fresh pack out of the same pair. Drop pairs that are
+        // fully drained (every committed spec has a terminal codegen); pairs
+        // with pending/failed specs stay so those drain.
+        let drained_pairs = repo
+            .load_drained_pairs()
+            .await
+            .wrap_err("failed to load drained pairs")?;
+        let before_pairs = drafts.len();
+        drafts.retain(|draft| !drained_pairs.contains(&(draft.extract_id, draft.historical_id)));
+        let dropped_touched = before_pairs - drafts.len();
+        if dropped_touched > 0 {
+            tracing::info!(
+                "Specification Generator pair resume: {} pair(s) dropped (fully drained), {} pair(s) remaining",
+                dropped_touched,
+                drafts.len(),
+            );
+        }
+
         let all_keys: Vec<LinkKey> = drafts
             .iter()
             .flat_map(|draft| {
@@ -3975,6 +3996,71 @@ mod planner_db_tests {
         let link = &batch[0];
         assert!(link.pack.is_empty(), "drain-only pair has no pending hints");
         assert_eq!(link.pre_committed_spec_ids, partial_ids);
+    }
+
+    #[tokio::test]
+    async fn pair_plan_drops_pair_whose_specs_are_all_terminal_even_with_unbuilt_linked_findings() {
+        // Regression: a pair can carry far more linked findings than
+        // `pack_size`. Each run specs a fresh pack out of the pending members,
+        // so the pair never reaches `Built` under member-level resume and gets
+        // re-scheduled forever. Once every *committed* spec is terminal, the
+        // pair is done — even though most linked findings were never spec'd.
+        let temp = temp_repo().await;
+        let repo = &temp.repo;
+        let links: Vec<(i32, LinkStrength)> = (1..=6).map(|f| (f, LinkStrength::High)).collect();
+        seed(
+            &repo,
+            &[extract("e1")],
+            vec![historical(1, &links)],
+            vec![(1, 1, MatchStrength::High)],
+        )
+        .await;
+        // Only finding 1 was ever spec'd, and its codegen is terminal. Findings
+        // 2..=6 remain un-spec'd but must NOT resurrect the pair.
+        mark_built(&repo, 1, 1, 1).await;
+
+        let options = SpecGenOptions {
+            granularity: SpecGranularity::Pair,
+            pack_size: 2,
+            ..Default::default()
+        };
+        let plan = PreparedLinkPlan::prepare(&repo, &options)
+            .await
+            .expect("prepare");
+        assert!(
+            plan.is_none(),
+            "pair with only terminal specs must be dropped despite un-spec'd linked findings"
+        );
+    }
+
+    #[tokio::test]
+    async fn pair_plan_keeps_pair_with_non_terminal_spec_and_unbuilt_linked_findings() {
+        // Counterpart: a pair with one non-terminal spec must stay in the plan
+        // so its pending work drains — the drained-pair shortcut must not
+        // swallow it.
+        let temp = temp_repo().await;
+        let repo = &temp.repo;
+        let links: Vec<(i32, LinkStrength)> = (1..=6).map(|f| (f, LinkStrength::High)).collect();
+        seed(
+            &repo,
+            &[extract("e1")],
+            vec![historical(1, &links)],
+            vec![(1, 1, MatchStrength::High)],
+        )
+        .await;
+        // Spec committed but no codegen yet → non-terminal.
+        mark_partial(&repo, 1, 1, 1, 1).await;
+
+        let options = SpecGenOptions {
+            granularity: SpecGranularity::Pair,
+            pack_size: 2,
+            ..Default::default()
+        };
+        let plan = PreparedLinkPlan::prepare(&repo, &options)
+            .await
+            .expect("prepare")
+            .expect("pair with non-terminal spec must remain planned");
+        assert_eq!(plan.planned_total(), 1);
     }
 
     #[tokio::test]

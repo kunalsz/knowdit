@@ -51,8 +51,13 @@ use llmy::client::client::LLM;
 use llmy::client::settings::LLMSettings;
 use llmy::harness::Agent;
 
-/// Default number of consecutive truncation retries before giving up.
-pub const DEFAULT_MAX_TRUNCATION_RETRIES: usize = 3;
+/// Default number of consecutive retryable provider failures before giving up.
+///
+/// Sized for the slowest retry curve: a rate-limited step waits 8s, 16s, 32s,
+/// then holds at 64s. Six retries outlast a ~4-minute rate window, which is the
+/// point — giving up after 3 (~56s of waiting) would abandon links during a
+/// normal concurrency burst, which is exactly what this module exists to avoid.
+pub const DEFAULT_MAX_TRUNCATION_RETRIES: usize = 6;
 
 /// User-role nudge appended after a truncated response.
 ///
@@ -125,6 +130,58 @@ const TRANSIENT_TRANSPORT_NEEDLES: [&str; 16] = [
     "error code 524",
 ];
 
+/// Substrings that mark an **edge-proxy timeout / gateway failure** as it
+/// actually reaches this layer.
+///
+/// [`TRANSIENT_TRANSPORT_NEEDLES`] matches the *text* of an API error object,
+/// which only works when the provider returns a JSON error with a `code` field.
+/// A Cloudflare-fronted gateway (the common case here — `api.tokenjuice.ai`)
+/// instead returns an **HTML error page** on 502/504/524. `async-openai` puts
+/// that raw body into `ApiError.message`, so `LLMYError`'s rendered form is
+/// `openai error: <html>...<title>524: A timeout occurred</title>...` — the
+/// status never appears as `error code: 524`.
+///
+/// Observed symptom without these: every 524 became `AgentError` on the
+/// code_gen row, because the step was classified non-retryable and abandoned
+/// "during 0 retry". The related log line is `async_openai::client: Server
+/// error: 524 <unknown status code>` — 524 is Cloudflare-proprietary, so
+/// `reqwest` cannot map it to a named `StatusCode`.
+const EDGE_GATEWAY_NEEDLES: [&str; 10] = [
+    // Cloudflare timeout page (502/504/524 all share this template).
+    "a timeout occurred",
+    "error 524",
+    "error 502",
+    "error 504",
+    "524: a timeout",
+    "502 bad gateway",
+    "504 gateway timeout",
+    // Wedged upstream connection.
+    "gateway time-out",
+    "upstream connect error",
+    "upstream request timeout",
+];
+
+/// Substrings that mark provider-side **rate limiting** (HTTP 429).
+///
+/// A 429 is not a verdict on the request: the same call succeeds once the
+/// window refills, so it must be retried. It is separated from
+/// [`TRANSIENT_TRANSPORT_NEEDLES`] because it needs a *different* backoff —
+/// rate limits are capacity windows measured in seconds-to-minutes, not a
+/// briefly-unreachable upstream, so retrying after 2s just burns another call
+/// against the same exhausted window.
+///
+/// The observed failure mode: the provider answers a plaintext `Too Many
+/// Requests` body, which fails `async-openai`'s JSON parse and surfaces as
+/// `JSONDeserialize(.., content:Too Many Requests)` — a string that mentions no
+/// HTTP status at all, so status-code needles alone miss it.
+const RATE_LIMIT_NEEDLES: [&str; 5] = [
+    "too many requests",
+    "error code: 429",
+    "error code 429",
+    "rate limit",
+    "rate_limit",
+];
+
 /// Whether `err` is a transient transport failure (gateway 5xx, refused
 /// connection, timeout) rather than a verdict about the request.
 ///
@@ -142,6 +199,26 @@ pub fn is_transient_transport(err: &LLMYError) -> bool {
         _ => {
             let text = err.to_string().to_lowercase();
             TRANSIENT_TRANSPORT_NEEDLES.iter().any(|n| text.contains(n))
+                || EDGE_GATEWAY_NEEDLES.iter().any(|n| text.contains(n))
+        }
+    }
+}
+
+/// Whether `err` is the provider **rate limiting** us (HTTP 429).
+///
+/// Checked before [`is_transient_transport`] so the caller can apply the
+/// rate-limit-specific backoff instead of the generic 5xx one. A 429 leaves the
+/// conversation state untouched — the request was rejected before the model ran
+/// — so re-issuing the step is safe.
+pub fn is_rate_limited(err: &LLMYError) -> bool {
+    match err {
+        // Same deterministic set as the transport check: none of these is a 429.
+        LLMYError::Billing { .. } | LLMYError::Filtered(_) | LLMYError::IncorrectToolCall(..) => {
+            false
+        }
+        _ => {
+            let text = err.to_string().to_lowercase();
+            RATE_LIMIT_NEEDLES.iter().any(|n| text.contains(n))
         }
     }
 }
@@ -166,7 +243,9 @@ pub fn is_transient_transport(err: &LLMYError) -> bool {
 /// Callers still use [`is_output_length`] to tell "output cap exhausted" apart
 /// from other failures when they abandon gracefully.
 pub fn is_retryable(err: &LLMYError) -> bool {
-    matches!(err, LLMYError::OutputLength | LLMYError::EmptyChoice) || is_transient_transport(err)
+    matches!(err, LLMYError::OutputLength | LLMYError::EmptyChoice)
+        || is_rate_limited(err)
+        || is_transient_transport(err)
 }
 
 /// The nudge to append for a given retryable error. Truncation, empty-choice
@@ -177,6 +256,7 @@ fn retry_nudge(err: &LLMYError) -> String {
     match err {
         LLMYError::EmptyChoice => EMPTY_CHOICE_NUDGE.to_string(),
         LLMYError::OutputLength => TRUNCATION_NUDGE.to_string(),
+        _ if is_rate_limited(err) => TRANSPORT_NUDGE.to_string(),
         _ if is_transient_transport(err) => TRANSPORT_NUDGE.to_string(),
         _ => TRUNCATION_NUDGE.to_string(),
     }
@@ -197,6 +277,47 @@ fn transport_backoff(consecutive: usize) -> Option<std::time::Duration> {
     Some(std::time::Duration::from_secs(secs))
 }
 
+/// Backoff before retrying a **rate-limited** (429) request.
+///
+/// Rate limits are capacity windows, not a briefly-unreachable upstream, so the
+/// curve starts higher and climbs further than [`transport_backoff`]: 8s, 16s,
+/// 32s, 64s, then hold at 64s. The provider does not expose `Retry-After` to
+/// this layer (`async-openai` turns a plaintext 429 body into a deserialize
+/// error and drops the headers), so the window length is estimated.
+///
+/// A deterministic 0–25% additive jitter is applied so that N links failing
+/// against the same exhausted window do not wake up and re-hit it in lockstep,
+/// which would otherwise re-trigger the 429 immediately. The jitter is derived
+/// from `consecutive` and the current time so tests can still bound the result.
+fn rate_limit_backoff(consecutive: usize) -> Option<std::time::Duration> {
+    if consecutive == 0 {
+        return None;
+    }
+    let base_secs = 8u64.saturating_mul(1u64 << (consecutive.saturating_sub(1)).min(3));
+    let jitter_secs = if base_secs >= 8 {
+        // 0..=base/4, wall-clock derived so concurrent workers spread out.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos() as u64)
+            .unwrap_or(0);
+        nanos % (base_secs / 4 + 1)
+    } else {
+        0
+    };
+    Some(std::time::Duration::from_secs(base_secs + jitter_secs))
+}
+
+/// Pick the backoff for a retryable error: rate limits get their own curve, all
+/// other transient transport failures get the 5xx curve, and truncation /
+/// empty-choice retry immediately.
+fn retry_backoff(err: &LLMYError, consecutive: usize) -> Option<std::time::Duration> {
+    if is_rate_limited(err) {
+        rate_limit_backoff(consecutive)
+    } else {
+        transport_backoff(consecutive).filter(|_| is_transient_transport(err))
+    }
+}
+
 /// Reason to record when a retryable error's budget is exhausted and the
 /// caller abandons the unit of work gracefully.
 ///
@@ -215,6 +336,13 @@ pub fn exhaustion_reason(err: &LLMYError, consecutive: usize) -> String {
         // A transport failure says nothing about the output cap — reporting it
         // as truncation would send the operator to `--llm-max-completion-tokens`
         // when the provider gateway is actually down.
+        // A rate limit is not an output-cap problem either; the fix is less
+        // concurrency or a bigger quota.
+        _ if is_rate_limited(err) => format!(
+            "provider rate-limited the request {consecutive} times in a row (HTTP 429); lower \
+             --stream-link-concurrency / --map-concurrency / --gen-specs-concurrency or request \
+             a higher provider quota"
+        ),
         _ if is_transient_transport(err) => format!(
             "provider gateway unreachable {consecutive} times in a row (repeated 5xx / \
              connection failure); the request never reached the model. Check provider status \
@@ -303,15 +431,15 @@ impl TruncationRetry {
                         );
                         return Err(err);
                     }
-                    // Transport failures get a delay before the re-issue (the
-                    // upstream is briefly unavailable); truncation/empty-choice
-                    // retry immediately, since those are sampling problems.
-                    if let Some(delay) =
-                        transport_backoff(self.consecutive).filter(|_| is_transient_transport(&err))
-                    {
+                    // Transport failures and rate limits get a delay before the
+                    // re-issue (the upstream is briefly unavailable / the rate
+                    // window is exhausted); truncation/empty-choice retry
+                    // immediately, since those are sampling problems.
+                    if let Some(delay) = retry_backoff(&err, self.consecutive) {
                         tracing::warn!(
-                            "agent step failed with a transient transport error ({}/{} \
+                            "agent step failed with a transient {} error ({}/{} \
                              consecutive: {err}); retrying in {delay:?}",
+                            if is_rate_limited(&err) { "rate-limit" } else { "transport" },
                             self.consecutive,
                             self.max_consecutive,
                         );
@@ -356,12 +484,11 @@ impl TruncationRetry {
                 if self.record_failure().is_err() {
                     return Err(err);
                 }
-                if let Some(delay) =
-                    transport_backoff(self.consecutive).filter(|_| is_transient_transport(&err))
-                {
+                if let Some(delay) = retry_backoff(&err, self.consecutive) {
                     tracing::warn!(
-                        "agent's first step failed with a transient transport error ({}/{} \
+                        "agent's first step failed with a transient {} error ({}/{} \
                          consecutive: {err}); retrying in {delay:?}",
+                        if is_rate_limited(&err) { "rate-limit" } else { "transport" },
                         self.consecutive,
                         self.max_consecutive,
                     );
@@ -586,5 +713,126 @@ mod tests {
         // sequential round-trips (C-02).
         assert!(TRUNCATION_NUDGE.contains("10-15 tool calls"));
         assert!(!TRUNCATION_NUDGE.contains("at most one tool call"));
+    }
+
+    /// A 429 must be retryable. The observed shape is a plaintext
+    /// `Too Many Requests` body that `async-openai` fails to deserialize,
+    /// producing a message with no HTTP status in it at all — the exact reason
+    /// status-code needles alone missed it and the step hard-failed "during 0
+    /// retry", burning the link's whole agent run.
+    #[test]
+    fn rate_limit_is_retryable() {
+        for text in [
+            "failed to deserialize api response: error:expected value at line 1 column 1 \
+             content:Too Many Requests",
+            "error code: 429",
+            "429 Too Many Requests",
+            "rate limit exceeded",
+            "rate_limit_error",
+        ] {
+            let err = LLMYError::IO(std::io::Error::other(text));
+            assert!(is_rate_limited(&err), "{text} must classify as a rate limit");
+            assert!(is_retryable(&err), "{text} must be retryable");
+        }
+    }
+
+    /// A rate limit is not a transport (5xx) failure: keeping the detectors
+    /// separate is what lets the retry apply the long rate-limit backoff
+    /// rather than the short 5xx one.
+    #[test]
+    fn rate_limit_backs_off_harder_than_transport() {
+        // Production shape: a plaintext 429 body fails async-openai's JSON
+        // parse. (`LLMYError::IO` is unconditionally transport, so it is the
+        // wrong vehicle for this assertion.)
+        let err = serde_429_error();
+        assert!(!is_transient_transport(&err), "429 is not a 5xx transport hit");
+        assert!(is_rate_limited(&err));
+
+        for consecutive in 1..=4 {
+            let nm = transport_backoff(consecutive).expect("transport delay");
+            let rl = rate_limit_backoff(consecutive).expect("rate-limit delay");
+            assert!(
+                rl > nm,
+                "rate-limit backoff ({rl:?}) must exceed transport backoff ({nm:?}) \
+                 at consecutive={consecutive}"
+            );
+        }
+        // The jitter is a bounded additive amount (<= 25% of the base).
+        let rl = rate_limit_backoff(1).expect("delay");
+        assert!(rl >= std::time::Duration::from_secs(8));
+        assert!(rl <= std::time::Duration::from_secs(10));
+    }
+
+    #[test]
+    fn retry_backoff_routes_by_error_kind() {
+        assert!(retry_backoff(&serde_429_error(), 1).is_some(), "rate limit delays");
+        let transport = LLMYError::IO(std::io::Error::other("error code: 502"));
+        assert!(retry_backoff(&transport, 1).is_some(), "5xx delays");
+        // Truncation retries immediately — that is a sampling problem.
+        assert_eq!(retry_backoff(&LLMYError::OutputLength, 3), None);
+    }
+
+    /// An exhausted rate-limit budget must point the operator at concurrency /
+    /// quota, not at the output cap.
+    #[test]
+    fn rate_limit_exhaustion_names_the_right_fix() {
+        let text = exhaustion_reason(&serde_429_error(), 4);
+        assert!(text.contains("rate-limited"));
+        assert!(text.contains("429"));
+        assert!(!text.contains("--llm-max-completion-tokens"));
+    }
+
+    /// The real production error: `async-openai` cannot deserialize the
+    /// provider's plaintext `Too Many Requests` body.
+    fn serde_429_error() -> LLMYError {
+        let json_err = serde_json::from_str::<serde_json::Value>("Too Many Requests")
+            .expect_err("plaintext is not JSON");
+        LLMYError::OpenAI(llmy::openai::error::OpenAIError::JSONDeserialize(
+            json_err,
+            "Too Many Requests".to_string(),
+        ))
+    }
+
+    /// A Cloudflare-fronted gateway returns an **HTML** body on 502/504/524.
+    /// `async-openai` stuffs that body into `ApiError.message`, so the rendered
+    /// error contains `<title>524: A timeout occurred</title>` and never the
+    /// literal `error code: 524`. Before [`EDGE_GATEWAY_NEEDLES`] every such
+    /// failure was classified non-retryable and abandoned as `AgentError`
+    /// during 0 retry.
+    #[test]
+    fn cloudflare_html_timeout_is_retryable() {
+        let body = "<!DOCTYPE html><html><head><title>api.tokenjuice.ai | 524: A timeout \
+                    occurred</title></head><body><h1>Error 524</h1><p>A timeout occurred</p>\
+                    </body></html>";
+        let err = LLMYError::OpenAI(llmy::openai::error::OpenAIError::ApiError(
+            llmy::openai::error::ApiError {
+                message: body.to_string(),
+                r#type: None,
+                param: None,
+                code: None,
+            },
+        ));
+        assert!(is_transient_transport(&err), "CF 524 HTML body is transport");
+        assert!(is_retryable(&err), "CF 524 HTML body must be retried");
+        assert!(!is_rate_limited(&err), "524 is not a 429");
+    }
+
+    /// Same gateway template for 502/504.
+    #[test]
+    fn cloudflare_html_gateway_errors_are_retryable() {
+        for body in [
+            "<html><title>502 Bad Gateway</title></html>",
+            "<html><title>504 Gateway Timeout</title></html>",
+        ] {
+            let err = LLMYError::OpenAI(llmy::openai::error::OpenAIError::ApiError(
+                llmy::openai::error::ApiError {
+                    message: body.to_string(),
+                    r#type: None,
+                    param: None,
+                    code: None,
+                },
+            ));
+            assert!(is_retryable(&err), "{body} must be retryable");
+        }
     }
 }

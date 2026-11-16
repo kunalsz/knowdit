@@ -2963,6 +2963,62 @@ impl RepoDatabase {
         }
         Ok(out)
     }
+
+    /// Pairs that are **fully drained**: they have at least one committed
+    /// `specification`, and every one of those specs already has a terminal
+    /// `code_gen` (`Completed` / `Duplicate` / `SkippedViability`).
+    ///
+    /// Pair-mode planning samples up to `--gen-specs-pack-size` members from a
+    /// pair's linked findings per run. Because a pair can carry many more
+    /// linked findings than the pack size (observed: 58 linked, pack 10), the
+    /// member-level [`Self::link_resume_state`] can never report the pair
+    /// `Built` — there is always another un-spec'ed linked member. Treating
+    /// "pair fully drained" as the resume unit prevents re-slicing a fresh
+    /// pack out of the same pair on every invocation, while still letting
+    /// pairs with pending/failed specs re-enter the plan so those drain.
+    pub async fn load_drained_pairs(
+        &self,
+    ) -> Result<std::collections::HashSet<(i32, i32)>> {
+        use sea_orm::{ColumnTrait, QueryFilter, QuerySelect};
+
+        let spec_rows = specification_model::Entity::find()
+            .select_only()
+            .column(specification_model::Column::Id)
+            .column(specification_model::Column::SemanticId)
+            .column(specification_model::Column::HistoricalId)
+            .into_tuple::<(i32, i32, i32)>()
+            .all(&self.db)
+            .await
+            .wrap_err("failed to load specifications for drained-pair resolution")?;
+        if spec_rows.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+        let terminal: std::collections::HashSet<i32> = code_gen_model::Entity::find()
+            .filter(code_gen_model::Column::Status.is_in([
+                CodeGenStatus::Completed,
+                CodeGenStatus::Duplicate,
+                CodeGenStatus::SkippedViability,
+            ]))
+            .all(&self.db)
+            .await
+            .wrap_err("failed to load terminal code_gen rows for drained-pair resolution")?
+            .into_iter()
+            .map(|r| r.spec_id)
+            .collect();
+
+        let mut pending: std::collections::HashMap<(i32, i32), bool> =
+            std::collections::HashMap::new();
+        for (spec_id, extract_id, historical_id) in spec_rows {
+            let entry = pending.entry((extract_id, historical_id)).or_insert(false);
+            if !terminal.contains(&spec_id) {
+                *entry = true;
+            }
+        }
+        Ok(pending
+            .into_iter()
+            .filter_map(|(pair, has_pending)| (!has_pending).then_some(pair))
+            .collect())
+    }
 }
 
 /// Projected `specification` query used by [`RepoDatabase::load_link_resume_states`].
